@@ -6,5 +6,6 @@
       "Bash(uv run python:*)",
       "Bash(uv run pytest:*)"
     ]
-  }
+  },
+  "outputStyle": "Explanatory"
 }

@@ -181,7 +181,7 @@ ResidualBlock × 15
     └─→ Value Head → (1,)
 ```
 
-**Policy Head**: Conv 1×1 → BN → ReLU → FC(4672)
+**Policy Head**: Conv 1×1 → BN → ReLU → FC(4672)\
 **Value Head**: Conv 1×1 → BN → ReLU → FC(192) → ReLU → FC(1) → Tanh
 
 ### MCTS Algorithm
@@ -323,15 +323,18 @@ uv run pytest tests/test_training.py -v
 - Expected: ~2000-5000 simulations/second (20-50x speedup)
 
 ## Future Enhancements
-
+Next Steps:
 - [ ] Cython MCTS implementation
 - [ ] C++ MCTS implementation with pybind11
 - [ ] Batched GPU inference for actors
-- [ ] Distributed training across multiple machines
-- [ ] Opening book integration
-- [ ] Endgame tablebase support
-- [ ] Web interface for playing against the model
+- [ ] Opening book integration (only as an evaluation metrics, DO NOT use to train network)
 - [ ] Training visualization dashboard
+- [ ] Web interface for playing against the model
+
+Potential Steps:
+- [ ] Endgame tablebase support
+- [ ] Distributed training across multiple machines
+
 
 ## References
 
