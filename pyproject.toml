@@ -1,7 +1,7 @@
 [project]
 name = "alpha-zero-chess"
 version = "0.1.0"
-description = "Add your description here"
+description = "AlphaZero chess engine implementation in PyTorch"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:python-chess.readthedocs.io)"
+      "WebFetch(domain:python-chess.readthedocs.io)",
+      "Bash(uv run python:*)",
+      "Bash(uv run pytest:*)"
     ]
   }
 }
