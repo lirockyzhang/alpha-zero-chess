@@ -55,7 +55,8 @@ class AlphaZeroLoss(nn.Module):
         """
         # Policy loss: cross-entropy with MCTS policy
         # Apply mask to logits before log_softmax
-        masked_logits = policy_logits.masked_fill(legal_mask == 0, float('-inf'))
+        # Use -1e4 instead of -inf for FP16 numerical stability (FP16 max ~65k)
+        masked_logits = policy_logits.masked_fill(legal_mask == 0, -1e4)
         log_probs = F.log_softmax(masked_logits, dim=-1)
 
         # Cross-entropy: -sum(target * log(pred))
@@ -92,7 +93,8 @@ def policy_loss(
     Returns:
         Policy loss scalar
     """
-    masked_logits = policy_logits.masked_fill(legal_mask == 0, float('-inf'))
+    # Use -1e4 instead of -inf for FP16 numerical stability (FP16 max ~65k)
+    masked_logits = policy_logits.masked_fill(legal_mask == 0, -1e4)
     log_probs = F.log_softmax(masked_logits, dim=-1)
     return -torch.sum(target_policy * log_probs, dim=-1).mean()
 
@@ -134,7 +136,8 @@ def compute_policy_accuracy(
         Accuracy as a float in [0, 1]
     """
     # Get network's top choice
-    masked_logits = policy_logits.masked_fill(legal_mask == 0, float('-inf'))
+    # Use -1e4 instead of -inf for FP16 numerical stability (FP16 max ~65k)
+    masked_logits = policy_logits.masked_fill(legal_mask == 0, -1e4)
     pred_actions = masked_logits.argmax(dim=-1)
 
     # Get MCTS top choice

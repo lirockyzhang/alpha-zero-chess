@@ -7,7 +7,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import autocast, GradScaler
 from typing import Dict, Optional, Tuple
 import logging
 from pathlib import Path
@@ -103,7 +103,7 @@ class Learner:
         self.optimizer.zero_grad()
 
         if self.config.use_amp and self.scaler is not None:
-            with autocast():
+            with autocast('cuda'):
                 policy_logits, value_pred = self.network(obs_tensor, mask_tensor)
                 loss, metrics = self.loss_fn(
                     policy_logits, policy_tensor,
@@ -206,12 +206,18 @@ class Learner:
         """
         Path(path).parent.mkdir(parents=True, exist_ok=True)
 
+        # Get network architecture info
+        num_filters = self.network.num_filters
+        num_blocks = self.network.num_blocks
+
         state = {
             'global_step': self.global_step,
             'epoch': self.epoch,
             'network_state_dict': self.network.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
+            'num_filters': num_filters,
+            'num_blocks': num_blocks,
         }
 
         if self.scaler is not None:

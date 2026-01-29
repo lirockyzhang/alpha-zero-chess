@@ -47,6 +47,7 @@ class TrainingConfig:
     lr_schedule_gamma: float = 0.1
     max_grad_norm: float = 1.0
     use_amp: bool = True
+    use_amp_inference: bool = True  # Mixed precision for inference
     checkpoint_interval: int = 1000
     log_interval: int = 100
 

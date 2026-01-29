@@ -406,21 +406,37 @@ class Trajectory:
    - Board encoding correctness
    - MCTS node statistics
    - Network forward pass shapes
+   - Batched inference request/response dataclasses
+   - BatchedEvaluator functionality and timeout handling
 
 2. **Integration Tests:**
    - Single self-play game completion
    - Training step execution
    - Checkpoint save/load
+   - Batched inference server with single and multiple requests
+   - Multi-actor batched inference pipeline
+   - MCTS backend consistency across Python/Cython/C++ implementations
 
 3. **Functional Tests:**
    - Train on small network (5 blocks, 64 filters) for a few hundred games
    - Verify loss decreases
    - Verify model beats random play
+   - Complete game trajectories with batched inference
+   - Edge cases: terminal positions, few legal moves, zero simulations
 
 4. **Performance Benchmarks:**
    - MCTS simulations per second
    - Training throughput (positions/second)
    - Self-play games per hour
+   - Backend performance comparison (Python vs Cython vs C++)
+
+5. **Test Files:**
+   - `tests/test_chess_env.py` - Chess environment tests
+   - `tests/test_neural.py` - Neural network tests
+   - `tests/test_mcts.py` - Core MCTS tests
+   - `tests/test_mcts_backends.py` - Backend implementation tests (Python/Cython/C++)
+   - `tests/test_training.py` - Training pipeline tests
+   - `tests/test_batched_inference.py` - Batched inference system tests
 
 ## Scalability Notes
 

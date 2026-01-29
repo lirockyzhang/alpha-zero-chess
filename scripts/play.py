@@ -15,6 +15,7 @@ from alphazero.chess_env import GameState
 from alphazero.neural import AlphaZeroNetwork
 from alphazero.mcts import create_mcts
 from alphazero.mcts.evaluator import NetworkEvaluator
+from alphazero.utils import load_checkpoint_with_architecture
 
 
 def print_board(state: GameState):
@@ -71,8 +72,12 @@ def main():
 
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to model checkpoint")
-    parser.add_argument("--simulations", type=int, default=800,
-                        help="MCTS simulations per move")
+    parser.add_argument("--simulations", type=int, default=400,
+                        help="MCTS simulations per move (default: 400 for interactive play)")
+    parser.add_argument("--filters", type=int, default=192,
+                        help="Number of filters in network (must match checkpoint)")
+    parser.add_argument("--blocks", type=int, default=15,
+                        help="Number of residual blocks (must match checkpoint)")
     parser.add_argument("--color", type=str, default="white",
                         choices=["white", "black"],
                         help="Your color")
@@ -88,10 +93,24 @@ def main():
 
     # Load model
     print(f"Loading model from {args.checkpoint}...")
-    state = torch.load(args.checkpoint, map_location=args.device)
+    state, filters_from_ckpt, blocks_from_ckpt = load_checkpoint_with_architecture(
+        args.checkpoint, args.device
+    )
 
-    # Determine network size from checkpoint
-    network = AlphaZeroNetwork()
+    # Determine architecture: use checkpoint info if available, otherwise use args
+    num_filters = filters_from_ckpt if filters_from_ckpt is not None else args.filters
+    num_blocks = blocks_from_ckpt if blocks_from_ckpt is not None else args.blocks
+
+    if filters_from_ckpt is not None:
+        print(f"Detected architecture from checkpoint: {num_blocks} blocks, {num_filters} filters")
+    else:
+        print(f"Using architecture from arguments: {num_blocks} blocks, {num_filters} filters")
+
+    # Create network with matching architecture
+    network = AlphaZeroNetwork(
+        num_filters=num_filters,
+        num_blocks=num_blocks
+    )
     network.load_state_dict(state['network_state_dict'])
     network = network.to(args.device)
     network.eval()

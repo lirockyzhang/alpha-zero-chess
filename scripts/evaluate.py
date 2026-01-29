@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import torch
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -13,9 +14,10 @@ from alphazero import AlphaZeroConfig, MCTSConfig
 from alphazero.neural import AlphaZeroNetwork
 from alphazero.mcts.evaluator import NetworkEvaluator
 from alphazero.evaluation import (
-    Arena, MCTSPlayer, RandomPlayer,
+    Arena, MCTSPlayer, RandomPlayer, MatchStats,
     StockfishEvaluator, quick_elo_test
 )
+from alphazero.utils import load_checkpoint_with_architecture
 
 
 def main():
@@ -28,8 +30,12 @@ def main():
                         help="Opponent type")
     parser.add_argument("--games", type=int, default=100,
                         help="Number of games to play")
-    parser.add_argument("--simulations", type=int, default=800,
-                        help="MCTS simulations per move")
+    parser.add_argument("--simulations", type=int, default=100,
+                        help="MCTS simulations per move (default: 100 for fast evaluation, use 800 for accurate measurement)")
+    parser.add_argument("--filters", type=int, default=192,
+                        help="Number of filters in network (must match checkpoint)")
+    parser.add_argument("--blocks", type=int, default=15,
+                        help="Number of residual blocks (must match checkpoint)")
     parser.add_argument("--stockfish-path", type=str, default=None,
                         help="Path to Stockfish executable")
     parser.add_argument("--stockfish-elo", type=int, default=1500,
@@ -46,9 +52,24 @@ def main():
 
     # Load model
     print(f"Loading model from {args.checkpoint}...")
-    state = torch.load(args.checkpoint, map_location=args.device)
+    state, filters_from_ckpt, blocks_from_ckpt = load_checkpoint_with_architecture(
+        args.checkpoint, args.device
+    )
 
-    network = AlphaZeroNetwork()
+    # Determine architecture: use checkpoint info if available, otherwise use args
+    num_filters = filters_from_ckpt if filters_from_ckpt is not None else args.filters
+    num_blocks = blocks_from_ckpt if blocks_from_ckpt is not None else args.blocks
+
+    if filters_from_ckpt is not None:
+        print(f"Detected architecture from checkpoint: {num_blocks} blocks, {num_filters} filters")
+    else:
+        print(f"Using architecture from arguments: {num_blocks} blocks, {num_filters} filters")
+
+    # Create network with matching architecture
+    network = AlphaZeroNetwork(
+        num_filters=num_filters,
+        num_blocks=num_blocks
+    )
     network.load_state_dict(state['network_state_dict'])
     network = network.to(args.device)
     network.eval()
@@ -64,7 +85,37 @@ def main():
     if args.opponent == "random":
         print(f"\nEvaluating against random player ({args.games} games)...")
         opponent = RandomPlayer()
-        stats, _ = arena.play_matches(player, opponent, args.games)
+
+        # Play matches with progress bar
+        stats = MatchStats(player.name, opponent.name)
+        with tqdm(total=args.games, desc="Playing games", unit="game") as pbar:
+            for i in range(args.games):
+                # Alternate colors
+                if i % 2 == 0:
+                    result = arena.play_match(player, opponent)
+                    if result.result > 0:
+                        stats.wins += 1
+                    elif result.result < 0:
+                        stats.losses += 1
+                    else:
+                        stats.draws += 1
+                else:
+                    result = arena.play_match(opponent, player)
+                    if result.result < 0:
+                        stats.wins += 1
+                    elif result.result > 0:
+                        stats.losses += 1
+                    else:
+                        stats.draws += 1
+
+                # Update progress bar
+                pbar.update(1)
+                pbar.set_postfix({
+                    'W': stats.wins,
+                    'D': stats.draws,
+                    'L': stats.losses,
+                    'score': f"{stats.score:.1%}"
+                })
 
         print(f"\nResults vs Random:")
         print(f"  Wins: {stats.wins}")
@@ -78,11 +129,14 @@ def main():
             sys.exit(1)
 
         print(f"\nEvaluating against Stockfish {args.stockfish_elo} ({args.games} games)...")
+
+        # Use quick_elo_test with progress tracking
         stats = quick_elo_test(
             player,
             args.stockfish_path,
             elo=args.stockfish_elo,
-            num_games=args.games
+            num_games=args.games,
+            show_progress=True
         )
 
         print(f"\nResults vs Stockfish {args.stockfish_elo}:")
@@ -96,7 +150,36 @@ def main():
         print(f"\nSelf-play evaluation ({args.games} games)...")
         # Create second player with same weights
         player2 = MCTSPlayer("AlphaZero-2", evaluator, mcts_config, temperature=0.0)
-        stats, _ = arena.play_matches(player, player2, args.games)
+
+        # Play matches with progress bar
+        stats = MatchStats(player.name, player2.name)
+        with tqdm(total=args.games, desc="Playing games", unit="game") as pbar:
+            for i in range(args.games):
+                # Alternate colors
+                if i % 2 == 0:
+                    result = arena.play_match(player, player2)
+                    if result.result > 0:
+                        stats.wins += 1
+                    elif result.result < 0:
+                        stats.losses += 1
+                    else:
+                        stats.draws += 1
+                else:
+                    result = arena.play_match(player2, player)
+                    if result.result < 0:
+                        stats.wins += 1
+                    elif result.result > 0:
+                        stats.losses += 1
+                    else:
+                        stats.draws += 1
+
+                # Update progress bar
+                pbar.update(1)
+                pbar.set_postfix({
+                    'W': stats.wins,
+                    'D': stats.draws,
+                    'L': stats.losses
+                })
 
         print(f"\nSelf-play results:")
         print(f"  White wins: {stats.wins}")

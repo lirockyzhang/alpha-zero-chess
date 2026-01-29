@@ -98,9 +98,10 @@ class AlphaZeroNetwork(nn.Module):
         # Apply legal move mask
         if legal_mask is not None:
             # Set illegal moves to very negative value before softmax
+            # Use -1e4 instead of -inf for FP16 numerical stability (FP16 max ~65k)
             policy_logits = policy_logits.masked_fill(
                 legal_mask == 0,
-                float('-inf')
+                -1e4
             )
 
         # Value head

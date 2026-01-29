@@ -94,8 +94,13 @@ class SelfPlayGame:
         # Game ended
         if state.is_terminal():
             game_result = state.get_result()
-            result = game_result.value_for_white
-            result_str = self._result_to_string(game_result)
+            if game_result is None:
+                # Terminal but no outcome (edge case)
+                result = 0.0
+                result_str = "1/2-1/2 (no outcome)"
+            else:
+                result = game_result.value_for_white
+                result_str = self._result_to_string(game_result)
         else:
             # Max moves reached - draw
             result = 0.0
@@ -116,11 +121,21 @@ class SelfPlayGame:
         """
         temperature = self.mcts.get_temperature(move_number)
 
-        if temperature < 0.01:
+        if temperature <= 0.01:
             # Greedy selection
             return int(np.argmax(policy))
         else:
             # Sample from distribution
+            # Ensure policy sums to 1 and handle numerical issues
+            policy = policy.astype(np.float64)
+            policy = np.maximum(policy, 0)  # Ensure non-negative
+            total = np.sum(policy)
+            if total > 0:
+                policy = policy / total
+            else:
+                # Fallback to uniform over non-zero entries
+                policy = (policy > 0).astype(np.float64)
+                policy = policy / np.sum(policy)
             return int(np.random.choice(len(policy), p=policy))
 
     def _result_to_string(self, result) -> str:

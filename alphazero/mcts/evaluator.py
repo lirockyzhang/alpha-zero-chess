@@ -5,6 +5,7 @@ Provides a clean interface between MCTS and the neural network.
 
 import torch
 import numpy as np
+from torch.amp import autocast
 from typing import Tuple, Optional, Protocol
 from dataclasses import dataclass
 
@@ -37,16 +38,19 @@ class NetworkEvaluator:
     def __init__(
         self,
         network: torch.nn.Module,
-        device: str = "cuda"
+        device: str = "cuda",
+        use_amp: bool = True
     ):
         """Initialize evaluator.
 
         Args:
             network: AlphaZero neural network
             device: Device to run inference on
+            use_amp: Use mixed precision (FP16) for inference
         """
         self.network = network
         self.device = device
+        self.use_amp = use_amp and device == "cuda"  # Only use AMP on CUDA
         self.network.eval()
 
     def evaluate(
@@ -68,7 +72,11 @@ class NetworkEvaluator:
         mask_tensor = torch.from_numpy(legal_mask).float().unsqueeze(0).to(self.device)
 
         with torch.no_grad():
-            policy, value = self.network.predict(obs_tensor, mask_tensor)
+            if self.use_amp:
+                with autocast('cuda'):
+                    policy, value = self.network.predict(obs_tensor, mask_tensor)
+            else:
+                policy, value = self.network.predict(obs_tensor, mask_tensor)
 
         # Convert back to numpy
         policy_np = policy.squeeze(0).cpu().numpy()
@@ -94,7 +102,11 @@ class NetworkEvaluator:
         mask_tensor = torch.from_numpy(legal_masks).float().to(self.device)
 
         with torch.no_grad():
-            policies, values = self.network.predict(obs_tensor, mask_tensor)
+            if self.use_amp:
+                with autocast('cuda'):
+                    policies, values = self.network.predict(obs_tensor, mask_tensor)
+            else:
+                policies, values = self.network.predict(obs_tensor, mask_tensor)
 
         return policies.cpu().numpy(), values.cpu().numpy()
 

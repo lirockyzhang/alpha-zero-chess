@@ -2,20 +2,32 @@
 
 This implementation prioritizes readability and correctness over performance.
 Each method includes comments mapping to the AlphaZero paper equations.
+
+Supports virtual loss for parallel MCTS simulations.
 """
 
 import numpy as np
 from typing import Dict, Tuple, Optional, List
+import threading
 
 
 class MCTSNode:
-    """MCTS node with PUCT selection.
+    """MCTS node with PUCT selection and virtual loss support.
 
     Stores statistics for a single state-action pair:
         - N(s,a): Visit count
         - W(s,a): Total value (sum of backpropagated values)
         - Q(s,a): Mean value = W(s,a) / N(s,a)
         - P(s,a): Prior probability from neural network
+        - V(s,a): Virtual loss (for parallel MCTS)
+
+    Virtual Loss:
+        When running parallel simulations, multiple threads may select the same
+        promising path. Virtual loss temporarily penalizes a node when it's being
+        explored, encouraging other threads to explore different paths.
+
+        During selection: Q_effective = (W - V*virtual_loss_value) / (N + V)
+        After backprop: Virtual loss is removed and real value is added
     """
 
     __slots__ = [
@@ -26,6 +38,8 @@ class MCTSNode:
         '_legal_actions',
         '_is_terminal',
         '_terminal_value',
+        '_virtual_loss',
+        '_lock',
     ]
 
     def __init__(self, prior: float = 1.0):
@@ -41,6 +55,8 @@ class MCTSNode:
         self._legal_actions: Optional[np.ndarray] = None
         self._is_terminal: bool = False
         self._terminal_value: float = 0.0
+        self._virtual_loss: int = 0  # Number of virtual losses applied
+        self._lock: Optional[threading.Lock] = None  # Lazy initialization
 
     @property
     def visit_count(self) -> int:
@@ -68,6 +84,60 @@ class MCTSNode:
         if self._visit_count == 0:
             return 0.0
         return self._value_sum / self._visit_count
+
+    @property
+    def virtual_loss(self) -> int:
+        """V(s,a): Number of virtual losses currently applied."""
+        return self._virtual_loss
+
+    def q_value_with_virtual_loss(self, virtual_loss_value: float = 1.0) -> float:
+        """Q(s,a) adjusted for virtual loss.
+
+        Q_effective = (W - V * virtual_loss_value) / (N + V)
+
+        This makes nodes being explored by other threads appear less attractive,
+        encouraging exploration of different paths.
+
+        Args:
+            virtual_loss_value: Penalty per virtual loss (typically 1.0)
+
+        Returns:
+            Adjusted Q value
+        """
+        effective_visits = self._visit_count + self._virtual_loss
+        if effective_visits == 0:
+            return 0.0
+        effective_value = self._value_sum - self._virtual_loss * virtual_loss_value
+        return effective_value / effective_visits
+
+    def add_virtual_loss(self) -> None:
+        """Add a virtual loss to this node.
+
+        Called when a thread starts exploring through this node.
+        Thread-safe if lock is initialized.
+        """
+        if self._lock:
+            with self._lock:
+                self._virtual_loss += 1
+        else:
+            self._virtual_loss += 1
+
+    def remove_virtual_loss(self) -> None:
+        """Remove a virtual loss from this node.
+
+        Called during backpropagation after the real value is known.
+        Thread-safe if lock is initialized.
+        """
+        if self._lock:
+            with self._lock:
+                self._virtual_loss = max(0, self._virtual_loss - 1)
+        else:
+            self._virtual_loss = max(0, self._virtual_loss - 1)
+
+    def enable_threading(self) -> None:
+        """Enable thread-safe operations by initializing the lock."""
+        if self._lock is None:
+            self._lock = threading.Lock()
 
     def is_expanded(self) -> bool:
         """Check if this node has been expanded with children."""
@@ -106,7 +176,12 @@ class MCTSNode:
         for action in self._legal_actions:
             self._children[action] = MCTSNode(prior=legal_priors[action])
 
-    def select_child(self, c_puct: float) -> Tuple[int, 'MCTSNode']:
+    def select_child(
+        self,
+        c_puct: float,
+        use_virtual_loss: bool = False,
+        virtual_loss_value: float = 1.0
+    ) -> Tuple[int, 'MCTSNode']:
         """Select the best child using PUCT algorithm.
 
         PUCT formula (from AlphaZero paper):
@@ -115,8 +190,14 @@ class MCTSNode:
         Where the exploration bonus U(s,a) is:
             U(s,a) = c_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
 
+        With virtual loss enabled:
+            Q_effective = (W - V * loss_value) / (N + V)
+            U_effective = c_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a) + V)
+
         Args:
             c_puct: Exploration constant (typically 1.25)
+            use_virtual_loss: Whether to account for virtual losses
+            virtual_loss_value: Penalty per virtual loss
 
         Returns:
             Tuple of (best_action, best_child)
@@ -132,12 +213,17 @@ class MCTSNode:
         sqrt_parent = np.sqrt(self._visit_count)
 
         for action, child in self._children.items():
-            # Q(s,a): exploitation term
-            q = child.q_value
-
-            # U(s,a): exploration term
-            # U = c_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
-            u = c_puct * child.prior * sqrt_parent / (1 + child.visit_count)
+            if use_virtual_loss:
+                # Q(s,a) with virtual loss: penalize nodes being explored
+                q = child.q_value_with_virtual_loss(virtual_loss_value)
+                # U(s,a) with virtual loss: treat virtual visits as real
+                effective_visits = child.visit_count + child.virtual_loss
+                u = c_puct * child.prior * sqrt_parent / (1 + effective_visits)
+            else:
+                # Standard Q(s,a): exploitation term
+                q = child.q_value
+                # Standard U(s,a): exploration term
+                u = c_puct * child.prior * sqrt_parent / (1 + child.visit_count)
 
             # PUCT score
             score = q + u
@@ -165,8 +251,31 @@ class MCTSNode:
         Args:
             value: Value to backpropagate (from current player's perspective)
         """
-        self._visit_count += 1
-        self._value_sum += value
+        if self._lock:
+            with self._lock:
+                self._visit_count += 1
+                self._value_sum += value
+        else:
+            self._visit_count += 1
+            self._value_sum += value
+
+    def update_and_remove_virtual_loss(self, value: float) -> None:
+        """Update node and remove virtual loss atomically.
+
+        Used in parallel MCTS during backpropagation.
+
+        Args:
+            value: Value to backpropagate
+        """
+        if self._lock:
+            with self._lock:
+                self._visit_count += 1
+                self._value_sum += value
+                self._virtual_loss = max(0, self._virtual_loss - 1)
+        else:
+            self._visit_count += 1
+            self._value_sum += value
+            self._virtual_loss = max(0, self._virtual_loss - 1)
 
     def get_visit_counts(self, num_actions: int) -> np.ndarray:
         """Get visit counts for all actions as an array.
@@ -197,20 +306,22 @@ class MCTSNode:
         """
         counts = self.get_visit_counts(num_actions)
 
-        if temperature < 0.01:
-            # Greedy
+        if temperature <= 0.01:
+            # Greedy selection
             policy = np.zeros(num_actions, dtype=np.float32)
             if np.sum(counts) > 0:
                 policy[np.argmax(counts)] = 1.0
             return policy
 
-        # Apply temperature
-        counts = np.power(counts, 1.0 / temperature)
+        # Apply temperature with numerical stability
+        counts = counts.astype(np.float64)
+        exponent = min(1.0 / temperature, 10.0)  # Cap to prevent overflow
+        counts = np.power(counts, exponent)
         total = np.sum(counts)
 
         if total > 0:
-            return counts / total
-        return counts
+            return (counts / total).astype(np.float32)
+        return counts.astype(np.float32)
 
     def __repr__(self) -> str:
         return (

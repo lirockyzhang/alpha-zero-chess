@@ -145,11 +145,11 @@ class MCTSBase(ABC):
             move_number: Current move number
 
         Returns:
-            Temperature value (1.0 for exploration, near 0 for exploitation)
+            Temperature value (1.0 for exploration, 0 for greedy exploitation)
         """
         if move_number < self.config.temperature_threshold:
             return self.config.temperature
-        return 0.01  # Near-greedy after threshold
+        return 0.0  # Greedy after threshold
 
     def apply_temperature(
         self,
@@ -167,15 +167,18 @@ class MCTSBase(ABC):
         Returns:
             Probability distribution over actions
         """
-        if temperature < 0.01:
-            # Greedy selection
+        if temperature <= 0.01:
+            # Greedy selection (temperature near 0)
             policy = np.zeros_like(visit_counts, dtype=np.float32)
-            policy[np.argmax(visit_counts)] = 1.0
+            if np.sum(visit_counts) > 0:
+                policy[np.argmax(visit_counts)] = 1.0
             return policy
 
-        # Apply temperature
+        # Apply temperature with numerical stability
         counts = visit_counts.astype(np.float64)
-        counts = np.power(counts, 1.0 / temperature)
+        # Clip to avoid overflow: 1/temperature can be large
+        exponent = min(1.0 / temperature, 10.0)  # Cap at 10 to prevent overflow
+        counts = np.power(counts, exponent)
 
         # Normalize
         total = np.sum(counts)
