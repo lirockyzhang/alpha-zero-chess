@@ -4,7 +4,8 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:python-chess.readthedocs.io)",
       "Bash(uv run python:*)",
-      "Bash(uv run pytest:*)"
+      "Bash(uv run pytest:*)",
+      "Bash(python:*)"
     ]
   },
   "outputStyle": "Explanatory"

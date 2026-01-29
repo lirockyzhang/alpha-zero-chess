@@ -36,9 +36,11 @@ Continue with the project plan you proposed:
     - Batched GPU inference (amortizes Python overhead)
     - Virtual loss for parallel MCTS (tree operations become bottleneck)
 
+## [Generate Google Colab Project Plan](/Google%20Colab/project_plan.md)
+
 ## Fourth
 
-Fix bugs
+Training loop add iterations.
 
 Open books in epd: https://github.com/fairy-stockfish/books/tree/master
 

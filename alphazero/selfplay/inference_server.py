@@ -133,7 +133,7 @@ class InferenceServer(Process):
                         while not self.weight_queue.empty():
                             weights = self.weight_queue.get_nowait()
                             network.load_state_dict(weights)
-                            logger.info("Updated network weights")
+                            # logger.info("Updated network weights")
                     except Empty:
                         pass
 

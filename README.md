@@ -65,6 +65,23 @@ uv run pytest tests/ -v
 
 ## Quick Start
 
+### Train on Google Colab (Recommended for Beginners)
+
+**NEW!** Train AlphaZero on Google Colab with free GPU access:
+
+- 📁 See the [`Google Colab/`](Google%20Colab/) folder for a complete self-contained training notebook
+- ✅ **Iterative training** for faster learning (refreshes replay buffer each iteration)
+- ✅ **A100 GPU optimizations** (torch.compile, large batches, FP16)
+- ✅ **Google Drive checkpoint persistence** (survives session timeouts)
+- ✅ **No installation required** - runs entirely in your browser
+
+**Quick start:**
+1. Upload `Google Colab/train_alphazero.ipynb` to [Google Colab](https://colab.research.google.com/)
+2. Select **Runtime → Change runtime type → GPU** (T4 or A100)
+3. Run all cells - training auto-saves to Google Drive
+
+See [`Google Colab/README.md`](Google%20Colab/README.md) for detailed instructions and configuration presets.
+
 ### Run Demos
 
 Explore the implementation with educational demos:
