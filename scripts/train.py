@@ -3,10 +3,22 @@
 
 import argparse
 import logging
+import multiprocessing
 import sys
 from pathlib import Path
 
 import torch
+
+# IMPORTANT: Set multiprocessing start method to 'spawn' for CUDA compatibility.
+# On Linux (including Google Colab), the default is 'fork', which causes:
+# "RuntimeError: Cannot re-initialize CUDA in forked subprocess"
+# This must be called before any CUDA operations or process creation.
+if __name__ == "__main__":
+    try:
+        multiprocessing.set_start_method('spawn')
+    except RuntimeError:
+        # Already set (e.g., on Windows where 'spawn' is default)
+        pass
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -61,8 +73,9 @@ def run_iterative_training(coordinator, args, logger):
     time.sleep(1)  # Give server time to initialize
 
     # Then start actors (uses pre-created response queues)
+    # Note: BatchedSelfPlayCoordinator doesn't have start_collection() - actors
+    # automatically begin collecting trajectories once started
     coordinator.start_actors(args.actors)
-    coordinator.start_collection()
 
     try:
         for iteration in range(args.iterations):
