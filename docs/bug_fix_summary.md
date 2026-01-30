@@ -340,3 +340,264 @@ The bug fix has **no performance impact** - it's purely a correctness fix. The b
 - Batched inference: ~2-3x faster than individual CPU inference per actor
 - Scales well with 4+ actors
 - Better GPU utilization with larger batch sizes
+
+---
+
+## Date: 2026-01-30
+
+### Issue 1: IndexError in Batched Inference Coordinator
+**Location:** `scripts/train.py` and `alphazero/selfplay/coordinator.py`
+
+**Error Message:**
+```
+IndexError: list index out of range
+  File "/content/alpha-zero-chess/alphazero/selfplay/coordinator.py", line 497, in start_actors
+    response_queue = self.inference_response_queues[i]
+                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^
+```
+
+**Root Cause:**
+The `BatchedSelfPlayCoordinator` uses a centralized GPU inference server that creates response queues for each actor during initialization. The `run_iterative_training()` function in `scripts/train.py` called `start_actors()` directly without first calling `start_inference_server()`, so the `inference_response_queues` dictionary was empty when actors tried to access their queues.
+
+**Architecture Pattern:**
+The batched coordinator uses a producer-consumer pattern where:
+1. Actors send inference requests to a central GPU server
+2. Server batches requests for efficient GPU utilization
+3. Server sends responses back through dedicated per-actor queues
+4. Response queues are created during server initialization (coordinator.py:463)
+
+**Affected Code:**
+- `scripts/train.py` at line 59 (run_iterative_training function)
+
+**Fix Applied:**
+```python
+# Before (broken):
+# Start actors once
+coordinator.start_actors(args.actors)
+coordinator.start_collection()
+
+# After (fixed):
+# Start inference server first (creates response queues)
+coordinator.start_inference_server(args.actors)
+import time
+time.sleep(1)  # Give server time to initialize
+
+# Then start actors (uses pre-created response queues)
+coordinator.start_actors(args.actors)
+coordinator.start_collection()
+```
+
+**Impact:**
+- **Before:** Iterative training mode would crash immediately with IndexError when trying to start actors
+- **After:** Batched inference coordinator properly initializes in the correct order, enabling iterative training with batched inference
+
+**Why the 1-second sleep?**
+The inference server runs in a separate process. The sleep gives it time to fully initialize its GPU context and start listening for requests before actors begin sending inference requests, preventing race conditions during startup.
+
+**Correct Initialization Order:**
+The `run()` method in coordinator.py:672-677 shows the proper sequence:
+1. `start_inference_server(num_actors)` - Creates response queues and starts GPU server
+2. `start_actors(num_actors)` - Spawns actor processes that use the queues
+3. `train(num_steps)` - Begins training loop
+
+---
+
+### Issue 2: Windows Paging File Exhaustion with Many Actors
+**Location:** Windows multiprocessing limitation (not a code bug)
+
+**Error Message:**
+```
+OSError: [WinError 1455] The paging file is too small for this operation to complete.
+Error loading "...\torch\lib\cufft64_11.dll" or one of its dependencies.
+```
+
+**Root Cause:**
+This is a **Windows multiprocessing limitation**, not a code bug. Windows uses "spawn" method for multiprocessing (not "fork" like Linux), which means:
+- Each spawned process loads PyTorch and CUDA libraries independently
+- PyTorch with CUDA requires ~2-3GB of virtual memory per process
+- With 24 actors: 24 × 2.5GB = ~60GB virtual memory required
+- Windows paging file was insufficient to handle this load
+
+**Why This Happens on Windows:**
+1. **Linux (fork)**: Child processes share memory with parent via copy-on-write, so PyTorch DLLs are loaded once
+2. **Windows (spawn)**: Each child process is a fresh Python interpreter that loads all modules independently
+
+**Solutions:**
+
+**Option 1: Reduce Number of Actors (Recommended)**
+```bash
+# Instead of 24 actors, use 4-8 actors
+uv run python scripts/train.py --actors 4 --batched-inference ...
+```
+
+**Option 2: Increase Windows Paging File**
+1. Open System Properties → Advanced → Performance Settings
+2. Advanced → Virtual Memory → Change
+3. Set custom size: Initial = 16GB, Maximum = 32GB
+4. Restart computer
+
+**Option 3: Use Linux/WSL2**
+```bash
+# In WSL2, fork() is available and memory efficient
+wsl
+cd /mnt/c/Users/liroc/...
+uv run python scripts/train.py --actors 24 --batched-inference ...
+```
+
+**Recommended Configuration for Windows:**
+```bash
+# A100 GPU (40GB VRAM)
+--actors 4 --filters 192 --blocks 15 --batch-size 8192 --simulations 400
+
+# RTX 4090 (24GB VRAM)
+--actors 4 --filters 128 --blocks 10 --batch-size 4096 --simulations 200
+
+# RTX 3080 (10GB VRAM)
+--actors 2 --filters 64 --blocks 5 --batch-size 2048 --simulations 200
+```
+
+**Impact:**
+- **Not a bug**: This is expected behavior on Windows with many processes
+- **Workaround**: Reduce actors to 4-8 or increase paging file size
+- **Performance**: 4-8 actors still provide good GPU utilization with batched inference
+
+---
+
+### Issue 3: Web Interface Game State Stale Reference Bug
+**Location:** `alphazero/web/app.py`
+
+**Error Message:**
+No error message, but symptoms:
+- User makes a move
+- AI says "thinking..."
+- Board reverts to previous position instead of showing AI's move
+- User gets stuck and cannot make further moves
+
+**Root Cause:**
+After the user's move was applied, the code called `_get_model_move()` which updated `self.games[session_id]` with the AI's move. However, the local `game` variable still held a reference to the old game state (before the AI's move). When the response was constructed, it used `game.board.fen()` which returned the outdated FEN string, causing the frontend to revert to the old position.
+
+**Affected Code:**
+- `alphazero/web/app.py` at lines 161-176 (make_move endpoint)
+
+**Fix Applied:**
+```python
+# Before (broken):
+# Get model move
+model_move_uci = self._get_model_move(session_id)
+
+# Check if game is over after model move
+game_over = game.is_terminal()  # ❌ Uses stale 'game' variable
+result = None
+if game_over:
+    result = self._format_result(game.get_result())
+
+return jsonify({
+    'success': True,
+    'fen': game.board.fen(),  # ❌ Returns outdated FEN
+    'model_move': model_move_uci,
+    'game_over': game_over,
+    'result': result
+})
+
+# After (fixed):
+# Get model move
+model_move_uci = self._get_model_move(session_id)
+
+# Reload game state after model move (it was updated in _get_model_move)
+game = self.games[session_id]  # ✅ Refresh reference
+
+# Check if game is over after model move
+game_over = game.is_terminal()  # ✅ Uses updated game state
+result = None
+if game_over:
+    result = self._format_result(game.get_result())
+
+return jsonify({
+    'success': True,
+    'fen': game.board.fen(),  # ✅ Returns current FEN
+    'model_move': model_move_uci,
+    'game_over': game_over,
+    'result': result
+})
+```
+
+**Impact:**
+- **Before:** Web interface would show incorrect board state after AI moves, making the game unplayable
+- **After:** Web interface correctly displays the board after both user and AI moves
+
+**Why This Bug Occurred:**
+1. `GameState` uses immutable design pattern - `apply_move()` returns a new state
+2. `_get_model_move()` correctly updates `self.games[session_id]` with the new state
+3. The `make_move()` endpoint held a local reference to the old state
+4. Python variables are references, not copies - the local `game` variable didn't automatically update
+
+**Design Pattern Note:**
+The `GameState` class follows functional programming principles:
+- `apply_move(move)` returns a new `GameState` object (immutable)
+- The web interface stores game states in `self.games` dictionary
+- After any state change, must reload the reference from the dictionary
+
+**Prevention for Future:**
+- Always reload game state after calling methods that update `self.games`
+- Consider using a getter method: `def get_game(session_id) -> GameState`
+- Add type hints to make immutability more explicit
+
+---
+
+## Verification Checklist (2026-01-30)
+
+- [x] Bug 1: IndexError in batched inference coordinator - Fixed
+- [x] Bug 2: Windows paging file exhaustion - Documented (not a code bug)
+- [x] Bug 3: Web interface stale reference - Fixed
+- [x] All fixes tested and verified
+- [x] Documentation updated (bug_fix_summary.md)
+- [x] Google Colab notebook Cell 6A updated with fix
+
+---
+
+## Testing Instructions (2026-01-30)
+
+### Test Bug Fix 1: Batched Inference Coordinator
+```bash
+# Test iterative training with batched inference
+uv run python scripts/train.py \
+  --iterations 2 \
+  --steps-per-iteration 100 \
+  --actors 4 \
+  --batched-inference \
+  --filters 64 \
+  --blocks 5 \
+  --simulations 200 \
+  --min-buffer 2048 \
+  --batch-size 2048
+
+# Should start successfully without IndexError
+```
+
+### Test Bug Fix 3: Web Interface
+```bash
+# Start web interface
+uv run python scripts/web_play.py --checkpoint checkpoints/checkpoint_run2_f64_b5.pt
+
+# Test in browser:
+# 1. Navigate to http://localhost:5000
+# 2. Click "New Game"
+# 3. Make a move (e.g., e2-e4)
+# 4. Verify AI responds with a move
+# 5. Verify board shows both moves correctly
+# 6. Continue playing to verify game flow works
+```
+
+### Workaround for Issue 2: Windows Actors
+```bash
+# Use fewer actors on Windows (4-8 recommended)
+uv run python scripts/train.py \
+  --actors 4 \
+  --batched-inference \
+  --filters 64 \
+  --blocks 5 \
+  --simulations 200 \
+  --min-buffer 4096 \
+  --batch-size 2048 \
+  --steps 5000
+```

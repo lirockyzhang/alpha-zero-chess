@@ -55,7 +55,12 @@ def run_iterative_training(coordinator, args, logger):
     logger.info(f"Total steps: {args.iterations * args.steps_per_iteration}")
     logger.info("="*60)
 
-    # Start actors once
+    # Start inference server first (creates response queues)
+    coordinator.start_inference_server(args.actors)
+    import time
+    time.sleep(1)  # Give server time to initialize
+
+    # Then start actors (uses pre-created response queues)
     coordinator.start_actors(args.actors)
     coordinator.start_collection()
 

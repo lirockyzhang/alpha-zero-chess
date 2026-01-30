@@ -161,6 +161,9 @@ class ChessWebInterface:
                 # Get model move
                 model_move_uci = self._get_model_move(session_id)
 
+                # Reload game state after model move (it was updated in _get_model_move)
+                game = self.games[session_id]
+
                 # Check if game is over after model move
                 game_over = game.is_terminal()
                 result = None
