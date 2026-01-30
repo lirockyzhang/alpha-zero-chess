@@ -177,6 +177,32 @@ uv run python scripts/play.py \
 
 ### Evaluate Model Strength
 
+**Endgame Evaluation (50 Curated Positions):**
+```bash
+# Evaluate on 50 endgame positions (basic mates, pawn/rook endgames, tactics)
+uv run python scripts/evaluate_endgames.py \
+    --checkpoint checkpoints/checkpoint_5000_f64_b5.pt \
+    --simulations 400
+
+# Evaluate specific category
+uv run python scripts/evaluate_endgames.py \
+    --checkpoint checkpoints/checkpoint_5000_f64_b5.pt \
+    --category basic_mate \
+    --simulations 200
+
+# Evaluate specific difficulty (1-5)
+uv run python scripts/evaluate_endgames.py \
+    --checkpoint checkpoints/checkpoint_5000_f64_b5.pt \
+    --difficulty 3 \
+    --simulations 400
+```
+
+**Categories:**
+- `basic_mate`: Basic checkmates (K+Q vs K, K+R vs K, etc.)
+- `pawn_endgame`: Pawn endgames (opposition, key squares, breakthroughs)
+- `rook_endgame`: Rook endgames (Lucena, Philidor, cutting off king)
+- `tactical`: Tactical positions (stalemate traps, zugzwang, tempo)
+
 **Quick Evaluation (Fast - 100 simulations per move):**
 ```bash
 # Against random player (~2 minutes for 50 games)
@@ -558,18 +584,80 @@ policy, root, stats = mcts.search(
 - ✅ Multi-process self-play pipeline
 - ✅ Replay buffer and SGD training
 
+### Training Visualization Dashboard
+
+Monitor training progress in real-time with an interactive web dashboard:
+
+```bash
+# Start the dashboard (monitors logs/metrics directory)
+uv run python scripts/dashboard.py
+
+# Custom log directory and port
+uv run python scripts/dashboard.py --log-dir logs/metrics --port 8050
+```
+
+**Features:**
+- 📊 **Real-time metrics**: Loss, accuracy, learning rate, buffer size, games/hour
+- 📈 **Interactive plots**: Zoom, pan, hover for details (powered by Plotly)
+- 🔄 **Auto-refresh**: Updates every 5 seconds
+- 📉 **Training summary**: Total steps, games, best loss, training time
+
+**Dashboard displays:**
+- Total Loss, Policy Loss, Value Loss over time
+- Policy Accuracy and Value Accuracy trends
+- Replay Buffer size and Total Games played
+- Learning Rate schedule visualization
+
+Open http://localhost:8050 in your browser to view the dashboard.
+
+**Note:** The dashboard requires training to be run with metrics logging enabled (automatic in the latest version).
+
+### Web Interface for Playing Against the Model
+
+Play chess against your trained model through an interactive web interface:
+
+```bash
+# Start the web interface
+uv run python scripts/web_play.py --checkpoint checkpoints/checkpoint_5000_f192_b15.pt
+
+# Custom settings
+uv run python scripts/web_play.py \
+    --checkpoint checkpoints/checkpoint_5000_f192_b15.pt \
+    --simulations 400 \
+    --device cuda \
+    --port 5000
+```
+
+**Features:**
+- ♟️ **Interactive chessboard**: Drag-and-drop pieces (powered by chessboard.js)
+- 🎮 **Choose your color**: Play as White or Black
+- 🤖 **AI opponent**: Model uses MCTS for move selection
+- 📝 **Move history**: Track all moves in the game
+- 🎯 **Legal moves**: Only legal moves are allowed
+- 📱 **Responsive design**: Works on desktop and mobile
+
+Open http://localhost:5000 in your browser to play.
+
+**Requirements:**
+```bash
+# Install web interface dependencies
+uv pip install flask flask-cors dash plotly
+```
+
 ## Future Enhancements
 Next Steps:
 - [x] Batched GPU inference for actors
 - [x] Virtual loss for parallel MCTS
 - [x] Mixed precision inference optimization
+- [x] Training visualization dashboard
+- [x] Web interface for playing against the model
 - [ ] Opening book integration (only as an evaluation metric, DO NOT use to train network)
-- [ ] Training visualization dashboard
-- [ ] Web interface for playing against the model
 
 Potential Steps:
 - [ ] Endgame tablebase support
 - [ ] Distributed training across multiple machines
+- [ ] Tournament mode (multiple models compete)
+- [ ] ELO rating system for trained models
 
 
 ## References

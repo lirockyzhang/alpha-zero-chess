@@ -21,6 +21,7 @@ from tqdm import tqdm
 from ..neural.network import AlphaZeroNetwork
 from ..training.replay_buffer import ReplayBuffer
 from ..training.learner import Learner
+from ..training.metrics_logger import MetricsLogger
 from ..config import AlphaZeroConfig
 from .actor import Actor, ActorProcess
 
@@ -74,6 +75,9 @@ class SelfPlayCoordinator:
         # Statistics
         self.total_games = 0
         self.total_positions = 0
+
+        # Metrics logger
+        self.metrics_logger = MetricsLogger(log_dir=config.log_dir + "/metrics")
 
         # Control
         self._running = False
@@ -248,6 +252,14 @@ class SelfPlayCoordinator:
 
                     # Training step
                     metrics = self.learner.train_step()
+
+                    # Log metrics
+                    self.metrics_logger.log_step(
+                        step=step + 1,
+                        metrics=metrics,
+                        games=self.total_games,
+                        buffer_size=len(self.replay_buffer)
+                    )
 
                     # Update progress bar
                     pbar.update(1)

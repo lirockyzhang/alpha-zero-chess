@@ -37,6 +37,126 @@ ts.value = result if ts.player == 0 else -result  # ✅ Works correctly
 
 ---
 
+## Date: 2026-01-29
+
+### Issue 1: AttributeError in Endgame Evaluation
+**Location:** `alphazero/evaluation/endgame_eval.py`
+
+**Error Message:**
+```
+AttributeError: property 'board' of 'GameState' object has no setter
+```
+
+**Root Cause:**
+The `GameState` class uses an immutable design pattern where the `board` property is read-only (no setter). The endgame evaluation code attempted to directly assign a chess.Board to `state.board`, which is not allowed. Additionally, the code tried to mutate the board state with `state.board.push(move)` instead of using the immutable `apply_move()` method.
+
+**Affected Code:**
+- `EndgameEvaluator.evaluate_position()` at lines 474 and 497
+
+**Fix Applied:**
+```python
+# Before (broken):
+state = GameState()
+state.board = chess.Board(position.fen)  # ❌ AttributeError: no setter
+# ... later ...
+state.board.push(move)  # ❌ Mutates internal state incorrectly
+
+# After (fixed):
+state = GameState.from_fen(position.fen)  # ✅ Use factory method
+# ... later ...
+state = state.apply_move(move)  # ✅ Returns new immutable state
+```
+
+**Impact:**
+- **Before:** Endgame evaluation script would crash immediately when trying to evaluate any position
+- **After:** Endgame evaluation works correctly, enabling testing on 50 curated endgame positions
+
+**Design Pattern Note:**
+The `GameState` class follows functional programming principles with immutability:
+- Private `_board` attribute stores the actual board
+- Public `board` property only has a getter (returns a copy)
+- State changes return new `GameState` objects rather than mutating existing ones
+- Factory method `from_fen()` properly initializes state from FEN strings
+
+---
+
+### Issue 2: ImportError for action_to_move Function
+**Location:** Multiple files
+
+**Error Message:**
+```
+ImportError: cannot import name 'action_to_move' from 'alphazero.chess_env.moves'
+```
+
+**Root Cause:**
+The code incorrectly attempted to import `action_to_move` as a standalone function from the `alphazero.chess_env.moves` module. However, `action_to_move` is actually a method of the `GameState` class (defined in `alphazero/chess_env/board.py:188-190`), not a standalone function in the moves module.
+
+**Affected Code:**
+- `alphazero/evaluation/endgame_eval.py` at line 492
+- `alphazero/web/app.py` at line 218
+- `Google Colab/train_alphazero.ipynb` Cell 10 (lines 1003-1004)
+
+**Fix Applied:**
+
+**File 1: `alphazero/evaluation/endgame_eval.py`**
+```python
+# Before (broken):
+from alphazero.chess_env.moves import action_to_move
+# ... later ...
+move = action_to_move(action, state.board)
+
+# After (fixed):
+# No import needed - use GameState method
+# ... later ...
+move = state.action_to_move(action)
+```
+
+**File 2: `alphazero/web/app.py`**
+```python
+# Before (broken):
+from alphazero.chess_env.moves import action_to_move
+# ... later in _get_model_move() ...
+move = action_to_move(action, game.board)
+game.board.push(move)  # ❌ Also mutates state incorrectly
+
+# After (fixed):
+# No import needed - use GameState method
+# ... later in _get_model_move() ...
+move = game.action_to_move(action)
+self.games[session_id] = game.apply_move(move)  # ✅ Immutable update
+```
+
+**File 3: `Google Colab/train_alphazero.ipynb` Cell 10**
+```python
+# Before (broken):
+from alphazero.chess_env.moves import action_to_move
+move = action_to_move(action, state.board)
+state.board.push(move)  # ❌ Also mutates state incorrectly
+
+# After (fixed):
+# No import needed - use GameState method
+move = state.action_to_move(action)
+state = state.apply_move(move)  # ✅ Immutable update
+```
+
+**Impact:**
+- **Before:** Endgame evaluation, web interface, and Colab notebook would crash when trying to convert actions to moves
+- **After:** All three components work correctly, properly using the GameState API
+
+**Why This Bug Occurred:**
+1. Misunderstanding of the codebase architecture - assuming `action_to_move` was a utility function
+2. Not checking the actual location of the function before importing
+3. The bug appeared in multiple newly created files (endgame eval, web interface, Colab notebook)
+4. Existing code in `scripts/play.py` and demo files correctly used `state.action_to_move(action)`
+
+**Prevention for Future:**
+- Always verify function/method locations before importing
+- Check existing codebase for usage patterns before implementing new features
+- Use IDE features or grep to find correct import paths
+- Follow the immutable design pattern consistently (use `apply_move()` instead of `board.push()`)
+
+---
+
 ## Test Suite Additions
 
 ### 1. Batched Inference Tests (`tests/test_batched_inference.py`)

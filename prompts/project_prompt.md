@@ -42,5 +42,7 @@ Continue with the project plan you proposed:
 
 Training loop add iterations.
 
+create and maintian a document bug_fix.md and review the preivous mistake before you start writing new code
+
 Open books in epd: https://github.com/fairy-stockfish/books/tree/master
 
