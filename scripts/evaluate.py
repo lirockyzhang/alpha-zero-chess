@@ -17,6 +17,7 @@ from alphazero.evaluation import (
     Arena, MCTSPlayer, RandomPlayer, MatchStats,
     StockfishEvaluator, quick_elo_test
 )
+from alphazero.evaluation.endgame_eval import EndgameEvaluator, ENDGAME_POSITIONS
 from alphazero.utils import load_checkpoint_with_architecture
 
 
@@ -26,7 +27,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to model checkpoint")
     parser.add_argument("--opponent", type=str, default="random",
-                        choices=["random", "stockfish", "self"],
+                        choices=["random", "stockfish", "self", "endgame"],
                         help="Opponent type")
     parser.add_argument("--games", type=int, default=100,
                         help="Number of games to play")
@@ -42,6 +43,14 @@ def main():
                         help="Stockfish Elo level")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device for inference")
+    parser.add_argument("--max-moves", type=int, default=100,
+                        help="Maximum moves per endgame position (only for --opponent endgame)")
+    parser.add_argument("--category", type=str, default=None,
+                        choices=['basic_mate', 'pawn_endgame', 'rook_endgame', 'tactical'],
+                        help="Endgame category filter (only for --opponent endgame)")
+    parser.add_argument("--difficulty", type=int, default=None,
+                        choices=[1, 2, 3, 4, 5],
+                        help="Endgame difficulty filter (only for --opponent endgame)")
 
     args = parser.parse_args()
 
@@ -185,6 +194,63 @@ def main():
         print(f"  White wins: {stats.wins}")
         print(f"  Draws: {stats.draws}")
         print(f"  Black wins: {stats.losses}")
+
+    elif args.opponent == "endgame":
+        print(f"\nEvaluating on endgame positions...")
+        print(f"Max moves per position: {args.max_moves}")
+
+        # Filter positions if requested
+        positions = ENDGAME_POSITIONS
+        if args.category:
+            positions = [p for p in positions if p.category == args.category]
+            print(f"Filtered to {len(positions)} positions in category: {args.category}")
+
+        if args.difficulty:
+            positions = [p for p in positions if p.difficulty == args.difficulty]
+            print(f"Filtered to {len(positions)} positions with difficulty: {args.difficulty}")
+
+        if not positions:
+            print("Error: No positions match the specified filters")
+            sys.exit(1)
+
+        # Create endgame evaluator
+        endgame_eval = EndgameEvaluator(
+            network=network,
+            device=args.device,
+            num_simulations=args.simulations,
+            max_moves=args.max_moves,
+            use_amp=True
+        )
+
+        # Run evaluation
+        results = endgame_eval.evaluate_all(positions)
+
+        # Print summary
+        endgame_eval.print_summary(results)
+
+        # Save detailed results
+        import json
+        from pathlib import Path
+        output_file = Path(args.checkpoint).parent / "endgame_evaluation.json"
+        with open(output_file, 'w') as f:
+            # Convert results to JSON-serializable format
+            json_results = {
+                'checkpoint': args.checkpoint,
+                'num_filters': num_filters,
+                'num_blocks': num_blocks,
+                'simulations': args.simulations,
+                'total_positions': results['total_positions'],
+                'correct_results': results['correct_results'],
+                'accuracy': results['accuracy'],
+                'optimal_moves_found': results['optimal_moves_found'],
+                'avg_moves_per_position': results['avg_moves_per_position'],
+                'category_stats': results['category_stats'],
+                'difficulty_stats': results['difficulty_stats'],
+                'detailed_results': results['detailed_results']
+            }
+            json.dump(json_results, f, indent=2)
+
+        print(f"\nDetailed results saved to: {output_file}")
 
 
 if __name__ == "__main__":

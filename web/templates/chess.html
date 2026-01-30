@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AlphaZero Chess - Play Against AI</title>
+
+    <!-- Chessboard.js CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
+
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            padding: 40px;
+            max-width: 1200px;
+            width: 100%;
+        }
+
+        h1 {
+            text-align: center;
+            color: #2c3e50;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #7f8c8d;
+            margin-bottom: 30px;
+            font-size: 1.1em;
+        }
+
+        .model-info {
+            background: #ecf0f1;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+
+        .model-info span {
+            margin: 0 15px;
+            color: #34495e;
+            font-weight: 500;
+        }
+
+        .game-container {
+            display: flex;
+            gap: 30px;
+            margin-top: 20px;
+        }
+
+        .board-container {
+            flex: 1;
+        }
+
+        #board {
+            width: 100%;
+            max-width: 500px;
+            margin: 0 auto;
+        }
+
+        .controls {
+            flex: 0 0 350px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .control-group {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 10px;
+        }
+
+        .control-group h3 {
+            color: #2c3e50;
+            margin-bottom: 15px;
+            font-size: 1.2em;
+        }
+
+        button {
+            width: 100%;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-bottom: 10px;
+        }
+
+        .btn-primary {
+            background: #3498db;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #2980b9;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(52, 152, 219, 0.3);
+        }
+
+        .btn-secondary {
+            background: #95a5a6;
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: #7f8c8d;
+        }
+
+        .color-selector {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .color-btn {
+            flex: 1;
+            padding: 10px;
+            border: 2px solid #ddd;
+            background: white;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .color-btn.selected {
+            border-color: #3498db;
+            background: #ebf5fb;
+        }
+
+        .status {
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+            text-align: center;
+            font-weight: 500;
+        }
+
+        .status.info {
+            background: #d1ecf1;
+            color: #0c5460;
+        }
+
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .status.warning {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .move-history {
+            max-height: 150px;
+            overflow-y: auto;
+            background: white;
+            padding: 10px;
+            border-radius: 8px;
+            border: 1px solid #ddd;
+        }
+
+        .move-history p {
+            margin: 5px 0;
+            color: #34495e;
+        }
+
+        /* AI Evaluation Display */
+        .ai-evaluation {
+            background: white;
+            padding: 10px;
+            border-radius: 8px;
+            border: 1px solid #ddd;
+        }
+
+        .eval-value {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+            padding: 8px;
+            background: #f8f9fa;
+            border-radius: 5px;
+        }
+
+        .eval-label {
+            font-weight: 600;
+            color: #2c3e50;
+        }
+
+        .eval-score {
+            font-size: 1.2em;
+            font-weight: bold;
+        }
+
+        .eval-score.positive {
+            color: #27ae60;
+        }
+
+        .eval-score.negative {
+            color: #e74c3c;
+        }
+
+        .eval-score.neutral {
+            color: #95a5a6;
+        }
+
+        .top-moves {
+            margin-top: 10px;
+        }
+
+        .top-move {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px;
+            margin: 3px 0;
+            background: #f8f9fa;
+            border-radius: 3px;
+            font-size: 0.9em;
+        }
+
+        .move-san {
+            font-weight: 600;
+            color: #2c3e50;
+        }
+
+        .move-prob {
+            color: #7f8c8d;
+        }
+
+        /* Promotion Dialog */
+        .promotion-dialog {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .promotion-dialog.active {
+            display: flex;
+        }
+
+        .promotion-content {
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            text-align: center;
+        }
+
+        .promotion-content h2 {
+            margin-bottom: 20px;
+            color: #2c3e50;
+        }
+
+        .promotion-pieces {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+        }
+
+        .promotion-piece {
+            width: 80px;
+            height: 80px;
+            border: 2px solid #ddd;
+            border-radius: 10px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 50px;
+            transition: all 0.3s;
+        }
+
+        .promotion-piece:hover {
+            border-color: #3498db;
+            background: #ebf5fb;
+            transform: scale(1.1);
+        }
+
+        @media (max-width: 768px) {
+            .game-container {
+                flex-direction: column;
+            }
+
+            .controls {
+                flex: 1;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>♟️ AlphaZero Chess</h1>
+        <p class="subtitle">Play against the trained AI model</p>
+
+        <div class="model-info">
+            <span>🧠 Model: {{ num_filters }} filters, {{ num_blocks }} blocks</span>
+            <span>🔍 MCTS: {{ num_simulations }} simulations</span>
+        </div>
+
+        <div class="game-container">
+            <div class="board-container">
+                <div id="board"></div>
+                <div id="status" class="status info">Select your color and click "New Game" to start</div>
+            </div>
+
+            <div class="controls">
+                <div class="control-group">
+                    <h3>Game Setup</h3>
+                    <div class="color-selector">
+                        <button class="color-btn selected" id="white-btn" onclick="selectColor('white')">
+                            ⚪ White
+                        </button>
+                        <button class="color-btn" id="black-btn" onclick="selectColor('black')">
+                            ⚫ Black
+                        </button>
+                    </div>
+                    <button class="btn-primary" onclick="newGame()">🎮 New Game</button>
+                    <button class="btn-secondary" onclick="resetBoard()">🔄 Reset Board</button>
+                </div>
+
+                <div class="control-group">
+                    <h3>AI Evaluation</h3>
+                    <div class="ai-evaluation" id="ai-evaluation">
+                        <div class="eval-value">
+                            <span class="eval-label">Position Value:</span>
+                            <span class="eval-score neutral" id="eval-score">--</span>
+                        </div>
+                        <div class="top-moves" id="top-moves">
+                            <p style="color: #95a5a6; font-size: 0.9em;">No evaluation yet</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="control-group">
+                    <h3>Move History</h3>
+                    <div class="move-history" id="move-history">
+                        <p style="color: #95a5a6;">No moves yet</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Promotion Dialog -->
+    <div class="promotion-dialog" id="promotion-dialog">
+        <div class="promotion-content">
+            <h2>Choose Promotion Piece</h2>
+            <div class="promotion-pieces">
+                <div class="promotion-piece" onclick="selectPromotion('q')">♕</div>
+                <div class="promotion-piece" onclick="selectPromotion('r')">♖</div>
+                <div class="promotion-piece" onclick="selectPromotion('b')">♗</div>
+                <div class="promotion-piece" onclick="selectPromotion('n')">♘</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- jQuery -->
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+
+    <!-- Chess.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+
+    <!-- Chessboard.js -->
+    <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
+
+    <script>
+        let board = null;
+        let game = new Chess();
+        let humanColor = 'white';
+        let sessionId = 'session_' + Date.now();
+        let moveHistory = [];
+        let pendingMove = null;  // For pawn promotion
+
+        function selectColor(color) {
+            humanColor = color;
+            document.getElementById('white-btn').classList.remove('selected');
+            document.getElementById('black-btn').classList.remove('selected');
+            document.getElementById(color + '-btn').classList.add('selected');
+        }
+
+        function updateStatus(message, type = 'info') {
+            const statusEl = document.getElementById('status');
+            statusEl.textContent = message;
+            statusEl.className = 'status ' + type;
+        }
+
+        function updateMoveHistory() {
+            const historyEl = document.getElementById('move-history');
+            if (moveHistory.length === 0) {
+                historyEl.innerHTML = '<p style="color: #95a5a6;">No moves yet</p>';
+                return;
+            }
+
+            let html = '';
+            for (let i = 0; i < moveHistory.length; i += 2) {
+                const moveNum = Math.floor(i / 2) + 1;
+                const whiteMove = moveHistory[i];
+                const blackMove = moveHistory[i + 1] || '';
+                html += `<p>${moveNum}. ${whiteMove} ${blackMove}</p>`;
+            }
+            historyEl.innerHTML = html;
+            historyEl.scrollTop = historyEl.scrollHeight;
+        }
+
+        function updateEvaluation(evaluation) {
+            if (!evaluation) return;
+
+            // Update position value
+            const scoreEl = document.getElementById('eval-score');
+            const value = evaluation.value;
+            scoreEl.textContent = value.toFixed(3);
+
+            // Color code the evaluation
+            if (value > 0.1) {
+                scoreEl.className = 'eval-score positive';
+            } else if (value < -0.1) {
+                scoreEl.className = 'eval-score negative';
+            } else {
+                scoreEl.className = 'eval-score neutral';
+            }
+
+            // Update top moves
+            const topMovesEl = document.getElementById('top-moves');
+            if (evaluation.top_moves && evaluation.top_moves.length > 0) {
+                let html = '<div style="font-size: 0.85em; color: #7f8c8d; margin-bottom: 5px;">Top Moves:</div>';
+                evaluation.top_moves.forEach((move, idx) => {
+                    const prob = (move.probability * 100).toFixed(1);
+                    html += `<div class="top-move">
+                        <span class="move-san">${idx + 1}. ${move.move_san}</span>
+                        <span class="move-prob">${prob}%</span>
+                    </div>`;
+                });
+                topMovesEl.innerHTML = html;
+            } else {
+                topMovesEl.innerHTML = '<p style="color: #95a5a6; font-size: 0.9em;">No moves available</p>';
+            }
+        }
+
+        function onDragStart(source, piece, position, orientation) {
+            // Don't allow moves if game is over
+            if (game.game_over()) return false;
+
+            // Only allow human to move their pieces
+            if ((humanColor === 'white' && piece.search(/^b/) !== -1) ||
+                (humanColor === 'black' && piece.search(/^w/) !== -1)) {
+                return false;
+            }
+
+            // Don't allow moves when it's not human's turn
+            if ((humanColor === 'white' && game.turn() === 'b') ||
+                (humanColor === 'black' && game.turn() === 'w')) {
+                return false;
+            }
+        }
+
+        function onDrop(source, target) {
+            // Check if this is a pawn promotion
+            const piece = game.get(source);
+            const isPromotion = piece && piece.type === 'p' &&
+                ((piece.color === 'w' && target[1] === '8') ||
+                 (piece.color === 'b' && target[1] === '1'));
+
+            if (isPromotion) {
+                // Store the move and show promotion dialog
+                // Return 'snapback' to keep board in sync with game state until promotion is complete
+                pendingMove = { from: source, to: target };
+                document.getElementById('promotion-dialog').classList.add('active');
+                return 'snapback';
+            }
+
+            // Try to make the move (non-promotion)
+            const move = game.move({
+                from: source,
+                to: target
+            });
+
+            // Illegal move
+            if (move === null) return 'snapback';
+
+            // Add to move history
+            moveHistory.push(move.san);
+            updateMoveHistory();
+
+            // Make API call to get model's response
+            makeMove(move.from + move.to);
+        }
+
+        function selectPromotion(piece) {
+            // Hide dialog
+            document.getElementById('promotion-dialog').classList.remove('active');
+
+            if (!pendingMove) return;
+
+            // Make the promotion move
+            const move = game.move({
+                from: pendingMove.from,
+                to: pendingMove.to,
+                promotion: piece
+            });
+
+            if (move === null) {
+                board.position(game.fen());
+                pendingMove = null;
+                return;
+            }
+
+            // Update board
+            board.position(game.fen());
+
+            // Add to move history
+            moveHistory.push(move.san);
+            updateMoveHistory();
+
+            // Make API call with promotion
+            makeMove(move.from + move.to + piece);
+
+            pendingMove = null;
+        }
+
+        function onSnapEnd() {
+            board.position(game.fen());
+        }
+
+        function makeMove(moveUci) {
+            updateStatus('AI is thinking...', 'info');
+
+            fetch('/api/make_move', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    session_id: sessionId,
+                    move: moveUci
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (!data.success) {
+                    updateStatus('Error: ' + data.error, 'error');
+                    // Undo the move we made on the frontend
+                    game.undo();
+                    moveHistory.pop();
+                    updateMoveHistory();
+                    // Revert the board to the correct position
+                    board.position(game.fen());
+                    return;
+                }
+
+                // Add AI's move to history BEFORE loading new FEN
+                // (game.load() clears move history, so we must do this first)
+                if (data.model_move) {
+                    // Make AI's move on current game state to get SAN notation
+                    const aiMove = game.move(data.model_move);
+                    if (aiMove) {
+                        moveHistory.push(aiMove.san);
+                        updateMoveHistory();
+                    }
+                }
+
+                // Now sync with server's authoritative state
+                game.load(data.fen);
+                board.position(data.fen);
+
+                // Update AI evaluation
+                if (data.evaluation) {
+                    updateEvaluation(data.evaluation);
+                }
+
+                // Check if game is over
+                if (data.game_over) {
+                    const result = data.result;
+                    let message = 'Game Over! ';
+                    if (result.winner === humanColor) {
+                        message += 'You won! 🎉';
+                    } else if (result.winner === null) {
+                        message += 'Draw';
+                    } else {
+                        message += 'AI won!';
+                    }
+                    message += ' (' + result.reason + ')';
+                    updateStatus(message, result.winner === humanColor ? 'success' : 'warning');
+                } else {
+                    updateStatus('Your turn', 'info');
+                }
+            })
+            .catch(error => {
+                updateStatus('Error: ' + error.message, 'error');
+                console.error('Error:', error);
+                // Undo the move we made on the frontend
+                game.undo();
+                moveHistory.pop();
+                updateMoveHistory();
+                // Revert the board
+                board.position(game.fen());
+            });
+        }
+
+        function newGame() {
+            updateStatus('Starting new game...', 'info');
+
+            fetch('/api/new_game', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    session_id: sessionId,
+                    color: humanColor
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (!data.success) {
+                    updateStatus('Error: ' + data.error, 'error');
+                    return;
+                }
+
+                // Reset game
+                game = new Chess();
+                moveHistory = [];
+                updateMoveHistory();
+
+                // Clear evaluation
+                document.getElementById('eval-score').textContent = '--';
+                document.getElementById('eval-score').className = 'eval-score neutral';
+                document.getElementById('top-moves').innerHTML = '<p style="color: #95a5a6; font-size: 0.9em;">No evaluation yet</p>';
+
+                // Update board orientation
+                board.orientation(humanColor);
+                board.position('start');
+
+                // If human plays black, AI makes first move
+                if (humanColor === 'black' && data.model_move) {
+                    // Make AI's move on fresh game to get SAN notation
+                    // (game.load() clears history, so we must do this first)
+                    const aiMove = game.move(data.model_move);
+                    if (aiMove) {
+                        moveHistory.push(aiMove.san);
+                        updateMoveHistory();
+                    }
+
+                    // Sync with server's authoritative state
+                    game.load(data.fen);
+                    board.position(data.fen);
+
+                    // Update evaluation
+                    if (data.evaluation) {
+                        updateEvaluation(data.evaluation);
+                    }
+
+                    updateStatus('Your turn', 'info');
+                } else {
+                    updateStatus('Your turn - White to move', 'info');
+                }
+            })
+            .catch(error => {
+                updateStatus('Error: ' + error.message, 'error');
+                console.error('Error:', error);
+            });
+        }
+
+        function resetBoard() {
+            game = new Chess();
+            board.position('start');
+            moveHistory = [];
+            updateMoveHistory();
+
+            // Clear evaluation
+            document.getElementById('eval-score').textContent = '--';
+            document.getElementById('eval-score').className = 'eval-score neutral';
+            document.getElementById('top-moves').innerHTML = '<p style="color: #95a5a6; font-size: 0.9em;">No evaluation yet</p>';
+
+            updateStatus('Board reset. Click "New Game" to start playing', 'info');
+        }
+
+        // Initialize board
+        const config = {
+            draggable: true,
+            position: 'start',
+            onDragStart: onDragStart,
+            onDrop: onDrop,
+            onSnapEnd: onSnapEnd,
+            pieceTheme: 'https://chessboardjs.com/img/chesspieces/wikipedia/{piece}.png'
+        };
+        board = Chessboard('board', config);
+
+        // Make board responsive
+        $(window).resize(function() {
+            board.resize();
+        });
+    </script>
+</body>
+</html>

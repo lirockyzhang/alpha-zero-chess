@@ -154,6 +154,7 @@ uv run python scripts/train.py \
 
 ### Play Against the Model
 
+**Interactive Terminal Play:**
 ```bash
 # Play interactively (architecture auto-detected from checkpoint name)
 uv run python scripts/play.py \
@@ -175,24 +176,44 @@ uv run python scripts/play.py \
 - Type `moves` to see legal moves
 - Type `quit` to exit
 
+**Web Interface (NEW!):**
+```bash
+# Launch interactive web interface
+uv run python web/run.py --checkpoint checkpoints/checkpoint_5000_f64_b5.pt
+
+# Or with custom settings
+uv run python web/run.py \
+    --checkpoint checkpoints/checkpoint_5000_f64_b5.pt \
+    --simulations 400 \
+    --device cuda \
+    --port 5000
+```
+
+Then open `http://localhost:5000` in your browser to play with a modern drag-and-drop interface.
+
+See [`web/README.md`](web/README.md) for detailed web interface documentation.
+
 ### Evaluate Model Strength
 
 **Endgame Evaluation (50 Curated Positions):**
 ```bash
 # Evaluate on 50 endgame positions (basic mates, pawn/rook endgames, tactics)
-uv run python scripts/evaluate_endgames.py \
+uv run scripts/evaluate.py \
     --checkpoint checkpoints/checkpoint_5000_f64_b5.pt \
+    --opponent endgame \
     --simulations 400
 
 # Evaluate specific category
-uv run python scripts/evaluate_endgames.py \
+uv run python scripts/evaluate.py \
     --checkpoint checkpoints/checkpoint_5000_f64_b5.pt \
+    --opponent endgame \
     --category basic_mate \
     --simulations 200
 
 # Evaluate specific difficulty (1-5)
-uv run python scripts/evaluate_endgames.py \
+uv run python scripts/evaluate.py \
     --checkpoint checkpoints/checkpoint_5000_f64_b5.pt \
+    --opponent endgame \
     --difficulty 3 \
     --simulations 400
 ```
@@ -651,7 +672,7 @@ Next Steps:
 - [x] Mixed precision inference optimization
 - [x] Training visualization dashboard
 - [x] Web interface for playing against the model
-- [ ] Opening book integration (only as an evaluation metric, DO NOT use to train network)
+- [x] EndGame integration (only as an evaluation metric, DO NOT use to train network)
 
 Potential Steps:
 - [ ] Endgame tablebase support

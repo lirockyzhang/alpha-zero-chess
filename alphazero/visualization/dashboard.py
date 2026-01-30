@@ -257,7 +257,7 @@ class TrainingDashboard:
         print(f"Starting training dashboard on http://localhost:{self.port}")
         print(f"Monitoring metrics from: {self.log_dir}")
         print("Press Ctrl+C to stop")
-        self.app.run_server(debug=debug, port=self.port)
+        self.app.run(debug=debug, port=self.port)
 
 
 def main():
