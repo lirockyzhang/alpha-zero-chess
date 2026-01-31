@@ -1,47 +1,80 @@
- AlphaZero Training Acceleration Plan
+# Updated AlphaZero Training Acceleration Plan
 
- Goal: Achieve 5x+ training speedup while maintaining training quality (800 simulations)
+ Goal: Achieve 5x+ training speedup for 192×15 network on A100/Colab, deployable to 4060 laptop
 
  Executive Summary
 
- The current training system is bottlenecked by:
- 1. Inference batching - GPU severely underutilized (batch_size=32, timeout=1ms)
- 2. Actor parallelism - Only 4 actors generating games
- 3. MCTS backend - Python backend is 5-10x slower than Cython
+ Target Configuration:
+ - Network: 192 filters × 15 blocks (~11M parameters)
+ - Training: A100/Colab (cloud)
+ - Inference: RTX 4060 laptop (~0.5-0.8 sec/move)
+ - MCTS: 800 simulations (maintain quality)
 
- Expected combined speedup: 5-8x (without reducing simulations)
+ Bottlenecks to fix:
+ 1. Inference batching (batch_size=32 → 512)
+ 2. Actor parallelism (4 → 24 actors)
+ 3. MCTS backend (Python → Cython)
+
+ Expected speedup: 5-8x
 
  ---
  Hardware Profiles
 
- Profile: HIGH (A100 / Colab A100)
+ Profile: HIGH (A100 / Colab A100) - RECOMMENDED FOR TRAINING
 
  PROFILE_HIGH = {
+     # Network architecture (optimized for 4060 inference)
+     'filters': 192,
+     'blocks': 15,
+     'network_params': '~11M parameters',
+
+     # Self-play configuration
      'actors': 24,
+     'simulations': 800,
+     'mcts_backend': 'cython',
+
+     # Inference server
      'inference_batch_size': 512,
      'inference_timeout': 0.02,  # 20ms
+
+     # Training
      'training_batch_size': 8192,
-     'mcts_backend': 'cython',
+     'replay_buffer_size': 1_000_000,
+     'min_buffer_size': 50_000,
+
+     # Memory estimates
+     'gpu_memory_usage': '~20GB',
+     'cpu_memory_usage': '~16GB',
  }
 
- Profile: MID (T4 / V100)
+ Profile: MID (T4 16GB / V100 16GB)
 
  PROFILE_MID = {
+     'filters': 192,
+     'blocks': 15,
      'actors': 12,
-     'inference_batch_size': 256,
-     'inference_timeout': 0.015,  # 15ms
-     'training_batch_size': 4096,
+     'simulations': 800,
      'mcts_backend': 'cython',
+     'inference_batch_size': 256,
+     'inference_timeout': 0.015,
+     'training_batch_size': 4096,
+     'replay_buffer_size': 500_000,
+     'min_buffer_size': 20_000,
  }
 
- Profile: LOW (RTX 4060 Laptop / 8GB VRAM)
+ Profile: LOW (RTX 4060 Laptop 8GB) - FOR LOCAL TRAINING ONLY
 
  PROFILE_LOW = {
-     'actors': 6,
+     'filters': 64,
+     'blocks': 5,
+     'actors': 4,
+     'simulations': 800,
+     'mcts_backend': 'python',
      'inference_batch_size': 128,
-     'inference_timeout': 0.01,  # 10ms
+     'inference_timeout': 0.01,
      'training_batch_size': 2048,
-     'mcts_backend': 'python',  # Cython may not be available
+     'replay_buffer_size': 200_000,
+     'min_buffer_size': 10_000,
  }
 
  ---
@@ -51,10 +84,9 @@
 
  Files to modify:
  - alphazero/selfplay/inference_server.py (lines 68-69)
- - alphazero/config.py (add InferenceConfig)
 
  Changes:
- # inference_server.py line 47-80
+ # inference_server.py - InferenceServer.__init__
  class InferenceServer:
      def __init__(
          self,
@@ -63,8 +95,8 @@
          weight_queue: mp.Queue,
          network: nn.Module,
          device: str = "cuda",
-         batch_size: int = 256,      # Was 32 - CHANGE
-         batch_timeout: float = 0.015, # Was 0.001 - CHANGE
+         batch_size: int = 512,       # Was 32
+         batch_timeout: float = 0.02,  # Was 0.001 (20ms vs 1ms)
          use_amp: bool = True,
      ):
 
@@ -73,82 +105,123 @@
  ---
  Optimization 2: Increase Number of Actors (1.5-2x speedup)
 
- Problem: Only 4 actors generating games. More actors = better batch utilization.
+ Problem: Only 4 actors generating games.
 
  Files to modify:
- - scripts/train.py (add --profile argument)
+ - scripts/train.py
+ - alphazero/config.py
 
- Changes:
- # Add hardware profile selection
- parser.add_argument("--profile", choices=['high', 'mid', 'low', 'auto'],
-                     default='auto', help="Hardware profile for training")
+ Changes to scripts/train.py:
+ # Add profile argument
+ parser.add_argument("--profile", choices=['high', 'mid', 'low'],
+                     default='high', help="Hardware profile")
 
- Expected speedup: 1.5-2x (combined with Optimization 1)
+ # Update actor default
+ parser.add_argument("--actors", type=int, default=None,
+                     help="Number of actors (default: from profile)")
+
+ Changes to alphazero/config.py:
+ from dataclasses import dataclass
+ from typing import Optional
+
+ @dataclass
+ class TrainingProfile:
+     """Hardware-specific training configuration."""
+     name: str
+     filters: int
+     blocks: int
+     actors: int
+     simulations: int
+     inference_batch_size: int
+     inference_timeout: float
+     training_batch_size: int
+     replay_buffer_size: int
+     min_buffer_size: int
+     mcts_backend: str = 'cython'
+
+ PROFILES = {
+     'high': TrainingProfile(
+         name='high',
+         filters=192,
+         blocks=15,
+         actors=24,
+         simulations=800,
+         inference_batch_size=512,
+         inference_timeout=0.02,
+         training_batch_size=8192,
+         replay_buffer_size=1_000_000,
+         min_buffer_size=50_000,
+     ),
+     'mid': TrainingProfile(
+         name='mid',
+         filters=192,
+         blocks=15,
+         actors=12,
+         simulations=800,
+         inference_batch_size=256,
+         inference_timeout=0.015,
+         training_batch_size=4096,
+         replay_buffer_size=500_000,
+         min_buffer_size=20_000,
+     ),
+     'low': TrainingProfile(
+         name='low',
+         filters=64,
+         blocks=5,
+         actors=4,
+         simulations=800,
+         inference_batch_size=128,
+         inference_timeout=0.01,
+         training_batch_size=2048,
+         replay_buffer_size=200_000,
+         min_buffer_size=10_000,
+         mcts_backend='python',
+     ),
+ }
+
+ Expected speedup: 1.5-2x
 
  ---
  Optimization 3: Use Cython MCTS Backend (2-3x speedup)
 
- Problem: Python MCTS is slow. Cython backend is 5-10x faster.
+ Problem: Python MCTS is slow.
 
  Files to modify:
- - alphazero/mcts/cython/setup.py - Ensure builds correctly
- - scripts/train.py - Auto-detect and use Cython if available
+ - alphazero/mcts/__init__.py
+ - scripts/train.py
 
- Changes:
- # Auto-detect best available backend
- def get_best_mcts_backend():
+ Changes to alphazero/mcts/__init__.py:
+ def get_best_backend() -> str:
+     """Auto-detect best available MCTS backend."""
      try:
-         from alphazero.mcts.cython import CythonMCTS
+         from alphazero.mcts.cython.search import CythonMCTS
          return 'cython'
      except ImportError:
-         try:
-             from alphazero.mcts.cpp import CppMCTS
-             return 'cpp'
-         except ImportError:
-             return 'python'
+         pass
+
+     try:
+         from alphazero.mcts.cpp import CppMCTS
+         return 'cpp'
+     except ImportError:
+         pass
+
+     return 'python'
 
  Expected speedup: 2-3x for MCTS operations
 
  ---
- Optimization 4: Pinned Memory for Data Transfer (1.2x speedup)
+ Optimization 4: Adaptive Batch Collection (1.3x speedup)
 
- Problem: CPU→GPU data transfer uses pageable memory.
-
- Files to modify:
- - alphazero/training/learner.py (train_step method ~line 83)
-
- Changes:
- def train_step(self):
-     batch = self.replay_buffer.sample(self.batch_size)
-
-     # Use non_blocking transfers with pinned memory
-     obs = torch.from_numpy(batch['observations']).to(
-         self.device, non_blocking=True
-     )
-     target_policy = torch.from_numpy(batch['policies']).to(
-         self.device, non_blocking=True
-     )
-     target_value = torch.from_numpy(batch['values']).to(
-         self.device, non_blocking=True
-     )
-
- Expected speedup: 1.2x
-
- ---
- Optimization 5: Adaptive Batch Collection (1.3x speedup)
-
- Problem: Fixed batch timeout doesn't adapt to actor count.
+ Problem: Fixed batch timeout doesn't adapt to load.
 
  Files to modify:
- - alphazero/selfplay/inference_server.py (lines 200-250)
+ - alphazero/selfplay/inference_server.py
 
  Changes:
  def _collect_batch(self) -> List[InferenceRequest]:
      """Collect batch with adaptive timeout."""
      batch = []
      start_time = time.time()
-
-     # Adaptive: wait longer if batch is filling slowly
      min_batch = max(1, self.batch_size // 4)  # At least 25% full
 
      while len(batch) < self.batch_size:
@@ -171,62 +244,99 @@
 
      return batch
 
- Expected speedup: 1.3x (better batch utilization)
+ Expected speedup: 1.3x
 
  ---
- Implementation Plan
+ Optimization 5: Pinned Memory Transfers (1.2x speedup)
 
- Phase 1: Quick Wins (Day 1) - Expected 4x speedup
+ Files to modify:
+ - alphazero/training/learner.py
 
- 1. Update inference server defaults (batch_size, timeout)
- 2. Add hardware profile system to train.py
- 3. Increase default actor count based on profile
+ Changes:
+ def train_step(self):
+     batch = self.replay_buffer.sample(self.batch_size)
 
- Phase 2: MCTS Optimization (Day 2) - Expected +2x speedup
+     # Use non_blocking transfers
+     obs = torch.from_numpy(batch['observations']).to(
+         self.device, non_blocking=True
+     )
+     target_policy = torch.from_numpy(batch['policies']).to(
+         self.device, non_blocking=True
+     )
+     target_value = torch.from_numpy(batch['values']).to(
+         self.device, non_blocking=True
+     )
 
- 4. Ensure Cython MCTS compiles on all platforms
- 5. Add auto-detection of best MCTS backend
- 6. Add build instructions for Cython on Windows/Linux
-
- Phase 3: Data Pipeline (Day 3) - Expected +1.2x speedup
-
- 7. Add pinned memory transfers
- 8. Implement adaptive batch collection
- 9. Add performance monitoring/logging
+ Expected speedup: 1.2x
 
  ---
- Files to Modify
- ┌────────────────────────────────────────┬───────────────────────────────────────────────────────────┐
- │                  File                  │                          Changes                          │
- ├────────────────────────────────────────┼───────────────────────────────────────────────────────────┤
- │ alphazero/config.py                    │ Add InferenceConfig, hardware profiles                    │
- ├────────────────────────────────────────┼───────────────────────────────────────────────────────────┤
- │ alphazero/selfplay/inference_server.py │ Increase batch_size/timeout defaults, adaptive collection │
- ├────────────────────────────────────────┼───────────────────────────────────────────────────────────┤
- │ scripts/train.py                       │ Add --profile argument, auto-detect backend               │
- ├────────────────────────────────────────┼───────────────────────────────────────────────────────────┤
- │ alphazero/training/learner.py          │ Pinned memory transfers                                   │
- ├────────────────────────────────────────┼───────────────────────────────────────────────────────────┤
- │ alphazero/mcts/__init__.py             │ Auto-detect best backend                                  │
- └────────────────────────────────────────┴───────────────────────────────────────────────────────────┘
+ Implementation Order
+ ┌───────┬──────────────────────────────────┬────────────────────────────┬─────────┐
+ │ Phase │               Task               │           Files            │ Speedup │
+ ├───────┼──────────────────────────────────┼────────────────────────────┼─────────┤
+ │ 1     │ Add TrainingProfile to config.py │ alphazero/config.py        │ -       │
+ ├───────┼──────────────────────────────────┼────────────────────────────┼─────────┤
+ │ 2     │ Add --profile to train.py        │ scripts/train.py           │ -       │
+ ├───────┼──────────────────────────────────┼────────────────────────────┼─────────┤
+ │ 3     │ Increase batch_size/timeout      │ inference_server.py        │ 3-4x    │
+ ├───────┼──────────────────────────────────┼────────────────────────────┼─────────┤
+ │ 4     │ Apply profile actors             │ scripts/train.py           │ 1.5x    │
+ ├───────┼──────────────────────────────────┼────────────────────────────┼─────────┤
+ │ 5     │ Auto-detect MCTS backend         │ alphazero/mcts/__init__.py │ 2x      │
+ ├───────┼──────────────────────────────────┼────────────────────────────┼─────────┤
+ │ 6     │ Adaptive batch collection        │ inference_server.py        │ 1.3x    │
+ ├───────┼──────────────────────────────────┼────────────────────────────┼─────────┤
+ │ 7     │ Pinned memory                    │ learner.py                 │ 1.2x    │
+ └───────┴──────────────────────────────────┴────────────────────────────┴─────────┘
+ Total expected speedup: 5-8x
+
  ---
- New CLI Interface
+ Files to Modify (Summary)
+ ┌────────────────────────────────────────┬─────────────────────────────────────────────────┐
+ │                  File                  │                     Changes                     │
+ ├────────────────────────────────────────┼─────────────────────────────────────────────────┤
+ │ alphazero/config.py                    │ Add TrainingProfile dataclass and PROFILES dict │
+ ├────────────────────────────────────────┼─────────────────────────────────────────────────┤
+ │ alphazero/selfplay/inference_server.py │ Increase defaults, add adaptive batching        │
+ ├────────────────────────────────────────┼─────────────────────────────────────────────────┤
+ │ scripts/train.py                       │ Add --profile argument, apply profile settings  │
+ ├────────────────────────────────────────┼─────────────────────────────────────────────────┤
+ │ alphazero/training/learner.py          │ Add non_blocking transfers                      │
+ ├────────────────────────────────────────┼─────────────────────────────────────────────────┤
+ │ alphazero/mcts/__init__.py             │ Add get_best_backend() function                 │
+ └────────────────────────────────────────┴─────────────────────────────────────────────────┘
+ ---
+ New CLI Usage
 
- # Auto-detect hardware and use optimal settings
- uv run python scripts/train.py --profile auto
+ # Train on A100/Colab with optimal settings (192×15, 24 actors)
+ uv run python scripts/train.py --profile high --batched-inference
 
- # Explicit profile selection
- uv run python scripts/train.py --profile high   # A100/Colab
- uv run python scripts/train.py --profile mid    # T4/V100
- uv run python scripts/train.py --profile low    # 4060 laptop
+ # Train on T4 (192×15, 12 actors)
+ uv run python scripts/train.py --profile mid --batched-inference
+
+ # Train locally on 4060 (64×5, 4 actors) - for testing only
+ uv run python scripts/train.py --profile low --batched-inference
 
  # Override specific settings
- uv run python scripts/train.py --profile mid --actors 16 --inference-batch-size 512
+ uv run python scripts/train.py --profile high --actors 32 --inference-batch-size 1024
 
  ---
- Verification Strategy
+ Deployment to 4060 Laptop
 
- 1. Benchmark Script
+ After training on A100/Colab:
+
+ # Copy checkpoint to laptop
+ scp checkpoint_192x15.pt user@laptop:/path/to/checkpoints/
+
+ # Run web interface on laptop
+ uv run python web/run.py --checkpoint checkpoint_192x15.pt --simulations 800
+
+ # Expected: ~0.5-0.8 seconds per move
+
+ ---
+ Verification
+
+  1. Benchmark Script
 
  # Add benchmarking mode
  uv run python scripts/train.py --benchmark --profile high --steps 500
@@ -239,39 +349,170 @@
  - Inference batch fill rate (%)
  - Average inference latency (ms)
 
- 3. Expected Results by Profile
- ┌─────────┬────────┬────────────┬──────────────────┐
- │ Profile │ Actors │ Batch Size │ Expected Speedup │
- ├─────────┼────────┼────────────┼──────────────────┤
- │ HIGH    │ 24     │ 512        │ 6-8x             │
- ├─────────┼────────┼────────────┼──────────────────┤
- │ MID     │ 12     │ 256        │ 4-5x             │
- ├─────────┼────────┼────────────┼──────────────────┤
- │ LOW     │ 6      │ 128        │ 2-3x             │
- └─────────┴────────┴────────────┴──────────────────┘
- ---
- Risk Mitigation
- ┌─────────────────────────┬───────────────────────────────────────────┐
- │          Risk           │                Mitigation                 │
- ├─────────────────────────┼───────────────────────────────────────────┤
- │ OOM on smaller GPUs     │ Profile system auto-selects safe defaults │
- ├─────────────────────────┼───────────────────────────────────────────┤
- │ Cython not available    │ Graceful fallback to Python backend       │
- ├─────────────────────────┼───────────────────────────────────────────┤
- │ Windows multiprocessing │ Already fixed with spawn method           │
- ├─────────────────────────┼───────────────────────────────────────────┤
- │ Batch timeout too long  │ Adaptive collection prevents starvation   │
- └─────────────────────────┴───────────────────────────────────────────┘
+ 3. Benchmark Training Speed
+
+ # Before optimization
+ Network: 5 blocks, 64 filters
+ MCTS: 800 simulations, backend=cpp
+ Actors: 28
+ Batched inference: True
+ Mixed precision training: True
+ Mixed precision inference: True
+ Batch size: 2048
+ Replay buffer capacity: 1000000
+ Min buffer size: 10000
+ Continuous training: 10000 steps
+ Network parameters: 1,054,151
+ Resuming from checkpoints\checkpoint_run2_f64_b5.pt
+ Using batched GPU inference mode
+ 
+ 150 min to fill 10000 positions in replay buffer
+ 32 min to train 10000 steps 
+
+ # After optimization
+ uv run python scripts/train.py --benchmark --profile high --steps 500 --batched-inference 
+ # Compare: should be 5-8x faster
+
+ 2. Verify Inference on 4060
+
+ # Test inference speed
+ uv run python -c "
+ import torch
+ import time
+ from alphazero.neural import AlphaZeroNetwork
+
+ net = AlphaZeroNetwork(filters=192, blocks=15).cuda()
+ x = torch.randn(1, 119, 8, 8).cuda()
+ mask = torch.ones(1, 4672).cuda()
+
+ # Warmup
+ for _ in range(10):
+     net.predict(x, mask)
+
+ # Benchmark
+ start = time.time()
+ for _ in range(100):
+     net.predict(x, mask)
+ print(f'Inference: {(time.time()-start)/100*1000:.1f}ms per position')
+ "
+ # Expected: ~5-10ms per position on 4060
+ # With 800 sims: ~0.5-0.8 seconds per move
+
  ---
  Summary
 
- Minimum changes for 5x speedup:
- 1. inference_server.py: batch_size=256, batch_timeout=0.015
- 2. train.py: --actors 12-24 based on GPU
- 3. Auto-detect and use Cython MCTS backend
+ Your setup:
+ - Train 192×15 network on A100/Colab with HIGH profile
+ - Deploy to 4060 laptop for play (~0.5-0.8 sec/move)
+ - Expected training speedup: 5-8x
 
- Files to create/modify:
- 1. alphazero/config.py - Add hardware profiles
- 2. alphazero/selfplay/inference_server.py - Better batching
- 3. scripts/train.py - Profile selection CLI
- 4. alphazero/training/learner.py - Pinned memory
+ Key changes:
+ 1. inference_server.py: batch_size=512, timeout=20ms
+ 2. train.py: --profile high (24 actors)
+ 3. Auto-detect Cython MCTS backend
+ 4. Adaptive batch collection
+ 5. Pinned memory transfers
+ 6. Cython MCTS micro-optimizations
+
+ ---
+ Optimization 6: Cython MCTS Micro-Optimizations (1.2-1.5x speedup)
+
+ Current Cython Code Analysis
+
+ ✅ Already Optimized:
+ - Compiler directives: boundscheck=False, wraparound=False, cdivision=True
+ - Typed variables with cdef
+ - cpdef methods for C-level calls
+ - libc.math.sqrt instead of Python math
+
+ ⚠️ Optimization Opportunities:
+
+ 6.1: Inline q_value in select_child (node.pyx:137)
+
+ Current code:
+ for action, child in self._children.items():
+     q = child.q_value  # Property call - Python overhead
+
+ Optimized:
+ for action, child in self._children.items():
+     # Inline q_value calculation to avoid property overhead
+     q = child.value_sum / child.visit_count if child.visit_count > 0 else 0.0
+
+ 6.2: Pre-allocate path list (search.pyx:142)
+
+ Current code:
+ cdef list path = []
+ # ... in loop:
+ path.append((node, action))
+
+ Optimized:
+ # Pre-allocate with max expected depth (chess games rarely exceed 200 moves)
+ cdef int max_depth = 200
+ cdef list path = [None] * max_depth
+ cdef int path_len = 0
+ # ... in loop:
+ path[path_len] = (node, action)
+ path_len += 1
+
+ 6.3: Use typed memoryview for visit counts (node.pyx:180)
+
+ Current code:
+ cdef np.ndarray[FLOAT_t, ndim=1] counts = np.zeros(num_actions, dtype=np.float32)
+
+ Optimized:
+ cdef float[:] counts_view
+ cdef np.ndarray[FLOAT_t, ndim=1] counts = np.zeros(num_actions, dtype=np.float32)
+ counts_view = counts  # Typed memoryview for faster access
+
+ 6.4: Cache children iteration (node.pyx:135)
+
+ Current code:
+ for action, child in self._children.items():
+
+ Optimized:
+ cdef dict children = self._children
+ cdef list items = list(children.items())  # Single dict access
+ for action, child in items:
+
+ Files to modify:
+
+ - alphazero/mcts/cython/node.pyx (lines 135-150, 180-188)
+ - alphazero/mcts/cython/search.pyx (lines 142-152)
+
+ Expected speedup: 1.2-1.5x for MCTS operations
+
+ ---
+ Cython Verification Checklist
+
+ Before implementation, verify Cython is working:
+
+ # Check if Cython MCTS is compiled
+ uv run python -c "from alphazero.mcts.cython import CythonMCTS; print('Cython MCTS OK')"
+
+ # Benchmark Cython vs Python
+ uv run python -c "
+ from alphazero.mcts import create_mcts
+ from alphazero.config import MCTSConfig
+ from alphazero.chess_env import GameState
+ import time
+
+ config = MCTSConfig(num_simulations=100)
+
+ # Test Python
+ py_mcts = create_mcts(config, backend='python')
+ state = GameState()
+
+ start = time.time()
+ for _ in range(10):
+     py_mcts.search(state, lambda o, m: (m/m.sum(), 0.0), add_noise=False)
+ py_time = time.time() - start
+
+ # Test Cython
+ cy_mcts = create_mcts(config, backend='cython')
+ start = time.time()
+ for _ in range(10):
+     cy_mcts.search(state, lambda o, m: (m/m.sum(), 0.0), add_noise=False)
+ cy_time = time.time() - start
+
+ print(f'Python: {py_time:.2f}s, Cython: {cy_time:.2f}s, Speedup: {py_time/cy_time:.1f}x')
+ "

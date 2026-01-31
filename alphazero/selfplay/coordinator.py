@@ -10,7 +10,7 @@ import torch
 import signal
 import sys
 import traceback
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Event
 from queue import Empty
 from typing import Optional, List, Dict
 import logging
@@ -448,6 +448,7 @@ class BatchedSelfPlayCoordinator:
 
         # Control
         self._shutdown_requested = False
+        self._shutdown_event = Event()  # For signaling child processes
 
     def start_inference_server(self, num_actors: int) -> None:
         """Start the centralized GPU inference server.
@@ -474,10 +475,11 @@ class BatchedSelfPlayCoordinator:
             },
             initial_weights=initial_weights,
             device=self.config.device,
-            batch_size=32,
-            batch_timeout=0.002,
+            batch_size=getattr(self.config, 'inference_batch_size', 512),
+            batch_timeout=getattr(self.config, 'inference_timeout', 0.02),
             weight_queue=self.inference_weight_queue,
             use_amp=self.config.training.use_amp_inference,
+            shutdown_event=self._shutdown_event,
         )
         self.inference_server.start()
         logger.info(f"Started inference server with {num_actors} response queues")
@@ -509,8 +511,14 @@ class BatchedSelfPlayCoordinator:
         logger.info(f"Started {num_actors} batched actor processes")
 
     def stop_all(self) -> None:
-        """Stop all processes."""
+        """Stop all processes gracefully."""
         logger.info("Stopping all processes...")
+
+        # Signal shutdown to all child processes first
+        self._shutdown_event.set()
+
+        # Give processes a moment to notice the shutdown signal
+        time.sleep(0.5)
 
         # Stop actors first
         for actor in self.actors:
@@ -520,6 +528,7 @@ class BatchedSelfPlayCoordinator:
         for actor in self.actors:
             actor.join(timeout=2)
             if actor.is_alive():
+                logger.warning(f"Actor did not terminate gracefully, killing...")
                 actor.kill()
 
         self.actors.clear()
@@ -529,6 +538,7 @@ class BatchedSelfPlayCoordinator:
             self.inference_server.terminate()
             self.inference_server.join(timeout=2)
             if self.inference_server.is_alive():
+                logger.warning("Inference server did not terminate gracefully, killing...")
                 self.inference_server.kill()
 
         self.inference_response_queues.clear()
@@ -664,6 +674,7 @@ class BatchedSelfPlayCoordinator:
         def signal_handler(signum, frame):
             logger.info(f"Received signal {signum}, initiating graceful shutdown...")
             self._shutdown_requested = True
+            self._shutdown_event.set()  # Signal child processes
 
         try:
             signal.signal(signal.SIGINT, signal_handler)
@@ -676,6 +687,11 @@ class BatchedSelfPlayCoordinator:
             # Then start actors (uses pre-created response queues)
             self.start_actors(num_actors)
             self.train(num_steps)
+
+        except KeyboardInterrupt:
+            logger.info("KeyboardInterrupt received, shutting down...")
+            self._shutdown_requested = True
+            self._shutdown_event.set()  # Signal child processes
 
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt received, shutting down...")

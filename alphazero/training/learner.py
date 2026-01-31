@@ -93,11 +93,12 @@ class Learner:
             self.config.batch_size
         )
 
-        # Convert to tensors
-        obs_tensor = torch.from_numpy(observations).float().to(self.device)
-        mask_tensor = torch.from_numpy(legal_masks).float().to(self.device)
-        policy_tensor = torch.from_numpy(policies).float().to(self.device)
-        value_tensor = torch.from_numpy(values).float().to(self.device)
+        # Convert to tensors with non_blocking transfers for better GPU utilization
+        # non_blocking=True allows CPU→GPU transfer to overlap with computation
+        obs_tensor = torch.from_numpy(observations).float().to(self.device, non_blocking=True)
+        mask_tensor = torch.from_numpy(legal_masks).float().to(self.device, non_blocking=True)
+        policy_tensor = torch.from_numpy(policies).float().to(self.device, non_blocking=True)
+        value_tensor = torch.from_numpy(values).float().to(self.device, non_blocking=True)
 
         # Forward pass with optional mixed precision
         self.optimizer.zero_grad()

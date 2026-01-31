@@ -76,6 +76,35 @@ def get_available_backends():
     return available
 
 
+def get_best_backend() -> MCTSBackend:
+    """Auto-detect the best available MCTS backend.
+
+    Priority order (fastest to slowest):
+    1. C++ (pybind11) - 20-50x faster than Python
+    2. Cython - 5-10x faster than Python
+    3. Python - baseline (always available)
+
+    Returns:
+        MCTSBackend enum value for the fastest available backend
+    """
+    # Try C++ first (fastest)
+    try:
+        from .cpp import CppMCTS
+        return MCTSBackend.CPP
+    except ImportError:
+        pass
+
+    # Try Cython second
+    try:
+        from .cython.search import CythonMCTS
+        return MCTSBackend.CYTHON
+    except ImportError:
+        pass
+
+    # Fall back to Python (always available)
+    return MCTSBackend.PYTHON
+
+
 __all__ = [
     "MCTSBase",
     "MCTSNodeBase",
@@ -87,4 +116,5 @@ __all__ = [
     "CachedEvaluator",
     "create_mcts",
     "get_available_backends",
+    "get_best_backend",
 ]

@@ -79,6 +79,70 @@ class EvaluationConfig:
 
 
 @dataclass
+class TrainingProfile:
+    """Hardware-specific training configuration for optimal performance.
+
+    Profiles are tuned for different GPU memory and compute capabilities:
+    - HIGH: A100/H100 with 40-80GB VRAM (cloud training)
+    - MID: T4/V100 with 16GB VRAM
+    - LOW: RTX 4060/3060 with 8GB VRAM (local development)
+    """
+    name: str
+    filters: int
+    blocks: int
+    actors: int
+    simulations: int
+    inference_batch_size: int
+    inference_timeout: float
+    training_batch_size: int
+    replay_buffer_size: int
+    min_buffer_size: int
+    mcts_backend: str = 'cython'
+
+
+# Hardware profiles for different GPU configurations
+PROFILES = {
+    'high': TrainingProfile(
+        name='high',
+        filters=192,
+        blocks=15,
+        actors=64,
+        simulations=800,
+        inference_batch_size=512,
+        inference_timeout=0.02,  # 20ms
+        training_batch_size=8192,
+        replay_buffer_size=1_000_000,
+        min_buffer_size=50_000,
+    ),
+    'mid': TrainingProfile(
+        name='mid',
+        filters=192,
+        blocks=15,
+        actors=32,
+        simulations=800,
+        inference_batch_size=256,
+        inference_timeout=0.015,  # 15ms
+        training_batch_size=4096,
+        replay_buffer_size=500_000,
+        min_buffer_size=20_000,
+    ),
+    'low': TrainingProfile(
+        name='low',
+        filters=64,
+        blocks=5,
+        actors=28,
+        simulations=800,
+        inference_batch_size=128,
+        inference_timeout=0.01,  # 10ms
+        training_batch_size=2048,
+        replay_buffer_size=200_000,
+        min_buffer_size=10_000,
+        mcts_backend='cpp',
+    ),
+}
+
+
+@dataclass
 class AlphaZeroConfig:
     """Master configuration combining all sub-configs."""
     mcts: MCTSConfig = field(default_factory=MCTSConfig)

@@ -44,5 +44,9 @@ Training loop add iterations.
 
 create and maintian a document bug_fix.md and review the preivous mistake before you start writing new code
 
+## Fifth
+
+Update the logic of the web app, so that it will automatically run cars   
+
 Open books in epd: https://github.com/fairy-stockfish/books/tree/master
 

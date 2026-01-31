@@ -14,6 +14,8 @@ from .config import (
     SelfPlayConfig,
     EvaluationConfig,
     MCTSBackend,
+    TrainingProfile,
+    PROFILES,
 )
 from .utils import parse_checkpoint_architecture, load_checkpoint_with_architecture
 
@@ -26,6 +28,8 @@ __all__ = [
     "SelfPlayConfig",
     "EvaluationConfig",
     "MCTSBackend",
+    "TrainingProfile",
+    "PROFILES",
     "parse_checkpoint_architecture",
     "load_checkpoint_with_architecture",
 ]

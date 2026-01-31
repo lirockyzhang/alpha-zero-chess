@@ -19,7 +19,7 @@ import time
 import logging
 from torch.amp import autocast
 from typing import Dict, Tuple, Optional, List
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Event
 from queue import Empty
 from dataclasses import dataclass
 import traceback
@@ -65,10 +65,11 @@ class InferenceServer(Process):
         network_kwargs: dict,
         initial_weights: Optional[dict] = None,
         device: str = "cuda",
-        batch_size: int = 32,
-        batch_timeout: float = 0.001,  # 1ms timeout to collect batch
+        batch_size: int = 512,
+        batch_timeout: float = 0.02,  # 20ms timeout to collect batch (was 1ms)
         weight_queue: Optional[Queue] = None,
         use_amp: bool = True,
+        shutdown_event: Optional[Event] = None,
     ):
         """Initialize inference server.
 
@@ -83,6 +84,7 @@ class InferenceServer(Process):
             batch_timeout: Time to wait for batch to fill (seconds)
             weight_queue: Queue to receive weight updates
             use_amp: Use mixed precision (FP16) for inference
+            shutdown_event: Event to signal server shutdown
         """
         super().__init__()
         self.request_queue = request_queue
@@ -95,6 +97,7 @@ class InferenceServer(Process):
         self.batch_timeout = batch_timeout
         self.weight_queue = weight_queue
         self.use_amp = use_amp and device == "cuda"  # Only use AMP on CUDA
+        self.shutdown_event = shutdown_event
         self.daemon = True
 
         # Statistics (updated in run())
@@ -126,7 +129,13 @@ class InferenceServer(Process):
             total_batches = 0
             last_log_time = time.time()
 
-            while True:
+            # Check shutdown_event if provided, otherwise run forever (daemon will be killed)
+            def should_run():
+                if self.shutdown_event is not None:
+                    return not self.shutdown_event.is_set()
+                return True
+
+            while should_run():
                 # Check for weight updates
                 if self.weight_queue:
                     try:
@@ -187,29 +196,50 @@ class InferenceServer(Process):
                     )
                     last_log_time = now
 
+            # Graceful shutdown
+            logger.info("InferenceServer shutting down gracefully...")
+
         except Exception as e:
             logger.error(f"InferenceServer fatal error: {e}")
             logger.error(traceback.format_exc())
 
     def _collect_batch(self) -> List[InferenceRequest]:
-        """Collect a batch of requests from the queue."""
-        batch = []
-        deadline = time.time() + self.batch_timeout
+        """Collect a batch of requests with adaptive timeout.
 
-        # Get first request (blocking)
+        Uses adaptive batching strategy:
+        - Waits for at least 25% of batch_size before timing out
+        - Hard timeout at 2x configured timeout to prevent starvation
+        - This improves GPU utilization by collecting larger batches
+        """
+        batch = []
+        start_time = time.time()
+        min_batch = max(1, self.batch_size // 4)  # At least 25% full
+
+        # Get first request (blocking with longer timeout)
         try:
             request = self.request_queue.get(timeout=0.1)
             batch.append(request)
         except Empty:
             return batch
 
-        # Collect more requests until batch is full or timeout
-        while len(batch) < self.batch_size and time.time() < deadline:
+        # Collect more requests with adaptive timeout
+        while len(batch) < self.batch_size:
+            elapsed = time.time() - start_time
+
+            # Exit if timeout AND we have minimum batch
+            if elapsed > self.batch_timeout and len(batch) >= min_batch:
+                break
+
+            # Hard timeout at 2x configured timeout to prevent starvation
+            if elapsed > self.batch_timeout * 2:
+                break
+
             try:
-                request = self.request_queue.get_nowait()
+                request = self.request_queue.get(timeout=0.001)
                 batch.append(request)
             except Empty:
-                break
+                if len(batch) >= min_batch:
+                    break
 
         return batch
 
