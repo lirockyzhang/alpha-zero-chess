@@ -16,6 +16,7 @@ import time
 from ..config import AlphaZeroConfig
 from ..chess_env import GameState
 from ..mcts import create_mcts
+from ..mcts.python.parallel import ParallelMCTS
 from ..training.trajectory import Trajectory, TrajectoryState
 from .inference_server import BatchedEvaluator
 
@@ -75,11 +76,8 @@ class BatchedActorProcess(Process):
                 timeout=10.0
             )
 
-            # Create MCTS (uses CPU for tree operations only)
-            mcts = create_mcts(
-                backend=self.config.mcts.backend,
-                config=self.config.mcts
-            )
+            # Create ParallelMCTS for batched leaf evaluation
+            mcts = ParallelMCTS(config=self.config.mcts)
 
             games_played = 0
 
@@ -185,10 +183,7 @@ class BatchedActor:
         self.actor_id = actor_id
         self.evaluator = evaluator
         self.config = config or AlphaZeroConfig()
-        self.mcts = create_mcts(
-            backend=self.config.mcts.backend,
-            config=self.config.mcts
-        )
+        self.mcts = ParallelMCTS(config=self.config.mcts)
 
     def play_game(self) -> Trajectory:
         """Play a single game and return trajectory."""

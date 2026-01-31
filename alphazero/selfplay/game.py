@@ -9,6 +9,7 @@ import logging
 
 from ..chess_env import GameState
 from ..mcts import MCTSBase, create_mcts
+from ..mcts.python.parallel import ParallelMCTS
 from ..mcts.evaluator import Evaluator
 from ..training.trajectory import Trajectory
 from ..config import MCTSConfig, SelfPlayConfig
@@ -49,13 +50,25 @@ class SelfPlayGame:
         resign_counter = 0
 
         while not state.is_terminal() and move_number < self.config.max_moves:
-            # Run MCTS search
-            policy, root, stats = self.mcts.search(
-                state,
-                self.evaluator,
-                move_number=move_number,
-                add_noise=True
-            )
+            # Run MCTS search with batched leaf evaluation if supported
+            if isinstance(self.mcts, ParallelMCTS) and hasattr(self.evaluator, 'evaluate_batch'):
+                # Use batched search for better GPU utilization
+                batch_size = getattr(self.mcts.config, 'batch_size', 16)
+                policy, root, stats = self.mcts.search_with_batching(
+                    state,
+                    self.evaluator,
+                    move_number=move_number,
+                    add_noise=True,
+                    batch_size=batch_size
+                )
+            else:
+                # Fall back to regular search
+                policy, root, stats = self.mcts.search(
+                    state,
+                    self.evaluator,
+                    move_number=move_number,
+                    add_noise=True
+                )
 
             # Get observation and legal mask before applying action
             observation = state.get_observation()

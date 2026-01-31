@@ -22,6 +22,7 @@ class MCTSConfig:
     temperature: float = 1.0
     temperature_threshold: int = 30
     backend: MCTSBackend = MCTSBackend.PYTHON
+    batch_size: int = 16  # Number of leaves to batch together during search
 
 
 @dataclass
@@ -98,6 +99,7 @@ class TrainingProfile:
     replay_buffer_size: int
     min_buffer_size: int
     mcts_backend: str = 'cython'
+    mcts_batch_size: int = 16  # Number of leaves to batch together during MCTS
 
 
 # Hardware profiles for different GPU configurations
@@ -108,11 +110,12 @@ PROFILES = {
         blocks=15,
         actors=64,
         simulations=800,
-        inference_batch_size=512,
-        inference_timeout=0.02,  # 20ms
+        inference_batch_size=1024,
+        inference_timeout=0.03,  # 20ms
         training_batch_size=8192,
         replay_buffer_size=1_000_000,
         min_buffer_size=50_000,
+        mcts_batch_size=32,  # Larger batches for high-end GPUs
     ),
     'mid': TrainingProfile(
         name='mid',
@@ -125,6 +128,7 @@ PROFILES = {
         training_batch_size=4096,
         replay_buffer_size=500_000,
         min_buffer_size=20_000,
+        mcts_batch_size=16,  # Medium batches for mid-range GPUs
     ),
     'low': TrainingProfile(
         name='low',
@@ -138,6 +142,7 @@ PROFILES = {
         replay_buffer_size=200_000,
         min_buffer_size=10_000,
         mcts_backend='cpp',
+        mcts_batch_size=8,  # Smaller batches for low-end GPUs
     ),
 }
 

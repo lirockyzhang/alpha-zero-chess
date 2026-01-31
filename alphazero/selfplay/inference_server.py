@@ -44,6 +44,26 @@ class InferenceResponse:
     value: float
 
 
+@dataclass
+class BatchInferenceRequest:
+    """Batch inference request containing multiple positions."""
+    request_id: int
+    actor_id: int
+    observations: np.ndarray  # (batch_size, 119, 8, 8)
+    legal_masks: np.ndarray   # (batch_size, 4672)
+    batch_size: int
+
+
+@dataclass
+class BatchInferenceResponse:
+    """Batch inference response containing multiple evaluations."""
+    request_id: int
+    actor_id: int
+    policies: np.ndarray  # (batch_size, 4672)
+    values: np.ndarray    # (batch_size,)
+    batch_size: int
+
+
 class InferenceServer(Process):
     """Centralized GPU inference server that batches requests from actors.
 
@@ -152,35 +172,74 @@ class InferenceServer(Process):
                 if not batch:
                     continue
 
+                # Separate single and batch requests
+                single_requests = [r for r in batch if isinstance(r, InferenceRequest)]
+                batch_requests = [r for r in batch if isinstance(r, BatchInferenceRequest)]
+
                 # Run batched inference
                 try:
-                    policies, values = self._run_inference(network, batch)
+                    # Process single requests (existing logic)
+                    if single_requests:
+                        policies, values = self._run_inference(network, single_requests)
 
-                    # Send responses
-                    for i, request in enumerate(batch):
-                        response = InferenceResponse(
-                            request_id=request.request_id,
-                            policy=policies[i],
-                            value=float(values[i])
+                        # Send responses
+                        for i, request in enumerate(single_requests):
+                            response = InferenceResponse(
+                                request_id=request.request_id,
+                                policy=policies[i],
+                                value=float(values[i])
+                            )
+
+                            if request.actor_id in self.response_queues:
+                                try:
+                                    self.response_queues[request.actor_id].put(
+                                        response, timeout=1.0
+                                    )
+                                except Exception as e:
+                                    logger.warning(
+                                        f"Failed to send response to actor {request.actor_id}: {e}"
+                                    )
+                            else:
+                                logger.error(
+                                    f"No response queue for actor {request.actor_id}! "
+                                    f"Available queues: {list(self.response_queues.keys())}"
+                                )
+
+                        total_requests += len(single_requests)
+                        total_batches += 1
+
+                    # Process batch requests (new logic)
+                    for batch_request in batch_requests:
+                        policies, values = self._run_batch_inference(
+                            network,
+                            batch_request.observations,
+                            batch_request.legal_masks
+                        )
+                        response = BatchInferenceResponse(
+                            request_id=batch_request.request_id,
+                            actor_id=batch_request.actor_id,
+                            policies=policies,
+                            values=values,
+                            batch_size=batch_request.batch_size
                         )
 
-                        if request.actor_id in self.response_queues:
+                        if batch_request.actor_id in self.response_queues:
                             try:
-                                self.response_queues[request.actor_id].put(
+                                self.response_queues[batch_request.actor_id].put(
                                     response, timeout=1.0
                                 )
                             except Exception as e:
                                 logger.warning(
-                                    f"Failed to send response to actor {request.actor_id}: {e}"
+                                    f"Failed to send batch response to actor {batch_request.actor_id}: {e}"
                                 )
                         else:
                             logger.error(
-                                f"No response queue for actor {request.actor_id}! "
+                                f"No response queue for actor {batch_request.actor_id}! "
                                 f"Available queues: {list(self.response_queues.keys())}"
                             )
 
-                    total_requests += len(batch)
-                    total_batches += 1
+                        total_requests += batch_request.batch_size
+                        total_batches += 1
 
                 except Exception as e:
                     logger.error(f"Inference error: {e}")
@@ -267,6 +326,36 @@ class InferenceServer(Process):
 
         return policies.cpu().numpy(), values.cpu().numpy().flatten()
 
+    def _run_batch_inference(
+        self,
+        network: torch.nn.Module,
+        observations: np.ndarray,  # (batch_size, 119, 8, 8)
+        legal_masks: np.ndarray    # (batch_size, 4672)
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Run inference on a batch of positions.
+
+        Args:
+            network: Neural network
+            observations: Batch of observations
+            legal_masks: Batch of legal masks
+
+        Returns:
+            Tuple of (policies, values)
+        """
+        # Convert to tensors
+        obs_tensor = torch.from_numpy(observations).float().to(self.device)
+        mask_tensor = torch.from_numpy(legal_masks).float().to(self.device)
+
+        # Run inference with optional mixed precision
+        with torch.no_grad():
+            if self.use_amp:
+                with autocast('cuda'):
+                    policies, values = network.predict(obs_tensor, mask_tensor)
+            else:
+                policies, values = network.predict(obs_tensor, mask_tensor)
+
+        return policies.cpu().numpy(), values.cpu().numpy().flatten()
+
 
 class BatchedEvaluator:
     """Evaluator that sends requests to a centralized inference server.
@@ -333,6 +422,58 @@ class BatchedEvaluator:
         except Empty:
             raise TimeoutError(
                 f"Inference request {request_id} timed out after {self.timeout}s"
+            )
+
+    def evaluate_batch(
+        self,
+        observations: np.ndarray,  # (batch, 119, 8, 8)
+        legal_masks: np.ndarray    # (batch, 4672)
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Evaluate a batch of positions via the inference server.
+
+        Sends a single BatchInferenceRequest containing all positions.
+
+        Args:
+            observations: Batch of board observations
+            legal_masks: Batch of legal action masks
+
+        Returns:
+            Tuple of (policies, values) with shape (batch, 4672) and (batch,)
+        """
+        batch_size = observations.shape[0]
+        request_id = self.request_counter
+        self.request_counter += 1
+
+        # Create batch request
+        request = BatchInferenceRequest(
+            request_id=request_id,
+            actor_id=self.actor_id,
+            observations=observations.copy(),
+            legal_masks=legal_masks.copy(),
+            batch_size=batch_size
+        )
+
+        # Send request
+        self.request_queue.put(request)
+
+        # Wait for batch response
+        try:
+            response = self.response_queue.get(timeout=self.timeout)
+
+            # Verify it's a batch response
+            if not isinstance(response, BatchInferenceResponse):
+                raise TypeError(f"Expected BatchInferenceResponse, got {type(response)}")
+
+            if response.batch_size != batch_size:
+                raise ValueError(
+                    f"Response batch size {response.batch_size} != request batch size {batch_size}"
+                )
+
+            return response.policies, response.values
+
+        except Empty:
+            raise TimeoutError(
+                f"Batch inference request {request_id} timed out after {self.timeout}s"
             )
 
 

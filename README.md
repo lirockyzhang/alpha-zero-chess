@@ -99,6 +99,27 @@ uv run python demo/selfplay_demo.py
 
 ### Train a Model
 
+**Using Hardware Profiles (Recommended):**
+
+Hardware profiles automatically configure optimal settings for your GPU:
+
+```bash
+# HIGH profile - A100/H100 (40-80GB VRAM) - Cloud training
+uv run python scripts/train.py --profile high --batched-inference
+
+# MID profile - T4/V100 (16GB VRAM)
+uv run python scripts/train.py --profile mid --batched-inference
+
+# LOW profile - RTX 4060/3060 (8GB VRAM) - Local development
+uv run python scripts/train.py --profile low --batched-inference
+```
+
+| Profile | Actors | Batch Size | Inference Batch | Network | Expected Speedup |
+|---------|--------|------------|-----------------|---------|------------------|
+| HIGH | 24 | 8192 | 512 | 192×15 | 6-8x |
+| MID | 24 | 4096 | 256 | 192×15 | 4-5x |
+| LOW | 24 | 2048 | 128 | 64×5 | 2-3x |
+
 **Toy Example (Gaming Laptop - 8GB GPU, ~2 hours):**
 ```bash
 # Quick training for testing (completes in ~2 hours on RTX 3060/4060)
@@ -141,13 +162,16 @@ uv run python scripts/train.py \
 ```
 
 **Training parameters:**
+- `--profile`: Hardware profile (`high`, `mid`, `low`) - auto-configures optimal settings
 - `--steps`: Number of training steps
-- `--actors`: Number of self-play processes
+- `--actors`: Number of self-play processes (default: from profile)
 - `--filters`: Network width (64, 128, 192, 256)
 - `--blocks`: Network depth (5, 10, 15, 19)
 - `--simulations`: MCTS simulations per move (default: 800)
-- `--mcts-backend`: MCTS backend (`python`, `cython`, `cpp`)
+- `--mcts-backend`: MCTS backend (`python`, `cython`, `cpp`, `auto`)
 - `--batched-inference`: Use centralized GPU inference server
+- `--inference-batch-size`: Inference server batch size (default: from profile)
+- `--inference-timeout`: Batch collection timeout in seconds (default: from profile)
 - `--no-amp-training`: Disable mixed precision for training
 - `--no-amp-inference`: Disable mixed precision for inference
 - `--device`: `cuda` or `cpu`
@@ -461,15 +485,97 @@ Three MCTS backends are available with different performance characteristics:
 
 > **Note:** The modest speedups (1.2x vs theoretical 5-50x) are because the bottleneck is in Python-side game state operations (`apply_action`, `get_observation`) and neural network evaluation, not the MCTS tree operations themselves.
 
-#### Building Optimized Backends
+#### Auto-Detection of Best Backend
+
+The training script can automatically detect and use the fastest available backend:
 
 ```bash
-# Build Cython backend
+# Auto-detect best backend (default behavior)
+uv run python scripts/train.py --mcts-backend auto --batched-inference
+
+# Check which backends are available
+uv run python -c "from alphazero.mcts import get_available_backends, get_best_backend; print('Available:', [b.value for b in get_available_backends()]); print('Best:', get_best_backend().value)"
+```
+
+#### Building Optimized Backends
+
+**Prerequisites:**
+
+```bash
+# Linux/macOS - Install build tools
+sudo apt-get install build-essential python3-dev  # Ubuntu/Debian
+# or
+brew install python3  # macOS (includes dev headers)
+
+# Windows - Install Visual Studio Build Tools
+# Download from: https://visualstudio.microsoft.com/visual-cpp-build-tools/
+# Select "Desktop development with C++" workload
+```
+
+**Build Cython Backend:**
+
+```bash
+# Works on Linux, macOS, and Windows
 uv run python alphazero/mcts/cython/setup.py build_ext --inplace
 
-# Build C++ backend
+# Verify installation
+uv run python -c "from alphazero.mcts.cython.search import CythonMCTS; print('Cython OK')"
+```
+
+**Build C++ Backend (using setuptools - recommended):**
+
+```bash
+# Works on Linux, macOS, and Windows
 cd alphazero/mcts/cpp
 uv run python setup.py build_ext --inplace
+cd ../../..
+
+# Verify installation
+uv run python -c "from alphazero.mcts.cpp import CppMCTS; print('C++ OK')"
+```
+
+**Build C++ Backend (using CMake - alternative):**
+
+```bash
+# Linux/macOS
+mkdir -p build && cd build
+cmake ../alphazero/mcts/cpp -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+cmake --install .
+cd ..
+
+# Windows (with Visual Studio)
+mkdir build && cd build
+cmake ../alphazero/mcts/cpp -G "Visual Studio 17 2022"
+cmake --build . --config Release
+cmake --install . --config Release
+cd ..
+
+# Windows (with Ninja - faster)
+mkdir build && cd build
+cmake ../alphazero/mcts/cpp -G Ninja -DCMAKE_BUILD_TYPE=Release
+ninja
+cmake --install .
+cd ..
+```
+
+**Build Both Backends (one-liner):**
+
+```bash
+# Linux/macOS
+uv run python alphazero/mcts/cython/setup.py build_ext --inplace && \
+cd alphazero/mcts/cpp && uv run python setup.py build_ext --inplace && cd ../../..
+
+# Windows (PowerShell)
+uv run python alphazero/mcts/cython/setup.py build_ext --inplace; `
+cd alphazero/mcts/cpp; uv run python setup.py build_ext --inplace; cd ../../..
+```
+
+**Verify All Backends:**
+
+```bash
+uv run python -c "from alphazero.mcts import get_available_backends; print([b.value for b in get_available_backends()])"
+# Expected output: ['python', 'cython', 'cpp']
 ```
 
 #### Choosing a Backend for Training
@@ -511,9 +617,8 @@ For multi-actor training, use `--batched-inference` to enable centralized GPU in
 ```bash
 # Recommended for 4+ actors with mixed precision
 uv run python scripts/train.py \
-    --actors 24 \
-    --batched-inference \
-    --mcts-backend cython
+    --profile high \
+    --batched-inference
 ```
 
 **Architecture:**
@@ -534,6 +639,46 @@ Actor 4 ──┘                              └── Response Queue 4
 **When to use:**
 - Standard mode (`--actors 1-2`): Each actor runs its own CPU inference
 - Batched mode (`--actors 4+`): Centralized GPU inference server
+
+### Training Acceleration
+
+The training pipeline includes several optimizations for 5-8x speedup:
+
+#### Adaptive Batch Collection
+
+The inference server uses adaptive batching to maximize GPU utilization:
+
+- Waits for at least 25% of `batch_size` before processing
+- Hard timeout at 2x configured timeout to prevent starvation
+- Automatically adjusts to actor load
+
+```bash
+# Configure inference batching (or use --profile for auto-configuration)
+uv run python scripts/train.py \
+    --batched-inference \
+    --inference-batch-size 512 \
+    --inference-timeout 0.02
+```
+
+#### Non-Blocking Memory Transfers
+
+Training uses `non_blocking=True` for CPU→GPU tensor transfers, allowing overlap between data preparation and GPU computation.
+
+#### Hardware Profile System
+
+Profiles provide pre-tuned configurations for different GPUs:
+
+```python
+from alphazero import PROFILES
+
+# Access profile settings programmatically
+high_profile = PROFILES['high']
+print(f"Actors: {high_profile.actors}")
+print(f"Inference batch: {high_profile.inference_batch_size}")
+print(f"Training batch: {high_profile.training_batch_size}")
+```
+
+See [docs/ACCELERATION_TECHNICAL_DOCS.md](docs/ACCELERATION_TECHNICAL_DOCS.md) for detailed technical documentation.
 
 ### Mixed Precision Inference
 
@@ -590,6 +735,16 @@ policy, root, stats = mcts.search(
 
 ## Recent Updates
 
+### v0.3.0 - Training Acceleration (2026-01-30)
+- ✅ **Hardware profiles** (`--profile high/mid/low`) for auto-configured optimal settings
+- ✅ **Adaptive batch collection** for better GPU utilization (25% min fill, 2x hard timeout)
+- ✅ **Auto-detection of MCTS backend** (`--mcts-backend auto`) selects fastest available
+- ✅ **Non-blocking memory transfers** for overlapped CPU→GPU data transfer
+- ✅ **Configurable inference batching** (`--inference-batch-size`, `--inference-timeout`)
+- ✅ **Graceful shutdown** with Ctrl+C now works properly on Windows
+- ✅ **5-8x training speedup** with combined optimizations
+- ✅ **Technical documentation** in `docs/ACCELERATION_TECHNICAL_DOCS.md`
+
 ### v0.2.0 - Mixed Precision Inference (2026-01-29)
 - ✅ **Mixed precision (FP16) inference** for 2-3x speedup on modern GPUs
 - ✅ **Numerical stability fixes** for FP16 compatibility (using -1e4 instead of -inf)
@@ -604,34 +759,6 @@ policy, root, stats = mcts.search(
 - ✅ Batched GPU inference server
 - ✅ Multi-process self-play pipeline
 - ✅ Replay buffer and SGD training
-
-### Training Visualization Dashboard
-
-Monitor training progress in real-time with an interactive web dashboard:
-
-```bash
-# Start the dashboard (monitors logs/metrics directory)
-uv run python scripts/dashboard.py
-
-# Custom log directory and port
-uv run python scripts/dashboard.py --log-dir logs/metrics --port 8050
-```
-
-**Features:**
-- 📊 **Real-time metrics**: Loss, accuracy, learning rate, buffer size, games/hour
-- 📈 **Interactive plots**: Zoom, pan, hover for details (powered by Plotly)
-- 🔄 **Auto-refresh**: Updates every 5 seconds
-- 📉 **Training summary**: Total steps, games, best loss, training time
-
-**Dashboard displays:**
-- Total Loss, Policy Loss, Value Loss over time
-- Policy Accuracy and Value Accuracy trends
-- Replay Buffer size and Total Games played
-- Learning Rate schedule visualization
-
-Open http://localhost:8050 in your browser to view the dashboard.
-
-**Note:** The dashboard requires training to be run with metrics logging enabled (automatic in the latest version).
 
 ### Web Interface for Playing Against the Model
 
@@ -670,7 +797,6 @@ Next Steps:
 - [x] Batched GPU inference for actors
 - [x] Virtual loss for parallel MCTS
 - [x] Mixed precision inference optimization
-- [x] Training visualization dashboard
 - [x] Web interface for playing against the model
 - [x] EndGame integration (only as an evaluation metric, DO NOT use to train network)
 

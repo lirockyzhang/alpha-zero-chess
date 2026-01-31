@@ -22,6 +22,7 @@ from ..neural.network import AlphaZeroNetwork
 from ..training.replay_buffer import ReplayBuffer
 from ..training.learner import Learner
 from ..training.metrics_logger import MetricsLogger
+from ..training.training_monitor import TrainingMetrics
 from ..config import AlphaZeroConfig
 from .actor import Actor, ActorProcess
 
@@ -78,6 +79,9 @@ class SelfPlayCoordinator:
 
         # Metrics logger
         self.metrics_logger = MetricsLogger(log_dir=config.log_dir + "/metrics")
+
+        # Training monitor for ETA estimation
+        self.training_monitor = TrainingMetrics()
 
         # Control
         self._running = False
@@ -218,11 +222,19 @@ class SelfPlayCoordinator:
         logger.info(f"Waiting for {min_size} positions in replay buffer...")
 
         # Progress bar for replay buffer filling
+        last_eta_log = time.time()
         with tqdm(total=min_size, desc="Filling replay buffer", unit="pos") as pbar:
             while len(self.replay_buffer) < min_size and not self._shutdown_requested:
                 prev_size = len(self.replay_buffer)
                 self.collect_trajectories(timeout=1.0)
                 current_size = len(self.replay_buffer)
+
+                # Update training monitor
+                self.training_monitor.update(
+                    games=self.total_games,
+                    positions=current_size,
+                    steps=0
+                )
 
                 # Update progress bar
                 delta = current_size - prev_size
@@ -233,6 +245,12 @@ class SelfPlayCoordinator:
                         'buffer': current_size
                     })
 
+                # Log ETA every 30 seconds
+                now = time.time()
+                if now - last_eta_log >= 30:
+                    self.training_monitor.log_buffer_progress(min_size)
+                    last_eta_log = now
+
         if self._shutdown_requested:
             logger.info("Shutdown requested during warmup")
             return
@@ -240,6 +258,7 @@ class SelfPlayCoordinator:
         logger.info("Starting training...")
 
         # Progress bar for training
+        last_eta_log = time.time()
         with tqdm(total=num_steps, desc="Training", unit="step") as pbar:
             for step in range(num_steps):
                 if self._shutdown_requested:
@@ -252,6 +271,13 @@ class SelfPlayCoordinator:
 
                     # Training step
                     metrics = self.learner.train_step()
+
+                    # Update training monitor
+                    self.training_monitor.update(
+                        games=self.total_games,
+                        positions=len(self.replay_buffer),
+                        steps=step + 1
+                    )
 
                     # Log metrics
                     self.metrics_logger.log_step(
@@ -270,6 +296,12 @@ class SelfPlayCoordinator:
                         'buffer': len(self.replay_buffer),
                         'games': self.total_games
                     })
+
+                    # Log ETA every 30 seconds
+                    now = time.time()
+                    if now - last_eta_log >= 30:
+                        self.training_monitor.log_training_progress(step + 1, num_steps, metrics['loss'])
+                        last_eta_log = now
 
                     # Logging (less frequent now that we have progress bar)
                     if (step + 1) % self.config.training.log_interval == 0:
@@ -446,6 +478,9 @@ class BatchedSelfPlayCoordinator:
         self.total_games = 0
         self.total_positions = 0
 
+        # Training monitor for ETA estimation
+        self.training_monitor = TrainingMetrics()
+
         # Control
         self._shutdown_requested = False
         self._shutdown_event = Event()  # For signaling child processes
@@ -593,11 +628,19 @@ class BatchedSelfPlayCoordinator:
         logger.info(f"Waiting for {min_size} positions in replay buffer...")
 
         # Progress bar for replay buffer filling
+        last_eta_log = time.time()
         with tqdm(total=min_size, desc="Filling replay buffer", unit="pos") as pbar:
             while len(self.replay_buffer) < min_size and not self._shutdown_requested:
                 prev_size = len(self.replay_buffer)
                 self.collect_trajectories(timeout=1.0)
                 current_size = len(self.replay_buffer)
+
+                # Update training monitor
+                self.training_monitor.update(
+                    games=self.total_games,
+                    positions=current_size,
+                    steps=0
+                )
 
                 # Update progress bar
                 delta = current_size - prev_size
@@ -608,6 +651,12 @@ class BatchedSelfPlayCoordinator:
                         'buffer': current_size
                     })
 
+                # Log ETA every 30 seconds
+                now = time.time()
+                if now - last_eta_log >= 30:
+                    self.training_monitor.log_buffer_progress(min_size)
+                    last_eta_log = now
+
         if self._shutdown_requested:
             logger.info("Shutdown requested during warmup")
             return
@@ -615,6 +664,7 @@ class BatchedSelfPlayCoordinator:
         logger.info("Starting training...")
 
         # Progress bar for training
+        last_eta_log = time.time()
         with tqdm(total=num_steps, desc="Training", unit="step") as pbar:
             for step in range(num_steps):
                 if self._shutdown_requested:
@@ -625,6 +675,13 @@ class BatchedSelfPlayCoordinator:
                     self.collect_trajectories(timeout=0.001)
                     metrics = self.learner.train_step()
 
+                    # Update training monitor
+                    self.training_monitor.update(
+                        games=self.total_games,
+                        positions=len(self.replay_buffer),
+                        steps=step + 1
+                    )
+
                     # Update progress bar
                     pbar.update(1)
                     pbar.set_postfix({
@@ -634,6 +691,12 @@ class BatchedSelfPlayCoordinator:
                         'buffer': len(self.replay_buffer),
                         'games': self.total_games
                     })
+
+                    # Log ETA every 30 seconds
+                    now = time.time()
+                    if now - last_eta_log >= 30:
+                        self.training_monitor.log_training_progress(step + 1, num_steps, metrics['loss'])
+                        last_eta_log = now
 
                     if (step + 1) % self.config.training.log_interval == 0:
                         logger.info(

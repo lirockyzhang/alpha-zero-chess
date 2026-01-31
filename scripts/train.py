@@ -317,7 +317,11 @@ def main():
 
     # Create configuration
     config = AlphaZeroConfig(
-        mcts=MCTSConfig(num_simulations=simulations, backend=mcts_backend),
+        mcts=MCTSConfig(
+            num_simulations=simulations,
+            backend=mcts_backend,
+            batch_size=profile.mcts_batch_size if profile else 16
+        ),
         network=NetworkConfig(num_filters=num_filters, num_blocks=num_blocks),
         training=TrainingConfig(
             batch_size=batch_size,

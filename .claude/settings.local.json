@@ -6,7 +6,8 @@
       "Bash(uv run python:*)",
       "Bash(uv run pytest:*)",
       "Bash(python:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "WebFetch(domain:github.com)"
     ]
   },
   "outputStyle": "Explanatory"
