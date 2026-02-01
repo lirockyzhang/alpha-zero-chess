@@ -209,10 +209,16 @@ _encoder = None
 
 
 def get_encoder() -> MoveEncoder:
-    """Get the global MoveEncoder instance."""
+    """Get the global MoveEncoder instance.
+
+    IMPORTANT: This now returns the C++-aligned encoder to ensure
+    compatibility with the C++ MCTS backend.
+    """
     global _encoder
     if _encoder is None:
-        _encoder = MoveEncoder()
+        # Use C++-aligned encoder for compatibility with C++ backend
+        from .moves_cpp_aligned import get_cpp_aligned_encoder
+        _encoder = get_cpp_aligned_encoder()
     return _encoder
 
 

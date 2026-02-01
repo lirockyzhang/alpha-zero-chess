@@ -1,0 +1,74 @@
+[
+  {
+    "num_games": 32,
+    "simulations_per_game": 100,
+    "batch_size": 256,
+    "total_time_s": 0.13743909999993775,
+    "total_simulations": 3200,
+    "simulations_per_second": 23283.03954261523,
+    "avg_request_time_us": 0.13893749667204247,
+    "batches_collected": 0,
+    "total_positions": 0,
+    "avg_batch_time_ms": 0,
+    "coordinator_stats": {
+      "active_games": 32,
+      "pending_evals": 0,
+      "batch_counter": 0,
+      "next_is_hard_sync": true
+    }
+  },
+  {
+    "num_games": 64,
+    "simulations_per_game": 100,
+    "batch_size": 256,
+    "total_time_s": 0.24511419999998907,
+    "total_simulations": 6400,
+    "simulations_per_second": 26110.278392685064,
+    "avg_request_time_us": 0.1322656235913655,
+    "batches_collected": 0,
+    "total_positions": 0,
+    "avg_batch_time_ms": 0,
+    "coordinator_stats": {
+      "active_games": 64,
+      "pending_evals": 0,
+      "batch_counter": 0,
+      "next_is_hard_sync": true
+    }
+  },
+  {
+    "num_games": 128,
+    "simulations_per_game": 100,
+    "batch_size": 256,
+    "total_time_s": 0.42525170000044454,
+    "total_simulations": 12800,
+    "simulations_per_second": 30099.820882518798,
+    "avg_request_time_us": 0.1344843769857107,
+    "batches_collected": 0,
+    "total_positions": 0,
+    "avg_batch_time_ms": 0,
+    "coordinator_stats": {
+      "active_games": 128,
+      "pending_evals": 0,
+      "batch_counter": 0,
+      "next_is_hard_sync": true
+    }
+  },
+  {
+    "num_games": 256,
+    "simulations_per_game": 100,
+    "batch_size": 256,
+    "total_time_s": 0.885778300000311,
+    "total_simulations": 25600,
+    "simulations_per_second": 28901.137000072154,
+    "avg_request_time_us": 0.15801562572193006,
+    "batches_collected": 0,
+    "total_positions": 0,
+    "avg_batch_time_ms": 0,
+    "coordinator_stats": {
+      "active_games": 256,
+      "pending_evals": 0,
+      "batch_counter": 0,
+      "next_is_hard_sync": true
+    }
+  }
+]

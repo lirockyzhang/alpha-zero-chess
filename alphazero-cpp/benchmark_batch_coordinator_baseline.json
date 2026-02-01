@@ -1,0 +1,62 @@
+[
+  {
+    "num_games": 32,
+    "moves_per_game": 50,
+    "batch_size": 256,
+    "total_time_s": 0.0540482999967935,
+    "total_moves": 1600,
+    "moves_per_second": 29603.151257207395,
+    "avg_time_per_move_ms": 0.684600062586469,
+    "coordinator_stats": {
+      "active_games": 32,
+      "pending_evals": 0,
+      "batch_counter": 0,
+      "next_is_hard_sync": true
+    }
+  },
+  {
+    "num_games": 64,
+    "moves_per_game": 50,
+    "batch_size": 256,
+    "total_time_s": 0.09085330000016256,
+    "total_moves": 3200,
+    "moves_per_second": 35221.61550537266,
+    "avg_time_per_move_ms": 0.9041941562213651,
+    "coordinator_stats": {
+      "active_games": 64,
+      "pending_evals": 0,
+      "batch_counter": 0,
+      "next_is_hard_sync": true
+    }
+  },
+  {
+    "num_games": 128,
+    "moves_per_game": 50,
+    "batch_size": 256,
+    "total_time_s": 0.17699659999925643,
+    "total_moves": 6400,
+    "moves_per_second": 36158.8866680314,
+    "avg_time_per_move_ms": 0.9948989218719362,
+    "coordinator_stats": {
+      "active_games": 128,
+      "pending_evals": 0,
+      "batch_counter": 0,
+      "next_is_hard_sync": true
+    }
+  },
+  {
+    "num_games": 256,
+    "moves_per_game": 50,
+    "batch_size": 256,
+    "total_time_s": 0.3427181000006385,
+    "total_moves": 12800,
+    "moves_per_second": 37348.47969796796,
+    "avg_time_per_move_ms": 1.0371355859285813,
+    "coordinator_stats": {
+      "active_games": 256,
+      "pending_evals": 0,
+      "batch_counter": 0,
+      "next_is_hard_sync": true
+    }
+  }
+]

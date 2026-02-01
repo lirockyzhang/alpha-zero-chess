@@ -1,0 +1,13 @@
+{
+  "batch_size": 256,
+  "python_loop_mean_ms": 1.4815129999442433,
+  "cpp_sequential_mean_ms": 0.636302999982945,
+  "cpp_parallel_mean_ms": 0.2718159999949421,
+  "speedup_sequential_vs_python": 2.3283137121527835,
+  "speedup_parallel_vs_python": 5.45042602338277,
+  "speedup_parallel_vs_sequential": 2.3409328368999076,
+  "throughput_python_pos_per_sec": 172796.3237647152,
+  "throughput_sequential_pos_per_sec": 402324.05003097834,
+  "throughput_parallel_pos_per_sec": 941813.5797920784,
+  "target_met": true
+}

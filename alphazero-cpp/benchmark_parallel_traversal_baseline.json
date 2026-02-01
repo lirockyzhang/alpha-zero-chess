@@ -1,0 +1,8 @@
+{
+  "single_position_mean_us": 4.571899984512129,
+  "batch_256_mean_ms": 1.4558640000450396,
+  "throughput_pos_per_sec": 175840.60049021078,
+  "target_met": false,
+  "speedup_needed": 1.4558640000450396,
+  "theoretical_speedup": 318.4374122305731
+}

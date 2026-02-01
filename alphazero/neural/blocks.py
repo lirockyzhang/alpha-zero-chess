@@ -127,7 +127,7 @@ class PolicyHead(nn.Module):
         x = self.conv(x)
         x = self.bn(x)
         x = self.relu(x)
-        x = x.view(x.size(0), -1)
+        x = x.reshape(x.size(0), -1)  # Use reshape for non-contiguous tensors
         x = self.fc(x)
         return x
 
@@ -172,7 +172,7 @@ class ValueHead(nn.Module):
         x = self.conv(x)
         x = self.bn(x)
         x = self.relu(x)
-        x = x.view(x.size(0), -1)
+        x = x.reshape(x.size(0), -1)  # Use reshape for non-contiguous tensors
         x = self.fc1(x)
         x = self.relu(x)
         x = self.fc2(x)
