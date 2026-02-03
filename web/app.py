@@ -24,7 +24,12 @@ except ImportError:
     print("Warning: flask not installed. Install with: pip install flask flask-cors")
 
 # Use standalone module (no dependency on alphazero/ package)
-from alphazero_standalone import AlphaZeroNetwork, GameState, MCTSConfig
+try:
+    # Try relative import (when running as package)
+    from .alphazero_standalone import AlphaZeroNetwork, GameState, MCTSConfig
+except ImportError:
+    # Fall back to direct import (when running as script)
+    from alphazero_standalone import AlphaZeroNetwork, GameState, MCTSConfig
 
 # Try to import C++ backend for 122-channel encoding
 try:
