@@ -1,88 +1,24 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
+#include <pybind11/functional.h>
 #include "mcts/search.hpp"
-#include "mcts/batch_search.hpp"
 #include "mcts/node_pool.hpp"
 #include "mcts/batch_coordinator.hpp"
 #include "encoding/position_encoder.hpp"
 #include "encoding/move_encoder.hpp"
+#include "selfplay/game.hpp"
+#include "selfplay/coordinator.hpp"
+#include "selfplay/parallel_coordinator.hpp"
+#include "selfplay/evaluation_queue.hpp"
+#include "training/replay_buffer.hpp"
+#include "training/trainer.hpp"
 #include "../third_party/chess-library/include/chess.hpp"
 
 namespace py = pybind11;
 
-// Python wrapper for MCTS search
-class PyMCTSSearch {
-public:
-    PyMCTSSearch(int num_simulations = 800, float c_puct = 1.5f)
-        : pool_()
-        , search_(pool_, create_config(num_simulations, c_puct))
-    {}
-
-    // Run MCTS search and return visit counts
-    py::array_t<int32_t> search(const std::string& fen,
-                                 py::array_t<float> policy,
-                                 float value) {
-        // Parse FEN position
-        chess::Board board(fen);
-
-        // Convert numpy array to vector
-        auto policy_buf = policy.request();
-        if (policy_buf.ndim != 1 || policy_buf.shape[0] != encoding::MoveEncoder::POLICY_SIZE) {
-            throw std::runtime_error("Policy must be 1D array of size " + std::to_string(encoding::MoveEncoder::POLICY_SIZE));
-        }
-        std::vector<float> policy_vec(static_cast<float*>(policy_buf.ptr),
-                                      static_cast<float*>(policy_buf.ptr) + encoding::MoveEncoder::POLICY_SIZE);
-
-        // Run MCTS search
-        mcts::Node* root = search_.search(board, policy_vec, value);
-
-        // Extract visit counts for all legal moves
-        std::vector<int32_t> visit_counts(encoding::MoveEncoder::POLICY_SIZE, 0);
-
-        // Map each child move to policy index and store visit count
-        for (mcts::Node* child = root->first_child; child != nullptr;
-             child = child->next_sibling) {
-            // Get visit count from child node
-            uint32_t visits = child->visit_count.load(std::memory_order_relaxed);
-
-            // Convert move to policy index
-            int move_index = encoding::MoveEncoder::move_to_index(child->move, board);
-
-            // Store visit count at the corresponding policy index
-            if (move_index >= 0 && move_index < encoding::MoveEncoder::POLICY_SIZE) {
-                visit_counts[move_index] = static_cast<int32_t>(visits);
-            }
-        }
-
-        // Return as numpy array
-        return py::array_t<int32_t>(visit_counts.size(), visit_counts.data());
-    }
-
-    // Select best move using temperature
-    std::string select_move(float temperature = 0.0f) {
-        // TODO: Implement move selection
-        return "e2e4";
-    }
-
-    // Reset search tree
-    void reset() {
-        pool_.reset();
-    }
-
-private:
-    static mcts::SearchConfig create_config(int num_simulations, float c_puct) {
-        mcts::SearchConfig config;
-        config.num_simulations = num_simulations;
-        config.c_puct = c_puct;
-        config.dirichlet_alpha = 0.3f;
-        config.dirichlet_epsilon = 0.25f;
-        return config;
-    }
-
-    mcts::NodePool pool_;
-    mcts::MCTSSearch search_;
-};
+// NOTE: Old PyMCTSSearch removed - use PyBatchedMCTSSearch instead
+// The old synchronous API is no longer supported. Use the batched API for proper AlphaZero.
 
 // Python wrapper for batch coordinator
 class PyBatchCoordinator {
@@ -128,14 +64,14 @@ private:
 };
 
 // Position encoding for neural network input
-// NHWC layout: (height, width, channels) = (8, 8, 119)
+// NHWC layout: (height, width, channels) = (8, 8, 122)
 py::array_t<float> encode_position(const std::string& fen) {
     chess::Board board(fen);
 
     // Use the real position encoder
     std::vector<float> encoding = encoding::PositionEncoder::encode(board);
 
-    // Return as numpy array with NHWC shape (8, 8, 119) - channels last
+    // Return as numpy array with NHWC shape (8, 8, 122) - channels last
     return py::array_t<float>(
         {encoding::PositionEncoder::HEIGHT,
          encoding::PositionEncoder::WIDTH,
@@ -145,7 +81,7 @@ py::array_t<float> encode_position(const std::string& fen) {
 }
 
 // Zero-copy position encoding - writes directly to provided buffer
-// NHWC layout: (height, width, channels) = (8, 8, 119)
+// NHWC layout: (height, width, channels) = (8, 8, 122)
 void encode_position_to_buffer(const std::string& fen, py::array_t<float> buffer) {
     chess::Board board(fen);
 
@@ -155,7 +91,7 @@ void encode_position_to_buffer(const std::string& fen, py::array_t<float> buffer
         buf_info.shape[0] != encoding::PositionEncoder::HEIGHT ||
         buf_info.shape[1] != encoding::PositionEncoder::WIDTH ||
         buf_info.shape[2] != encoding::PositionEncoder::CHANNELS) {
-        throw std::runtime_error("Buffer must have NHWC shape (8, 8, 119)");
+        throw std::runtime_error("Buffer must have NHWC shape (8, 8, 122)");
     }
 
     // Write directly to buffer (zero-copy)
@@ -175,7 +111,7 @@ int encode_batch(const std::vector<std::string>& fens, py::array_t<float> buffer
         buf_info.shape[1] != encoding::PositionEncoder::HEIGHT ||
         buf_info.shape[2] != encoding::PositionEncoder::WIDTH ||
         buf_info.shape[3] != encoding::PositionEncoder::CHANNELS) {
-        throw std::runtime_error("Buffer must have NHWC shape (batch_size, 8, 8, 119)");
+        throw std::runtime_error("Buffer must have NHWC shape (batch_size, 8, 8, 122)");
     }
 
     // Encode batch
@@ -226,7 +162,7 @@ public:
     // Returns (num_leaves, observations, legal_masks)
     py::tuple collect_leaves() {
         // Allocate buffers for observations and masks
-        std::vector<float> obs_buffer(batch_size_ * 8 * 8 * 119, 0.0f);
+        std::vector<float> obs_buffer(batch_size_ * encoding::PositionEncoder::TOTAL_SIZE, 0.0f);
         std::vector<float> mask_buffer(batch_size_ * encoding::MoveEncoder::POLICY_SIZE, 0.0f);
 
         int num_leaves = search_.collect_leaves(obs_buffer.data(), mask_buffer.data(), batch_size_);
@@ -235,18 +171,18 @@ public:
             // Return empty arrays
             return py::make_tuple(
                 0,
-                py::array_t<float>({0, 8, 8, 119}),
+                py::array_t<float>({0, 8, 8, encoding::PositionEncoder::CHANNELS}),
                 py::array_t<float>({0, encoding::MoveEncoder::POLICY_SIZE})
             );
         }
 
         // Create numpy arrays with actual size
-        py::array_t<float> obs_array({num_leaves, 8, 8, 119});
+        py::array_t<float> obs_array({num_leaves, 8, 8, encoding::PositionEncoder::CHANNELS});
         py::array_t<float> mask_array({num_leaves, encoding::MoveEncoder::POLICY_SIZE});
 
         // Copy data
         std::memcpy(obs_array.mutable_data(), obs_buffer.data(),
-                    num_leaves * 8 * 8 * 119 * sizeof(float));
+                    num_leaves * encoding::PositionEncoder::TOTAL_SIZE * sizeof(float));
         std::memcpy(mask_array.mutable_data(), mask_buffer.data(),
                     num_leaves * encoding::MoveEncoder::POLICY_SIZE * sizeof(float));
 
@@ -311,57 +247,332 @@ private:
     }
 
     mcts::NodePool pool_;
-    mcts::BatchedMCTSSearch search_;
+    mcts::MCTSSearch search_;
     int batch_size_;
     std::string root_fen_;
+};
+
+// Python wrapper for self-play coordinator
+// Uses Python callable for neural network evaluation
+class PySelfPlayCoordinator {
+public:
+    PySelfPlayCoordinator(int num_workers = 4, int num_simulations = 800, int batch_size = 256)
+        : config_()
+    {
+        config_.num_workers = num_workers;
+        config_.game_config.num_simulations = num_simulations;
+        config_.game_config.batch_size = batch_size;
+        coordinator_ = std::make_unique<selfplay::SelfPlayCoordinator>(config_);
+    }
+
+    // Generate games using Python neural network evaluator
+    // evaluator: callable that takes (observations_flat: np.array, num_leaves: int)
+    //            and returns (policies: List[np.array], values: np.array)
+    py::list generate_games(py::object evaluator, int num_games) {
+        // Create C++ evaluator that calls Python
+        auto cpp_evaluator = [&evaluator](float* obs_data, int num_leaves,
+                                          std::vector<std::vector<float>>& policies,
+                                          std::vector<float>& values) {
+            // Acquire GIL before calling Python from C++ thread
+            py::gil_scoped_acquire acquire;
+
+            // Convert C++ buffer to numpy array
+            py::array_t<float> obs_array({num_leaves, 8, 8, encoding::PositionEncoder::CHANNELS}, obs_data);
+
+            // Call Python evaluator
+            py::object result = evaluator(obs_array, num_leaves);
+
+            // Extract results (expect tuple of (policies, values))
+            py::tuple result_tuple = result.cast<py::tuple>();
+            py::array_t<float> py_policies = result_tuple[0].cast<py::array_t<float>>();
+            py::array_t<float> py_values = result_tuple[1].cast<py::array_t<float>>();
+
+            // Convert back to C++ vectors
+            auto policies_buf = py_policies.request();
+            auto values_buf = py_values.request();
+
+            float* policies_ptr = static_cast<float*>(policies_buf.ptr);
+            float* values_ptr = static_cast<float*>(values_buf.ptr);
+
+            policies.resize(num_leaves);
+            values.resize(num_leaves);
+
+            for (int i = 0; i < num_leaves; ++i) {
+                policies[i].assign(
+                    policies_ptr + i * encoding::MoveEncoder::POLICY_SIZE,
+                    policies_ptr + (i + 1) * encoding::MoveEncoder::POLICY_SIZE
+                );
+                values[i] = values_ptr[i];
+            }
+        };
+
+        // Release GIL before calling C++ code (worker threads will reacquire as needed)
+        std::vector<selfplay::GameTrajectory> trajectories;
+        {
+            py::gil_scoped_release release;
+            trajectories = coordinator_->generate_games(cpp_evaluator, num_games);
+        }
+
+        // Convert to Python list of dictionaries
+        py::list result;
+        for (const auto& traj : trajectories) {
+            py::dict game_dict;
+
+            // Convert observations
+            py::list obs_list;
+            py::list policy_list;
+            py::list value_list;
+
+            for (const auto& state : traj.states) {
+                // Observation: shape (8, 8, 122)
+                py::array_t<float> obs_array({8, 8, encoding::PositionEncoder::CHANNELS});
+                std::memcpy(obs_array.mutable_data(), state.observation.data(),
+                           state.observation.size() * sizeof(float));
+                obs_list.append(obs_array);
+
+                // Policy: shape (4672,)
+                py::array_t<float> policy_array({encoding::MoveEncoder::POLICY_SIZE});
+                std::memcpy(policy_array.mutable_data(), state.policy.data(),
+                           state.policy.size() * sizeof(float));
+                policy_list.append(policy_array);
+
+                // Value: scalar
+                value_list.append(state.value);
+            }
+
+            game_dict["observations"] = obs_list;
+            game_dict["policies"] = policy_list;
+            game_dict["values"] = value_list;
+            game_dict["num_moves"] = traj.num_moves;
+
+            // Convert result
+            int result_value = 0;
+            if (traj.result == chess::GameResult::WIN) result_value = 1;
+            else if (traj.result == chess::GameResult::LOSE) result_value = -1;
+            game_dict["result"] = result_value;
+
+            result.append(game_dict);
+        }
+
+        return result;
+    }
+
+    // Get statistics
+    py::dict get_stats() const {
+        auto stats = coordinator_->get_stats();
+        py::dict result;
+        result["games_completed"] = stats.games_completed;
+        result["total_moves"] = stats.total_moves;
+        result["white_wins"] = stats.white_wins;
+        result["black_wins"] = stats.black_wins;
+        result["draws"] = stats.draws;
+        result["avg_game_length"] = stats.avg_game_length();
+        result["avg_game_time"] = stats.avg_game_time();
+        return result;
+    }
+
+private:
+    selfplay::CoordinatorConfig config_;
+    std::unique_ptr<selfplay::SelfPlayCoordinator> coordinator_;
+};
+
+// Python wrapper for PARALLEL self-play coordinator (cross-game batching)
+// This achieves high GPU utilization by batching NN evaluations across multiple games
+class PyParallelSelfPlayCoordinator {
+public:
+    PyParallelSelfPlayCoordinator(
+        int num_workers = 16,
+        int games_per_worker = 4,
+        int num_simulations = 800,
+        int mcts_batch_size = 64,
+        int gpu_batch_size = 512,
+        float c_puct = 1.5f,
+        float dirichlet_alpha = 0.3f,
+        float dirichlet_epsilon = 0.25f,
+        int temperature_moves = 30,
+        int gpu_timeout_ms = 20,
+        int worker_timeout_ms = 2000)
+        : replay_buffer_(nullptr)
+    {
+        config_.num_workers = num_workers;
+        config_.games_per_worker = games_per_worker;
+        config_.num_simulations = num_simulations;
+        config_.mcts_batch_size = mcts_batch_size;
+        config_.gpu_batch_size = gpu_batch_size;
+        config_.c_puct = c_puct;
+        config_.dirichlet_alpha = dirichlet_alpha;
+        config_.dirichlet_epsilon = dirichlet_epsilon;
+        config_.temperature_moves = temperature_moves;
+        config_.gpu_timeout_ms = gpu_timeout_ms;
+        config_.worker_timeout_ms = worker_timeout_ms;
+    }
+
+    // Set replay buffer (optional - if not set, games are returned instead)
+    void set_replay_buffer(training::ReplayBuffer* buffer) {
+        replay_buffer_ = buffer;
+    }
+
+    // Generate games using Python neural network evaluator
+    // evaluator: callable that takes (observations: np.array, legal_masks: np.array, batch_size: int)
+    //            and writes results to (policies: np.array, values: np.array)
+    // Returns list of game dictionaries if no replay buffer is set
+    py::object generate_games(py::object evaluator) {
+        // Create coordinator
+        auto coordinator = std::make_unique<selfplay::ParallelSelfPlayCoordinator>(
+            config_, replay_buffer_
+        );
+
+        // Create C++ evaluator callback that wraps Python callable
+        selfplay::NeuralEvaluatorFn cpp_evaluator = [&evaluator](
+            const float* observations,
+            const float* legal_masks,
+            int batch_size,
+            float* out_policies,
+            float* out_values)
+        {
+            // Acquire GIL before calling Python from C++ thread
+            py::gil_scoped_acquire acquire;
+
+            // Create numpy arrays wrapping C++ memory (no copy for input)
+            // Note: we need to create copies for safety since Python may do async operations
+            py::array_t<float> obs_array({batch_size, 8, 8, 122});
+            py::array_t<float> mask_array({batch_size, 4672});
+
+            std::memcpy(obs_array.mutable_data(), observations,
+                       batch_size * 8 * 8 * 122 * sizeof(float));
+            std::memcpy(mask_array.mutable_data(), legal_masks,
+                       batch_size * 4672 * sizeof(float));
+
+            // Call Python evaluator
+            // Expected signature: evaluator(observations, legal_masks, batch_size) -> (policies, values)
+            py::object result = evaluator(obs_array, mask_array, batch_size);
+
+            // Extract results
+            py::tuple result_tuple = result.cast<py::tuple>();
+            py::array_t<float> py_policies = result_tuple[0].cast<py::array_t<float>>();
+            py::array_t<float> py_values = result_tuple[1].cast<py::array_t<float>>();
+
+            // Copy results back to C++ buffers
+            auto policies_buf = py_policies.request();
+            auto values_buf = py_values.request();
+
+            std::memcpy(out_policies, policies_buf.ptr,
+                       batch_size * 4672 * sizeof(float));
+            std::memcpy(out_values, values_buf.ptr,
+                       batch_size * sizeof(float));
+        };
+
+        // Run generation (releases GIL during C++ execution)
+        {
+            py::gil_scoped_release release;
+            coordinator->generate_games(cpp_evaluator);
+        }
+
+        // Get stats for logging (use reference since stats contains atomics)
+        const auto& stats = coordinator->get_stats();
+        const auto& queue_metrics = coordinator->get_queue_metrics();
+
+        // Return completed games if no replay buffer
+        if (replay_buffer_ == nullptr) {
+            auto trajectories = coordinator->get_completed_games();
+
+            py::list result;
+            for (const auto& traj : trajectories) {
+                py::dict game_dict;
+
+                py::list obs_list;
+                py::list policy_list;
+                py::list value_list;
+
+                for (const auto& state : traj.states) {
+                    py::array_t<float> obs_array({8, 8, 122});
+                    std::memcpy(obs_array.mutable_data(), state.observation.data(),
+                               state.observation.size() * sizeof(float));
+                    obs_list.append(obs_array);
+
+                    py::array_t<float> policy_array({4672});
+                    std::memcpy(policy_array.mutable_data(), state.policy.data(),
+                               state.policy.size() * sizeof(float));
+                    policy_list.append(policy_array);
+
+                    value_list.append(state.value);
+                }
+
+                game_dict["observations"] = obs_list;
+                game_dict["policies"] = policy_list;
+                game_dict["values"] = value_list;
+                game_dict["num_moves"] = traj.num_moves;
+
+                int result_value = 0;
+                if (traj.result == chess::GameResult::WIN) result_value = 1;
+                else if (traj.result == chess::GameResult::LOSE) result_value = -1;
+                game_dict["result"] = result_value;
+
+                result.append(game_dict);
+            }
+
+            return result;
+        }
+
+        // Return stats dictionary if using replay buffer
+        py::dict result;
+        result["games_completed"] = stats.games_completed.load();
+        result["total_moves"] = stats.total_moves.load();
+        result["white_wins"] = stats.white_wins.load();
+        result["black_wins"] = stats.black_wins.load();
+        result["draws"] = stats.draws.load();
+        result["mcts_failures"] = stats.mcts_failures.load();  // Track evaluation failures
+        result["gpu_errors"] = stats.gpu_errors.load();  // Track GPU thread exceptions
+        result["total_simulations"] = stats.total_simulations.load();
+        result["total_nn_evals"] = stats.total_nn_evals.load();
+
+        // Queue diagnostic metrics (for debugging parallel pipeline health)
+        result["pool_exhaustion_count"] = queue_metrics.pool_exhaustion_count.load();
+        result["partial_submissions"] = queue_metrics.partial_submissions.load();
+        result["submission_drops"] = queue_metrics.submission_drops.load();
+        result["pool_resets"] = queue_metrics.pool_resets.load();
+        result["avg_batch_size"] = queue_metrics.avg_batch_size();
+        result["total_batches"] = queue_metrics.total_batches.load();
+        result["total_leaves"] = queue_metrics.total_leaves.load();
+        return result;
+    }
+
+    // Get configuration as dict
+    py::dict get_config() const {
+        py::dict d;
+        d["num_workers"] = config_.num_workers;
+        d["games_per_worker"] = config_.games_per_worker;
+        d["num_simulations"] = config_.num_simulations;
+        d["mcts_batch_size"] = config_.mcts_batch_size;
+        d["gpu_batch_size"] = config_.gpu_batch_size;
+        d["c_puct"] = config_.c_puct;
+        d["dirichlet_alpha"] = config_.dirichlet_alpha;
+        d["dirichlet_epsilon"] = config_.dirichlet_epsilon;
+        d["temperature_moves"] = config_.temperature_moves;
+        d["gpu_timeout_ms"] = config_.gpu_timeout_ms;
+        return d;
+    }
+
+    // Total games that will be generated
+    int total_games() const {
+        return config_.num_workers * config_.games_per_worker;
+    }
+
+private:
+    selfplay::ParallelSelfPlayConfig config_;
+    training::ReplayBuffer* replay_buffer_;
 };
 
 PYBIND11_MODULE(alphazero_cpp, m) {
     m.doc() = "AlphaZero C++ - High-performance MCTS for chess";
 
-    // MCTS Search class
-    py::class_<PyMCTSSearch>(m, "MCTSSearch")
-        .def(py::init<int, float>(),
-             py::arg("num_simulations") = 800,
-             py::arg("c_puct") = 1.5f,
-             "Create MCTS search engine")
-        .def("search", &PyMCTSSearch::search,
-             py::arg("fen"),
-             py::arg("policy"),
-             py::arg("value"),
-             "Run MCTS search and return visit counts")
-        .def("select_move", &PyMCTSSearch::select_move,
-             py::arg("temperature") = 0.0f,
-             "Select best move using temperature")
-        .def("reset", &PyMCTSSearch::reset,
-             "Reset search tree");
-
-    // Batch Coordinator class
-    py::class_<PyBatchCoordinator>(m, "BatchCoordinator")
-        .def(py::init<int, float>(),
-             py::arg("batch_size") = 256,
-             py::arg("batch_threshold") = 0.9f,
-             "Create batch coordinator")
-        .def("add_game", &PyBatchCoordinator::add_game,
-             py::arg("game_id"),
-             py::arg("fen"),
-             "Add game to batch")
-        .def("is_game_complete", &PyBatchCoordinator::is_game_complete,
-             py::arg("game_id"),
-             "Check if game is complete")
-        .def("remove_game", &PyBatchCoordinator::remove_game,
-             py::arg("game_id"),
-             "Remove completed game")
-        .def("get_stats", &PyBatchCoordinator::get_stats,
-             "Get coordinator statistics");
-
-    // Batched MCTS Search class (proper AlphaZero with batch leaf evaluation)
+    // MCTS Search class (batched leaf evaluation - proper AlphaZero)
     py::class_<PyBatchedMCTSSearch>(m, "BatchedMCTSSearch")
         .def(py::init<int, int, float>(),
              py::arg("num_simulations") = 800,
              py::arg("batch_size") = 256,
              py::arg("c_puct") = 1.5f,
-             "Create batched MCTS search engine with proper leaf evaluation")
+             "Create MCTS search engine with batched leaf evaluation (proper AlphaZero)")
         .def("init_search", &PyBatchedMCTSSearch::init_search,
              py::arg("fen"),
              py::arg("root_policy"),
@@ -407,6 +618,209 @@ PYBIND11_MODULE(alphazero_cpp, m) {
           py::arg("index"),
           py::arg("fen"),
           "Convert policy index to UCI move");
+
+    // Self-play coordinator (original - per-game NN calls)
+    py::class_<PySelfPlayCoordinator>(m, "SelfPlayCoordinator")
+        .def(py::init<int, int, int>(),
+             py::arg("num_workers") = 4,
+             py::arg("num_simulations") = 800,
+             py::arg("batch_size") = 256,
+             "Create self-play coordinator for multi-threaded game generation")
+        .def("generate_games", &PySelfPlayCoordinator::generate_games,
+             py::arg("evaluator"),
+             py::arg("num_games"),
+             "Generate self-play games using neural network evaluator.\n"
+             "evaluator: callable(observations, num_leaves) -> (policies, values)")
+        .def("get_stats", &PySelfPlayCoordinator::get_stats,
+             "Get self-play statistics");
+
+    // Parallel self-play coordinator (cross-game batching for high GPU utilization)
+    py::class_<PyParallelSelfPlayCoordinator>(m, "ParallelSelfPlayCoordinator")
+        .def(py::init<int, int, int, int, int, float, float, float, int, int, int>(),
+             py::arg("num_workers") = 16,
+             py::arg("games_per_worker") = 4,
+             py::arg("num_simulations") = 800,
+             py::arg("mcts_batch_size") = 64,
+             py::arg("gpu_batch_size") = 512,
+             py::arg("c_puct") = 1.5f,
+             py::arg("dirichlet_alpha") = 0.3f,
+             py::arg("dirichlet_epsilon") = 0.25f,
+             py::arg("temperature_moves") = 30,
+             py::arg("gpu_timeout_ms") = 20,
+             py::arg("worker_timeout_ms") = 2000,
+             "Create parallel self-play coordinator with cross-game batching.\n"
+             "This achieves high GPU utilization by batching NN evaluations across multiple games.\n"
+             "\nParameters:\n"
+             "  num_workers: Number of worker threads (default 16)\n"
+             "  games_per_worker: Games each worker plays (default 4)\n"
+             "  num_simulations: MCTS simulations per move (default 800)\n"
+             "  mcts_batch_size: Leaves collected per MCTS iteration (default 64)\n"
+             "  gpu_batch_size: Maximum GPU batch size (default 512)\n"
+             "  c_puct: PUCT exploration constant (default 1.5)\n"
+             "  dirichlet_alpha: Dirichlet noise alpha (default 0.3)\n"
+             "  dirichlet_epsilon: Dirichlet noise weight (default 0.25)\n"
+             "  temperature_moves: Moves with temperature=1.0 (default 30)\n"
+             "  gpu_timeout_ms: GPU batch collection timeout (default 20)\n"
+             "  worker_timeout_ms: Worker wait time for NN results (default 2000)")
+        .def("set_replay_buffer", &PyParallelSelfPlayCoordinator::set_replay_buffer,
+             py::arg("buffer"),
+             "Set replay buffer for direct data storage (optional).\n"
+             "If not set, completed games are returned from generate_games().")
+        .def("generate_games", &PyParallelSelfPlayCoordinator::generate_games,
+             py::arg("evaluator"),
+             "Generate self-play games using cross-game batching.\n"
+             "\nevaluator: callable(observations, legal_masks, batch_size) -> (policies, values)\n"
+             "  observations: np.array shape (batch_size, 8, 8, 122)\n"
+             "  legal_masks: np.array shape (batch_size, 4672)\n"
+             "  batch_size: int, number of positions to evaluate\n"
+             "  Returns: (policies np.array (batch_size, 4672), values np.array (batch_size,))\n"
+             "\nReturns: If replay_buffer is set, returns stats dict.\n"
+             "         Otherwise, returns list of game trajectories.")
+        .def("get_config", &PyParallelSelfPlayCoordinator::get_config,
+             "Get configuration as dictionary")
+        .def("total_games", &PyParallelSelfPlayCoordinator::total_games,
+             "Get total number of games that will be generated");
+
+    // Replay Buffer
+    py::class_<training::ReplayBuffer>(m, "ReplayBuffer")
+        .def(py::init<size_t>(),
+             py::arg("capacity"),
+             "Create replay buffer with fixed capacity")
+        .def("add_sample", [](training::ReplayBuffer& self,
+                             py::array_t<float> observation,
+                             py::array_t<float> policy,
+                             float value) {
+            auto obs_buf = observation.request();
+            auto pol_buf = policy.request();
+
+            std::vector<float> obs_vec(static_cast<float*>(obs_buf.ptr),
+                                       static_cast<float*>(obs_buf.ptr) + obs_buf.size);
+            std::vector<float> pol_vec(static_cast<float*>(pol_buf.ptr),
+                                       static_cast<float*>(pol_buf.ptr) + pol_buf.size);
+
+            self.add_sample(obs_vec, pol_vec, value);
+        },
+        py::arg("observation"),
+        py::arg("policy"),
+        py::arg("value"),
+        "Add a single training sample to buffer")
+        .def("add_batch", [](training::ReplayBuffer& self,
+                            py::array_t<float> observations,
+                            py::array_t<float> policies,
+                            py::array_t<float> values) {
+            // Zero-copy implementation: direct pointer access
+            auto obs_buf = observations.request();
+            auto pol_buf = policies.request();
+            auto val_buf = values.request();
+
+            size_t batch_size = obs_buf.shape[0];
+
+            // Direct pointer access (zero-copy)
+            float* obs_ptr = static_cast<float*>(obs_buf.ptr);
+            float* pol_ptr = static_cast<float*>(pol_buf.ptr);
+            float* val_ptr = static_cast<float*>(val_buf.ptr);
+
+            // Call zero-copy add_batch_raw
+            self.add_batch_raw(batch_size, obs_ptr, pol_ptr, val_ptr);
+        },
+        py::arg("observations"),
+        py::arg("policies"),
+        py::arg("values"),
+        "Add a batch of training samples to buffer")
+        .def("sample", [](training::ReplayBuffer& self, size_t batch_size) {
+            std::vector<float> observations, policies, values;
+
+            bool success = self.sample(batch_size, observations, policies, values);
+            if (!success) {
+                throw std::runtime_error("Not enough samples in buffer");
+            }
+
+            // Return as numpy arrays
+            py::array_t<float> obs_array(std::vector<size_t>{batch_size, 7808UL});
+            py::array_t<float> pol_array(std::vector<size_t>{batch_size, 4672UL});
+            py::array_t<float> val_array(std::vector<size_t>{batch_size});
+
+            std::memcpy(obs_array.mutable_data(), observations.data(),
+                       batch_size * 7808 * sizeof(float));
+            std::memcpy(pol_array.mutable_data(), policies.data(),
+                       batch_size * 4672 * sizeof(float));
+            std::memcpy(val_array.mutable_data(), values.data(),
+                       batch_size * sizeof(float));
+
+            return py::make_tuple(obs_array, pol_array, val_array);
+        },
+        py::arg("batch_size"),
+        "Sample a random batch of training data.\n"
+        "Returns: (observations, policies, values)")
+        .def("save", &training::ReplayBuffer::save,
+             py::arg("path"),
+             "Save replay buffer to disk")
+        .def("load", &training::ReplayBuffer::load,
+             py::arg("path"),
+             "Load replay buffer from disk")
+        .def("size", &training::ReplayBuffer::size,
+             "Get current number of samples in buffer")
+        .def("capacity", &training::ReplayBuffer::capacity,
+             "Get buffer capacity")
+        .def("total_added", &training::ReplayBuffer::total_added,
+             "Get total number of samples ever added")
+        .def("total_games", &training::ReplayBuffer::total_games,
+             "Get total number of games added")
+        .def("is_ready", &training::ReplayBuffer::is_ready,
+             py::arg("min_size"),
+             "Check if buffer has enough samples for training")
+        .def("clear", &training::ReplayBuffer::clear,
+             "Clear all samples from buffer")
+        .def("get_stats", [](const training::ReplayBuffer& self) {
+            auto stats = self.get_stats();
+            py::dict d;
+            d["size"] = stats.size;
+            d["capacity"] = stats.capacity;
+            d["total_added"] = stats.total_added;
+            d["total_games"] = stats.total_games;
+            d["utilization"] = stats.utilization;
+            return d;
+        },
+        "Get buffer statistics");
+
+    // Trainer
+    py::class_<training::Trainer::Config>(m, "TrainerConfig")
+        .def(py::init<>())
+        .def_readwrite("batch_size", &training::Trainer::Config::batch_size)
+        .def_readwrite("min_buffer_size", &training::Trainer::Config::min_buffer_size)
+        .def_readwrite("learning_rate", &training::Trainer::Config::learning_rate)
+        .def_readwrite("num_epochs_per_iteration", &training::Trainer::Config::num_epochs_per_iteration)
+        .def_readwrite("batches_per_epoch", &training::Trainer::Config::batches_per_epoch);
+
+    py::class_<training::Trainer>(m, "Trainer")
+        .def(py::init<const training::Trainer::Config&>(),
+             py::arg("config") = training::Trainer::Config{},
+             "Create trainer with configuration")
+        .def("is_ready", &training::Trainer::is_ready,
+             py::arg("buffer"),
+             "Check if buffer is ready for training")
+        .def("get_config", &training::Trainer::get_config,
+             py::return_value_policy::reference,
+             "Get training configuration")
+        .def("get_stats", [](const training::Trainer& self) {
+            auto stats = self.get_stats();
+            py::dict d;
+            d["total_steps"] = stats.total_steps;
+            d["total_samples_trained"] = stats.total_samples_trained;
+            d["last_loss"] = stats.last_loss;
+            d["last_policy_loss"] = stats.last_policy_loss;
+            d["last_value_loss"] = stats.last_value_loss;
+            return d;
+        },
+        "Get training statistics")
+        .def("record_step", &training::Trainer::record_step,
+             py::arg("batch_size"),
+             py::arg("loss"),
+             py::arg("policy_loss"),
+             py::arg("value_loss"),
+             "Record training step statistics")
+        .def("reset_stats", &training::Trainer::reset_stats,
+             "Reset training statistics");
 
     // Version info
     m.attr("__version__") = "1.0.0";

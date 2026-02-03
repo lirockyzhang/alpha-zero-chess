@@ -17,8 +17,12 @@ from .blocks import ConvBlock, ResidualBlock, PolicyHead, ValueHead
 class AlphaZeroNetwork(nn.Module):
     """AlphaZero neural network with policy and value heads.
 
+    Note: Input tensors should be in NCHW format (batch, 122, 8, 8) but stored
+    with channels_last memory layout for optimal Conv2d performance. The model
+    should be converted to channels_last format during initialization.
+
     Architecture:
-        Input (119, 8, 8)
+        Input (122, 8, 8) NCHW shape, NHWC memory
             |
         ConvBlock (3x3, num_filters)
             |
@@ -33,24 +37,24 @@ class AlphaZeroNetwork(nn.Module):
 
     def __init__(
         self,
-        input_channels: int = 119,
+        input_channels: int = 122,
         num_filters: int = 192,
         num_blocks: int = 15,
         num_actions: int = 4672,
         policy_filters: int = 2,
         value_filters: int = 1,
-        value_hidden: int = 192
+        value_hidden: int = 256
     ):
         """Initialize AlphaZeroNetwork.
 
         Args:
-            input_channels: Number of input planes (119 for chess)
+            input_channels: Number of input planes (122 for chess)
             num_filters: Number of filters in residual tower
             num_blocks: Number of residual blocks
             num_actions: Size of action space (4672 for chess)
-            policy_filters: Filters in policy head conv layer
-            value_filters: Filters in value head conv layer
-            value_hidden: Hidden layer size in value head
+            policy_filters: Filters in policy head conv layer (AlphaZero paper: 2)
+            value_filters: Filters in value head conv layer (AlphaZero paper: 1)
+            value_hidden: Hidden layer size in value head (AlphaZero paper: 256)
         """
         super().__init__()
 
@@ -79,7 +83,8 @@ class AlphaZeroNetwork(nn.Module):
         """Forward pass through the network.
 
         Args:
-            x: Input tensor of shape (batch, 119, 8, 8)
+            x: Input tensor of shape (batch, 122, 8, 8) in NCHW format
+               Should be stored with channels_last memory layout
             legal_mask: Optional binary mask of shape (batch, 4672)
                        If provided, illegal actions are masked to -inf
 
@@ -117,7 +122,7 @@ class AlphaZeroNetwork(nn.Module):
         """Get policy probabilities and value for inference.
 
         Args:
-            x: Input tensor of shape (batch, 119, 8, 8)
+            x: Input tensor of shape (batch, 122, 8, 8) in NCHW format
             legal_mask: Binary mask of shape (batch, 4672)
 
         Returns:
@@ -137,7 +142,7 @@ class AlphaZeroNetwork(nn.Module):
         """Convenience method for single position evaluation.
 
         Args:
-            observation: Single observation of shape (119, 8, 8)
+            observation: Single observation of shape (122, 8, 8) in NCHW format
             legal_mask: Legal action mask of shape (4672,)
 
         Returns:

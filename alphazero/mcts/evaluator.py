@@ -128,6 +128,93 @@ class RandomEvaluator:
         return policy, 0.0
 
 
+class CppEncodingEvaluator:
+    """Evaluator that uses C++ encoding (122 channels) for checkpoint compatibility.
+
+    Use this evaluator when loading checkpoints trained with the C++ backend
+    (alphazero-cpp/scripts/train.py) that use 122-channel encoding.
+
+    This evaluator accepts 119-channel observations (from Python GameState)
+    but internally re-encodes using C++ encoding before inference.
+    """
+
+    def __init__(
+        self,
+        network: torch.nn.Module,
+        device: str = "cuda",
+        use_amp: bool = True
+    ):
+        """Initialize evaluator with C++ encoding support.
+
+        Args:
+            network: AlphaZero neural network (must expect 122-channel input)
+            device: Device to run inference on
+            use_amp: Use mixed precision (FP16) for inference
+        """
+        self.network = network
+        self.device = device
+        self.use_amp = use_amp and device == "cuda"
+        self.network.eval()
+
+        # Check if C++ backend is available
+        try:
+            import sys
+            from pathlib import Path
+            # Add C++ build directory to path
+            cpp_path = Path(__file__).parent.parent.parent / "alphazero-cpp" / "build" / "Release"
+            if str(cpp_path) not in sys.path:
+                sys.path.insert(0, str(cpp_path))
+            import alphazero_cpp
+            self._cpp = alphazero_cpp
+            self._cpp_available = True
+        except ImportError:
+            self._cpp_available = False
+            raise ImportError(
+                "C++ backend (alphazero_cpp) not available. "
+                "Build it first: cd alphazero-cpp && cmake -B build && cmake --build build"
+            )
+
+    def evaluate(
+        self,
+        observation: np.ndarray,
+        legal_mask: np.ndarray,
+        fen: Optional[str] = None
+    ) -> Tuple[np.ndarray, float]:
+        """Evaluate a single position using C++ encoding.
+
+        Args:
+            observation: Board observation (119, 8, 8) - ignored if fen provided
+            legal_mask: Legal action mask (4672,)
+            fen: FEN string for the position (required for C++ encoding)
+
+        Returns:
+            Tuple of (policy, value)
+        """
+        if fen is None:
+            raise ValueError(
+                "CppEncodingEvaluator requires FEN string. "
+                "Use NetworkEvaluator for Python 119-channel encoding."
+            )
+
+        # Use C++ encoding (returns 8, 8, 122 in HWC format)
+        obs_hwc = self._cpp.encode_position(fen)
+        # Convert to CHW format (122, 8, 8)
+        obs_chw = np.transpose(obs_hwc, (2, 0, 1))
+
+        # Convert to tensors
+        obs_tensor = torch.from_numpy(obs_chw).float().unsqueeze(0).to(self.device)
+        mask_tensor = torch.from_numpy(legal_mask).float().unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            if self.use_amp:
+                with autocast('cuda'):
+                    policy, value = self.network.predict(obs_tensor, mask_tensor)
+            else:
+                policy, value = self.network.predict(obs_tensor, mask_tensor)
+
+        return policy.squeeze(0).cpu().numpy(), value.item()
+
+
 class CachedEvaluator:
     """Evaluator with position caching for repeated evaluations."""
 

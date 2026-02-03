@@ -23,11 +23,75 @@ except ImportError:
     FLASK_AVAILABLE = False
     print("Warning: flask not installed. Install with: pip install flask flask-cors")
 
-from alphazero.neural.network import AlphaZeroNetwork
-from alphazero.chess_env import GameState
-from alphazero.mcts import create_mcts
-from alphazero.mcts.evaluator import NetworkEvaluator
-from alphazero.config import MCTSConfig
+# Use standalone module (no dependency on alphazero/ package)
+from alphazero_standalone import AlphaZeroNetwork, GameState, MCTSConfig
+
+# Try to import C++ backend for 122-channel encoding
+try:
+    cpp_build_path = str(Path(__file__).parent.parent / "alphazero-cpp" / "build" / "Release")
+    if cpp_build_path not in sys.path:
+        sys.path.insert(0, cpp_build_path)
+    import alphazero_cpp
+    CPP_BACKEND_AVAILABLE = True
+except ImportError:
+    CPP_BACKEND_AVAILABLE = False
+
+
+class CppEncodingEvaluator:
+    """Evaluator that uses C++ 122-channel encoding for C++ checkpoint compatibility."""
+
+    def __init__(self, network, device: str = "cuda", use_amp: bool = True):
+        """Initialize evaluator with C++ encoding.
+
+        Args:
+            network: AlphaZero network (122 input channels)
+            device: Device to run inference on
+            use_amp: Use mixed precision inference
+        """
+        self.network = network
+        self.device = device
+        self.use_amp = use_amp and device == "cuda"
+        self.network.eval()
+
+        if not CPP_BACKEND_AVAILABLE:
+            raise ImportError(
+                "C++ backend (alphazero_cpp) not available. "
+                "Build it: cd alphazero-cpp && cmake -B build && cmake --build build --config Release"
+            )
+
+    def evaluate(self, observation: np.ndarray, legal_mask: np.ndarray,
+                 fen: str = None) -> tuple:
+        """Evaluate position using C++ encoding.
+
+        Args:
+            observation: Ignored (we use FEN instead for C++ encoding)
+            legal_mask: Legal action mask (4672,)
+            fen: FEN string (required for C++ encoding)
+
+        Returns:
+            Tuple of (policy, value)
+        """
+        if fen is None:
+            raise ValueError("CppEncodingEvaluator requires FEN string")
+
+        # Use C++ encoding: returns (8, 8, 122) HWC format
+        obs_hwc = alphazero_cpp.encode_position(fen)
+        # Convert to (122, 8, 8) CHW format
+        obs_chw = np.transpose(obs_hwc, (2, 0, 1))
+
+        # Convert to tensors
+        obs_tensor = torch.from_numpy(obs_chw).float().unsqueeze(0).to(self.device)
+        mask_tensor = torch.from_numpy(legal_mask).float().unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            if self.use_amp:
+                from torch.amp import autocast
+                with autocast('cuda'):
+                    policy, value = self.network.predict(obs_tensor, mask_tensor)
+            else:
+                policy, value = self.network.predict(obs_tensor, mask_tensor)
+
+        return policy.squeeze(0).cpu().numpy(), value.item()
 
 
 class ChessWebInterface:
@@ -54,7 +118,17 @@ class ChessWebInterface:
         # Load model
         self.network, self.num_filters, self.num_blocks = self._load_model()
 
-        # Create MCTS and evaluator
+        # Require C++ backend for encoding
+        if not CPP_BACKEND_AVAILABLE:
+            raise ImportError(
+                "C++ backend (alphazero_cpp) is required. "
+                "Build it: cd alphazero-cpp && cmake -B build && cmake --build build --config Release"
+            )
+
+        print("Using C++ encoding (122 channels)")
+        self.evaluator = CppEncodingEvaluator(self.network, device, use_amp=True)
+
+        # MCTS config (used for C++ MCTS)
         self.mcts_config = MCTSConfig(
             num_simulations=num_simulations,
             c_puct=1.25,
@@ -62,8 +136,6 @@ class ChessWebInterface:
             dirichlet_epsilon=0.0,
             temperature=0.0  # Greedy selection
         )
-        self.mcts = create_mcts(config=self.mcts_config)
-        self.evaluator = NetworkEvaluator(self.network, device, use_amp=True)
 
         # Game state storage (in-memory, keyed by session ID)
         self.games: Dict[str, GameState] = {}
@@ -79,21 +151,66 @@ class ChessWebInterface:
         self._setup_routes()
 
     def _load_model(self):
-        """Load model from checkpoint."""
+        """Load model from checkpoint.
+
+        Supports both Python and C++ checkpoint formats:
+        - Python: 'network_state_dict', 'num_filters', 'num_blocks'
+        - C++: 'model_state_dict', config dict with all params
+        """
         print(f"Loading model from {self.checkpoint_path}...")
-        checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
 
-        # Extract network architecture from checkpoint or filename
-        num_filters = checkpoint.get('num_filters', 192)
-        num_blocks = checkpoint.get('num_blocks', 15)
+        # Detect checkpoint format
+        is_cpp_checkpoint = 'model_state_dict' in checkpoint
 
-        # Create and load network
-        network = AlphaZeroNetwork(num_filters=num_filters, num_blocks=num_blocks)
-        network.load_state_dict(checkpoint['network_state_dict'])
+        if is_cpp_checkpoint:
+            # C++ checkpoint format
+            config = checkpoint.get('config', {})
+            num_filters = config.get('num_filters', 192)
+            num_blocks = config.get('num_blocks', 15)
+            input_channels = config.get('input_channels', 122)
+            policy_filters = config.get('policy_filters', 2)
+            value_hidden = config.get('value_hidden', 256)
+            backend = checkpoint.get('backend', 'cpp')
+
+            print(f"Detected C++ checkpoint (backend={backend}, version={checkpoint.get('version', '?')})")
+            print(f"  input_channels={input_channels}, policy_filters={policy_filters}, value_hidden={value_hidden}")
+
+            # Create network with C++ architecture
+            network = AlphaZeroNetwork(
+                input_channels=input_channels,
+                num_filters=num_filters,
+                num_blocks=num_blocks,
+                policy_filters=policy_filters,
+                value_hidden=value_hidden
+            )
+            network.load_state_dict(checkpoint['model_state_dict'])
+
+            # Store flag to use C++ encoding
+            self.use_cpp_encoding = True
+            self.input_channels = input_channels
+        else:
+            # Python checkpoint format
+            num_filters = checkpoint.get('num_filters', 192)
+            num_blocks = checkpoint.get('num_blocks', 15)
+
+            print("Detected Python checkpoint")
+
+            # Create network with Python architecture (119 channels)
+            network = AlphaZeroNetwork(
+                input_channels=119,
+                num_filters=num_filters,
+                num_blocks=num_blocks
+            )
+            network.load_state_dict(checkpoint['network_state_dict'])
+
+            self.use_cpp_encoding = False
+            self.input_channels = 119
+
         network = network.to(self.device)
         network.eval()
 
-        print(f"Model loaded: {num_filters} filters, {num_blocks} blocks")
+        print(f"Model loaded: {num_filters} filters, {num_blocks} blocks, {self.input_channels} input channels")
         return network, num_filters, num_blocks
 
     def _setup_routes(self):
@@ -219,12 +336,8 @@ class ChessWebInterface:
         """
         game = self.games[session_id]
 
-        # Run MCTS
-        policy, root, stats = self.mcts.search(
-            game, self.evaluator,
-            move_number=len(game.board.move_stack),
-            add_noise=False
-        )
+        # Run C++ MCTS with batched leaf evaluation
+        policy, root_value = self._run_cpp_mcts(game)
 
         # Select best action
         action = int(np.argmax(policy))
@@ -232,11 +345,10 @@ class ChessWebInterface:
         # Convert action to move using GameState method
         move = game.action_to_move(action)
 
-        # Get evaluation data using raw visit counts (not temperature-adjusted policy)
-        # This gives meaningful probabilities even when temperature=0
+        # Get evaluation data from policy (already from visit counts)
         evaluation_data = {
-            'value': float(root.q_value),  # Position evaluation from AI's perspective
-            'top_moves': self._get_top_moves(game, root, top_k=5)
+            'value': float(root_value),
+            'top_moves': self._get_top_moves_from_policy(game, policy, top_k=5)
         }
 
         # Apply move (immutable update)
@@ -244,41 +356,111 @@ class ChessWebInterface:
 
         return move.uci(), evaluation_data
 
-    def _get_top_moves(self, game: GameState, root, top_k: int = 5) -> list:
-        """Get top K moves with their probabilities from MCTS visit counts.
+    def _run_cpp_mcts(self, game: GameState) -> tuple:
+        """Run C++ MCTS with batched leaf evaluation.
 
         Args:
             game: Current game state
-            root: MCTS root node (contains visit counts for each child)
+
+        Returns:
+            Tuple of (policy, root_value)
+        """
+        fen = game.fen()
+        board = game.board
+
+        # Get initial evaluation
+        obs_hwc = alphazero_cpp.encode_position(fen)
+        obs_chw = np.transpose(obs_hwc, (2, 0, 1))
+
+        legal_mask = np.zeros(4672, dtype=np.float32)
+        for move in board.legal_moves:
+            idx = alphazero_cpp.move_to_index(move.uci(), fen)
+            if 0 <= idx < 4672:
+                legal_mask[idx] = 1.0
+
+        # Get root evaluation
+        obs_tensor = torch.from_numpy(obs_chw).float().unsqueeze(0).to(self.device)
+        mask_tensor = torch.from_numpy(legal_mask).float().unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            if self.device == "cuda":
+                from torch.amp import autocast
+                with autocast('cuda'):
+                    root_policy, root_value = self.network.predict(obs_tensor, mask_tensor)
+            else:
+                root_policy, root_value = self.network.predict(obs_tensor, mask_tensor)
+
+        root_policy = root_policy.squeeze(0).cpu().numpy().astype(np.float32)
+        root_value_float = float(root_value.item())
+
+        # Create C++ MCTS and run search
+        mcts = alphazero_cpp.BatchedMCTSSearch(
+            num_simulations=self.num_simulations,
+            batch_size=64,
+            c_puct=1.25
+        )
+        mcts.init_search(fen, root_policy, root_value_float)
+
+        # Run MCTS with batched leaf evaluation
+        while not mcts.is_complete():
+            num_leaves, obs_batch, mask_batch = mcts.collect_leaves()
+            if num_leaves == 0:
+                break
+
+            # Convert to NCHW and evaluate
+            obs_nchw = np.transpose(obs_batch[:num_leaves], (0, 3, 1, 2))
+            masks = mask_batch[:num_leaves]
+
+            obs_t = torch.from_numpy(obs_nchw).float().to(self.device)
+            mask_t = torch.from_numpy(masks).float().to(self.device)
+
+            with torch.no_grad():
+                if self.device == "cuda":
+                    from torch.amp import autocast
+                    with autocast('cuda'):
+                        leaf_policies, leaf_values = self.network.predict(obs_t, mask_t)
+                else:
+                    leaf_policies, leaf_values = self.network.predict(obs_t, mask_t)
+
+            mcts.update_leaves(
+                leaf_policies.cpu().numpy().astype(np.float32),
+                leaf_values.cpu().numpy().astype(np.float32)
+            )
+
+        # Get final policy from visit counts
+        visit_counts = mcts.get_visit_counts()
+        policy = visit_counts.astype(np.float32)
+        policy = policy * legal_mask
+        if policy.sum() > 0:
+            policy = policy / policy.sum()
+        else:
+            policy = legal_mask / legal_mask.sum()
+
+        return policy, root_value_float
+
+    def _get_top_moves_from_policy(self, game: GameState, policy: np.ndarray, top_k: int = 5) -> list:
+        """Get top K moves from policy probabilities.
+
+        Args:
+            game: Current game state
+            policy: Policy probabilities (4672,)
             top_k: Number of top moves to return
 
         Returns:
-            List of dicts with 'move' (UCI), 'move_san' (SAN), and 'probability' (float)
+            List of dicts with move info
         """
-        # Get raw visit counts from MCTS tree (not temperature-adjusted)
-        # This gives meaningful probabilities even when temperature=0
-        visit_counts = root.get_visit_counts(4672)  # 4672 = chess action space size
-
-        # Normalize to get probabilities
-        total_visits = np.sum(visit_counts)
-        if total_visits > 0:
-            probabilities = visit_counts / total_visits
-        else:
-            probabilities = visit_counts
-
-        # Get indices of top K moves by visit count
-        top_indices = np.argsort(visit_counts)[-top_k:][::-1]
+        top_indices = np.argsort(policy)[-top_k:][::-1]
 
         top_moves = []
         for idx in top_indices:
-            if visit_counts[idx] > 0:  # Only include moves that were visited
+            if policy[idx] > 0.001:  # Only include moves with meaningful probability
                 try:
                     move = game.action_to_move(int(idx))
                     top_moves.append({
                         'move': move.uci(),
-                        'move_san': game.board.san(move),  # Standard algebraic notation
-                        'probability': float(probabilities[idx]),
-                        'visits': int(visit_counts[idx])
+                        'move_san': game.board.san(move),
+                        'probability': float(policy[idx]),
+                        'visits': int(policy[idx] * self.num_simulations)  # Approximate
                     })
                 except:
                     continue

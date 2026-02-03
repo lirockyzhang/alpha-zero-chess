@@ -3,11 +3,8 @@
 Available backends:
 - python: Pure Python implementation (educational, readable)
 - cython: Cython-optimized implementation (5-10x faster)
-- cpp: C++ implementation with pybind11 (20-50x faster)
 
-C++ Backend Options:
-- CppBatchedMCTS: Proper AlphaZero with batch leaf evaluation (default, recommended for training)
-- CppMCTS: Fast but root-only evaluation (use for inference/play only)
+Note: C++ MCTS is now in the alphazero-cpp package for better organization.
 """
 
 from typing import Optional
@@ -27,8 +24,7 @@ def create_mcts(
     Args:
         backend: Which MCTS implementation to use (overrides config.backend if provided)
         config: MCTS configuration (includes backend setting)
-        use_batched: For C++ backend, use CppBatchedMCTS (proper AlphaZero) if True,
-                     or CppMCTS (fast but root-only) if False. Default: True.
+        use_batched: Deprecated parameter (kept for compatibility)
 
     Returns:
         MCTS instance
@@ -38,12 +34,7 @@ def create_mcts(
         2. `config.backend` (always respected when config is provided)
         3. Auto-detect best available backend (only when no config provided)
 
-    Note on C++ backends:
-        - CppBatchedMCTS (use_batched=True): Proper AlphaZero where every leaf
-          gets a neural network evaluation. Slower but produces high-quality
-          training data. RECOMMENDED FOR TRAINING.
-        - CppMCTS (use_batched=False): Fast but only evaluates root node.
-          Leaf expansions use uniform priors. Use for inference/play only.
+    Note: C++ backend has been moved to alphazero-cpp package.
     """
     if config is None:
         config = MCTSConfig()
@@ -70,20 +61,10 @@ def create_mcts(
             ) from e
 
     elif backend == MCTSBackend.CPP:
-        try:
-            if use_batched:
-                # Proper AlphaZero with batch leaf evaluation (recommended for training)
-                from .cpp import CppBatchedMCTS
-                return CppBatchedMCTS(config)
-            else:
-                # Fast but root-only evaluation (for inference/play)
-                from .cpp import CppMCTS
-                return CppMCTS(config)
-        except ImportError as e:
-            raise ImportError(
-                "C++ MCTS backend not available. "
-                "Build it with: cmake --build build"
-            ) from e
+        raise ImportError(
+            "C++ MCTS backend has been moved to alphazero-cpp package. "
+            "Use 'import alphazero_cpp' and create MCTS directly from that module."
+        )
 
     else:
         raise ValueError(f"Unknown MCTS backend: {backend}")
@@ -99,12 +80,6 @@ def get_available_backends():
     except ImportError:
         pass
 
-    try:
-        from .cpp import CppMCTS
-        available.append(MCTSBackend.CPP)
-    except ImportError:
-        pass
-
     return available
 
 
@@ -112,21 +87,15 @@ def get_best_backend() -> MCTSBackend:
     """Auto-detect the best available MCTS backend.
 
     Priority order (fastest to slowest):
-    1. C++ (pybind11) - 20-50x faster than Python
-    2. Cython - 5-10x faster than Python
-    3. Python - baseline (always available)
+    1. Cython - 5-10x faster than Python
+    2. Python - baseline (always available)
+
+    Note: C++ backend has been moved to alphazero-cpp package.
 
     Returns:
         MCTSBackend enum value for the fastest available backend
     """
-    # Try C++ first (fastest)
-    try:
-        from .cpp import CppMCTS
-        return MCTSBackend.CPP
-    except ImportError:
-        pass
-
-    # Try Cython second
+    # Try Cython first
     try:
         from .cython.search import CythonMCTS
         return MCTSBackend.CYTHON

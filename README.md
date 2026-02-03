@@ -15,9 +15,10 @@ This project implements a complete AlphaZero chess engine from scratch, includin
 ## Features
 
 ### Chess Environment
-- **119-plane board encoding** with 8-step position history
+- **122-plane board encoding** with 8-step position history (AlphaZero paper spec)
 - **4672-action move space** covering all legal chess moves
 - Efficient move encoding/decoding with `python-chess`
+- C++ encoding for maximum performance
 
 ### Neural Network
 - **ResNet architecture**: 15 residual blocks, 192 filters (configurable)
@@ -99,19 +100,43 @@ uv run python demo/selfplay_demo.py
 
 ### Train a Model
 
-**Using Hardware Profiles (Recommended):**
+**C++ Backend (Recommended - 2-5x faster):**
 
-Hardware profiles automatically configure optimal settings for your GPU:
+See **[docs/training-guide.md](docs/training-guide.md)** for complete documentation.
 
 ```bash
-# HIGH profile - A100/H100 (40-80GB VRAM) - Cloud training
-uv run python scripts/train.py --profile high --batched-inference
+# Quick test (~10 minutes, verifies setup)
+uv run python alphazero-cpp/scripts/train.py \
+    --iterations 2 --games-per-iter 5 --simulations 100 \
+    --filters 64 --blocks 3
+
+# Development (~2-4 hours, RTX 4060)
+uv run python alphazero-cpp/scripts/train.py \
+    --iterations 20 --games-per-iter 25 --simulations 400 \
+    --filters 64 --blocks 5
+
+# Serious training (~12-24 hours)
+uv run python alphazero-cpp/scripts/train.py \
+    --iterations 50 --games-per-iter 50 --simulations 800 \
+    --filters 128 --blocks 10
+
+# Production (~24+ hours, full AlphaZero architecture)
+uv run python alphazero-cpp/scripts/train.py \
+    --iterations 100 --games-per-iter 100 --simulations 800 \
+    --filters 192 --blocks 15
+```
+
+**Python Backend (Alternative - with hardware profiles):**
+
+```bash
+# LOW profile - RTX 4060/3060 (8GB VRAM) - Local development
+uv run python alphazero/scripts/train.py --profile low --batched-inference
 
 # MID profile - T4/V100 (16GB VRAM)
-uv run python scripts/train.py --profile mid --batched-inference
+uv run python alphazero/scripts/train.py --profile mid --batched-inference
 
-# LOW profile - RTX 4060/3060 (8GB VRAM) - Local development
-uv run python scripts/train.py --profile low --batched-inference
+# HIGH profile - A100/H100 (40-80GB VRAM) - Cloud training
+uv run python alphazero/scripts/train.py --profile high --batched-inference
 ```
 
 | Profile | Actors | Batch Size | Inference Batch | Network | Expected Speedup |
@@ -123,7 +148,7 @@ uv run python scripts/train.py --profile low --batched-inference
 **Toy Example (Gaming Laptop - 8GB GPU, ~2 hours):**
 ```bash
 # Quick training for testing (completes in ~2 hours on RTX 3060/4060)
-uv run python scripts/train.py \
+uv run python alphazero/scripts/train.py \
     --steps 5000 \
     --actors 8 \
     --filters 64 \
@@ -138,7 +163,7 @@ uv run python scripts/train.py \
 **Small Network (Testing):**
 ```bash
 # Basic training (small network for testing)
-uv run python scripts/train.py \
+uv run python alphazero/scripts/train.py \
     --steps 10000 \
     --actors 4 \
     --filters 64 \
@@ -150,7 +175,7 @@ uv run python scripts/train.py \
 **Full Training (Production - Requires 16GB+ GPU):**
 ```bash
 # Production settings (requires powerful GPU)
-uv run python scripts/train.py \
+uv run python alphazero/scripts/train.py \
     --steps 100000 \
     --actors 16 \
     --filters 192 \
@@ -181,13 +206,13 @@ uv run python scripts/train.py \
 **Interactive Terminal Play:**
 ```bash
 # Play interactively (architecture auto-detected from checkpoint name)
-uv run python scripts/play.py \
+uv run python alphazero/scripts/play.py \
     --checkpoint checkpoints/checkpoint_1000_f64_b5.pt \
     --color white \
     --simulations 400
 
 # Or specify architecture manually for old checkpoints
-uv run python scripts/play.py \
+uv run python alphazero/scripts/play.py \
     --checkpoint checkpoints/checkpoint_1000.pt \
     --filters 64 \
     --blocks 5 \
@@ -222,20 +247,20 @@ See [`web/README.md`](web/README.md) for detailed web interface documentation.
 **Endgame Evaluation (50 Curated Positions):**
 ```bash
 # Evaluate on 50 endgame positions (basic mates, pawn/rook endgames, tactics)
-uv run scripts/evaluate.py \
+uv run python alphazero/scripts/evaluate.py \
     --checkpoint checkpoints/checkpoint_5000_f64_b5.pt \
     --opponent endgame \
     --simulations 400
 
 # Evaluate specific category
-uv run python scripts/evaluate.py \
+uv run python alphazero/scripts/evaluate.py \
     --checkpoint checkpoints/checkpoint_5000_f64_b5.pt \
     --opponent endgame \
     --category basic_mate \
     --simulations 200
 
 # Evaluate specific difficulty (1-5)
-uv run python scripts/evaluate.py \
+uv run python alphazero/scripts/evaluate.py \
     --checkpoint checkpoints/checkpoint_5000_f64_b5.pt \
     --opponent endgame \
     --difficulty 3 \
@@ -251,14 +276,14 @@ uv run python scripts/evaluate.py \
 **Quick Evaluation (Fast - 100 simulations per move):**
 ```bash
 # Against random player (~2 minutes for 50 games)
-uv run python scripts/evaluate.py \
+uv run python alphazero/scripts/evaluate.py \
     --checkpoint checkpoints/checkpoint_1000_f64_b5.pt \
     --opponent random \
     --games 50 \
     --simulations 100
 
 # Self-play evaluation
-uv run python scripts/evaluate.py \
+uv run python alphazero/scripts/evaluate.py \
     --checkpoint checkpoints/checkpoint_1000_f64_b5.pt \
     --opponent self \
     --games 20 \
@@ -268,14 +293,14 @@ uv run python scripts/evaluate.py \
 **Full Evaluation (Slow - 800 simulations per move):**
 ```bash
 # Against random player (~20 minutes for 100 games)
-uv run python scripts/evaluate.py \
+uv run python alphazero/scripts/evaluate.py \
     --checkpoint checkpoints/checkpoint_1000_f64_b5.pt \
     --opponent random \
     --games 100 \
     --simulations 800
 
 # Against Stockfish (requires Stockfish installed)
-uv run python scripts/evaluate.py \
+uv run python alphazero/scripts/evaluate.py \
     --checkpoint checkpoints/checkpoint_1000_f64_b5.pt \
     --opponent stockfish \
     --stockfish-path "C:\path\to\stockfish.exe" \
@@ -289,7 +314,7 @@ uv run python scripts/evaluate.py \
 ### Benchmark MCTS Performance
 
 ```bash
-uv run python scripts/benchmark_mcts.py \
+uv run python alphazero/scripts/benchmark_mcts.py \
     --searches 100 \
     --simulations 800 \
     --backends python
@@ -297,15 +322,17 @@ uv run python scripts/benchmark_mcts.py \
 
 ## Architecture Details
 
-### Board Encoding (119 planes, 8×8 each)
+### Board Encoding (122 planes, 8×8 each)
+
+C++ backend uses 122 channels (full AlphaZero paper specification):
 
 | Planes | Description |
 |--------|-------------|
-| 0-95 | Piece positions for 8 history steps (12 planes × 8 steps) |
-| 96-99 | Castling rights (4 planes) |
-| 100 | Side to move |
-| 101-108 | Repetition counters |
-| 109-118 | Move clocks (halfmove, fullmove) |
+| 0-11 | Current piece positions (6 types × 2 colors) |
+| 12-17 | Metadata (color, move count, castling, no-progress) |
+| 18-121 | Position history (8 × 13 planes = 104 total) |
+
+Python backend uses 119 channels (legacy encoding).
 
 ### Action Space (4672 actions)
 
@@ -318,7 +345,7 @@ uv run python scripts/benchmark_mcts.py \
 ### Neural Network
 
 ```
-Input (119, 8, 8)
+Input (122, 8, 8)  # C++ backend uses 122 channels
     ↓
 Conv 3×3, 192 filters → BatchNorm → ReLU
     ↓
@@ -328,8 +355,8 @@ ResidualBlock × 15
     └─→ Value Head → (1,)
 ```
 
-**Policy Head**: Conv 1×1 → BN → ReLU → FC(4672)\
-**Value Head**: Conv 1×1 → BN → ReLU → FC(192) → ReLU → FC(1) → Tanh
+**Policy Head** (AlphaZero paper): Conv 1×1 (2 filters) → BN → ReLU → FC(4672)\
+**Value Head** (AlphaZero paper): Conv 1×1 (1 filter) → BN → ReLU → FC(256) → ReLU → FC(1) → Tanh
 
 ### MCTS Algorithm
 
@@ -491,7 +518,7 @@ The training script can automatically detect and use the fastest available backe
 
 ```bash
 # Auto-detect best backend (default behavior)
-uv run python scripts/train.py --mcts-backend auto --batched-inference
+uv run python alphazero/scripts/train.py --mcts-backend auto --batched-inference
 
 # Check which backends are available
 uv run python -c "from alphazero.mcts import get_available_backends, get_best_backend; print('Available:', [b.value for b in get_available_backends()]); print('Best:', get_best_backend().value)"
@@ -575,7 +602,7 @@ cd alphazero/mcts/cpp; uv run python setup.py build_ext --inplace; cd ../../..
 
 ```bash
 uv run python -c "from alphazero.mcts import get_available_backends; print([b.value for b in get_available_backends()])"
-# Expected output: ['python', 'cython', 'cpp']
+# Expected output: ['python', 'cython']  # Note: cpp backend moved to alphazero-cpp package
 ```
 
 #### Choosing a Backend for Training
@@ -584,13 +611,13 @@ Use the `--mcts-backend` flag when training:
 
 ```bash
 # Use Python backend (default, no build required)
-uv run python scripts/train.py --mcts-backend python
+uv run python alphazero/scripts/train.py --mcts-backend python
 
 # Use Cython backend (requires build)
-uv run python scripts/train.py --mcts-backend cython
+uv run python alphazero/scripts/train.py --mcts-backend cython
 
-# Use C++ backend (requires build)
-uv run python scripts/train.py --mcts-backend cpp
+# Use C++ backend (high performance, requires alphazero-cpp)
+uv run python alphazero-cpp/scripts/train.py
 ```
 
 #### Using Backends Programmatically
@@ -600,10 +627,15 @@ from alphazero import MCTSBackend
 from alphazero.mcts import create_mcts, get_available_backends
 
 # Check which backends are available
-print(get_available_backends())  # [MCTSBackend.PYTHON, MCTSBackend.CYTHON, MCTSBackend.CPP]
+print(get_available_backends())  # [MCTSBackend.PYTHON, MCTSBackend.CYTHON]
 
 # Create MCTS with specific backend
-mcts = create_mcts(backend=MCTSBackend.CPP)
+mcts = create_mcts(backend=MCTSBackend.CYTHON)
+
+# For C++ backend, use alphazero_cpp module directly
+import alphazero_cpp
+cpp_mcts = alphazero_cpp.MCTSSearch(config)
+```
 
 # Or use in self-play
 from alphazero.selfplay import SelfPlayGame
@@ -616,7 +648,7 @@ For multi-actor training, use `--batched-inference` to enable centralized GPU in
 
 ```bash
 # Recommended for 4+ actors with mixed precision
-uv run python scripts/train.py \
+uv run python alphazero/scripts/train.py \
     --profile high \
     --batched-inference
 ```
@@ -654,7 +686,7 @@ The inference server uses adaptive batching to maximize GPU utilization:
 
 ```bash
 # Configure inference batching (or use --profile for auto-configuration)
-uv run python scripts/train.py \
+uv run python alphazero/scripts/train.py \
     --batched-inference \
     --inference-batch-size 512 \
     --inference-timeout 0.02
@@ -766,10 +798,10 @@ Play chess against your trained model through an interactive web interface:
 
 ```bash
 # Start the web interface
-uv run python scripts/web_play.py --checkpoint checkpoints/checkpoint_5000_f192_b15.pt
+uv run python web/run.py --checkpoint checkpoints/checkpoint_5000_f192_b15.pt
 
 # Custom settings
-uv run python scripts/web_play.py \
+uv run python web/run.py \
     --checkpoint checkpoints/checkpoint_5000_f192_b15.pt \
     --simulations 400 \
     --device cuda \

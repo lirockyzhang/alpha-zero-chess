@@ -7,25 +7,26 @@
 namespace encoding {
 
 // AlphaZero position encoding
-// 119 planes total:
+// 122 planes total (updated to support 8 FULL historical positions):
 // - 12 planes: piece positions (6 piece types × 2 colors)
-// - 2 planes: repetition counts (1-fold, 2-fold)
+// - 2 planes: repetition counts (currently unused, reserved)
 // - 1 plane: color to move
 // - 1 plane: total move count
 // - 1 plane: castling rights (encoded as 4 bits)
 // - 1 plane: no-progress count (50-move rule)
-// - 102 planes: history (8 previous positions × 12 piece planes + 8 × repetition)
+// - 104 planes: history (8 previous positions × 13 planes each)
+//   - Each historical position: 12 piece planes + 1 repetition marker
 //
-// Note: The original AlphaZero paper uses 119 planes, but the exact breakdown
-// varies by implementation. This follows the Leela Chess Zero approach.
+// Note: Updated from 119 to 122 channels to fully match AlphaZero paper specification
+// with 8 complete historical positions.
 
 class PositionEncoder {
 public:
     // NHWC (channels-last) layout for Tensor Core performance
-    // Shape: (height, width, channels) = (8, 8, 119)
+    // Shape: (height, width, channels) = (8, 8, 122)
     static constexpr int HEIGHT = 8;
     static constexpr int WIDTH = 8;
-    static constexpr int CHANNELS = 119;
+    static constexpr int CHANNELS = 122;
     static constexpr int TOTAL_SIZE = HEIGHT * WIDTH * CHANNELS;
 
     // Legacy constants for compatibility
@@ -33,12 +34,16 @@ public:
     static constexpr int BOARD_SIZE = HEIGHT;
 
     // Encode position from current player's perspective
-    // Returns flat array of size 119 × 8 × 8 = 7616
-    static std::vector<float> encode(const chess::Board& board);
+    // Returns flat array of size 122 × 8 × 8 = 7808
+    // position_history: Last N positions (up to 8) for history encoding
+    static std::vector<float> encode(const chess::Board& board,
+                                     const std::vector<chess::Board>& position_history = {});
 
     // Encode position with zero-copy (writes directly to provided buffer)
     // Buffer must have size >= TOTAL_SIZE
-    static void encode_to_buffer(const chess::Board& board, float* buffer);
+    // position_history: Last N positions (up to 8) for history encoding
+    static void encode_to_buffer(const chess::Board& board, float* buffer,
+                                 const std::vector<chess::Board>& position_history = {});
 
     // Batch encoding with optional OpenMP parallelization
     // Encodes multiple positions in parallel to reduce Python call overhead
@@ -56,6 +61,9 @@ private:
     static void encode_move_count_plane(const chess::Board& board, float* buffer);
     static void encode_castling_plane(const chess::Board& board, float* buffer);
     static void encode_no_progress_plane(const chess::Board& board, float* buffer);
+    static void encode_history_planes(const std::vector<chess::Board>& position_history,
+                                      const chess::Board& current_board,
+                                      float* buffer, bool flip);
 
     // Convert square index based on perspective (flip for black)
     static inline int flip_square(int square, bool flip) {

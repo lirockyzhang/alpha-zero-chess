@@ -28,7 +28,7 @@ class MCTSConfig:
 @dataclass
 class NetworkConfig:
     """Configuration for the neural network architecture."""
-    input_channels: int = 119
+    input_channels: int = 122  # Updated to support 8 full historical positions
     num_filters: int = 192
     num_blocks: int = 15
     num_actions: int = 4672

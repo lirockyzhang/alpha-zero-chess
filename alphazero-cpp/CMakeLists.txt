@@ -57,27 +57,8 @@ target_link_libraries(chess_engine PUBLIC
     Threads::Threads
 )
 
-# Perft test executable (old implementation - has bugs)
-add_executable(perft_test
-    tests/perft_test.cpp
-)
-
-target_link_libraries(perft_test PRIVATE
-    chess_engine
-)
-
-# Perft test with chess-library (battle-tested, 269-449M nps)
-add_executable(perft_test_library
-    tests/perft_test_library.cpp
-)
-
-target_include_directories(perft_test_library PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/chess-library/include
-)
-
-target_link_libraries(perft_test_library PRIVATE
-    Threads::Threads
-)
+# NOTE: Old test executables disabled - they use deprecated API
+# Keeping files in tests/ for reference but not building them
 
 # Encoding library
 add_library(encoding STATIC
@@ -98,7 +79,6 @@ target_link_libraries(encoding PUBLIC
 add_library(mcts_core STATIC
     src/mcts/search.cpp
     src/mcts/batch_coordinator.cpp
-    src/mcts/batch_search.cpp
 )
 
 target_include_directories(mcts_core PUBLIC
@@ -111,40 +91,41 @@ target_link_libraries(mcts_core PUBLIC
     encoding
 )
 
-# MCTS test executable
-add_executable(mcts_test
-    tests/mcts_test.cpp
+# Self-play library
+add_library(selfplay STATIC
+    src/selfplay/game.cpp
+    src/selfplay/coordinator.cpp
+    src/selfplay/evaluation_queue.cpp
+    src/selfplay/parallel_coordinator.cpp
 )
 
-target_link_libraries(mcts_test PRIVATE
+target_include_directories(selfplay PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/chess-library/include
+)
+
+target_link_libraries(selfplay PUBLIC
     mcts_core
+    encoding
+    training
 )
 
-# MCTS correctness test executable
-add_executable(mcts_correctness_test
-    tests/mcts_correctness_test.cpp
+# Training library
+add_library(training STATIC
+    src/training/replay_buffer.cpp
+    src/training/trainer.cpp
 )
 
-target_link_libraries(mcts_correctness_test PRIVATE
-    mcts_core
+target_include_directories(training PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-# MCTS benchmark executable
-add_executable(mcts_benchmark
-    tests/mcts_benchmark.cpp
+target_link_libraries(training PUBLIC
+    Threads::Threads
 )
 
-target_link_libraries(mcts_benchmark PRIVATE
-    mcts_core
-)
-
-# Enable testing
-enable_testing()
-add_test(NAME perft_test COMMAND perft_test)
-add_test(NAME perft_test_library COMMAND perft_test_library)
-add_test(NAME mcts_test COMMAND mcts_test)
-add_test(NAME mcts_correctness_test COMMAND mcts_correctness_test)
-add_test(NAME mcts_benchmark COMMAND mcts_benchmark)
+# NOTE: MCTS test executables disabled - they use deprecated API
+# Use alphazero-cpp/scripts/test_performance.py instead for testing
 
 # Python bindings with pybind11
 find_package(Python COMPONENTS Interpreter Development)
@@ -166,6 +147,8 @@ if(Python_FOUND)
         target_link_libraries(alphazero_cpp PRIVATE
             mcts_core
             encoding
+            selfplay
+            training
         )
 
         target_include_directories(alphazero_cpp PRIVATE

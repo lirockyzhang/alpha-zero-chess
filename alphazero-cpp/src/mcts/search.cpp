@@ -1,66 +1,153 @@
 #include "mcts/search.hpp"
 #include "encoding/move_encoder.hpp"
+#include "encoding/position_encoder.hpp"
 #include <algorithm>
 #include <numeric>
+#include <random>
+#include <cmath>
 
 namespace mcts {
 
-Node* MCTSSearch::search(const chess::Board& root_position,
-                         const std::vector<float>& policy,
-                         float value) {
-    // Create root node
-    Node* root = pool_.allocate();
+Node* MCTSSearch::init_search(const chess::Board& root_position,
+                                      const std::vector<float>& root_policy,
+                                      float root_value,
+                                      const std::vector<chess::Board>& position_history) {
+    // Reset state
+    root_position_ = root_position;
+    position_history_ = position_history;  // Store position history for encoding
+    pending_evals_.clear();
+    simulations_completed_ = 0;
+    simulations_in_flight_ = 0;
 
-    // Expand root immediately
-    expand(root, root_position, policy, value);
+    // Create and expand root node
+    root_ = pool_.allocate();
+    expand(root_, root_position_, root_policy, root_value);
 
     // Add Dirichlet noise to root for exploration
-    add_dirichlet_noise(root);
+    add_dirichlet_noise(root_);
 
-    // Run simulations
-    for (int i = 0; i < config_.num_simulations; ++i) {
-        // Make a copy of the board for this simulation
-        chess::Board board = root_position;
+    return root_;
+}
 
-        // Selection phase: traverse tree to leaf
-        Node* leaf = select(root, board);
+int MCTSSearch::collect_leaves(float* obs_buffer, float* mask_buffer, int max_batch_size) {
+    // First, run selection to collect leaves that need evaluation
+    int leaves_needed = std::min(max_batch_size, config_.num_simulations - simulations_completed_ - simulations_in_flight_);
 
-        // If leaf is terminal, backpropagate immediately
-        if (leaf->is_terminal()) {
-            // Terminal value depends on game outcome
-            float terminal_value = 0.0f;  // Draw
+    if (leaves_needed <= 0) {
+        return 0;
+    }
 
-            // Check if it's checkmate or stalemate
-            auto game_result = board.isGameOver();
-            if (game_result.second == chess::GameResult::LOSE) {
-                terminal_value = -1.0f;  // Loss for side to move
+    run_selection_phase(leaves_needed);
+
+    // Encode pending evaluations into buffers
+    int batch_size = std::min(static_cast<int>(pending_evals_.size()), max_batch_size);
+
+    for (int i = 0; i < batch_size; ++i) {
+        const auto& eval = pending_evals_[i];
+
+        // Encode position to observation buffer (NHWC format: 8 x 8 x 122)
+        // Pass position history for history plane encoding
+        encoding::PositionEncoder::encode_to_buffer(
+            eval.board,
+            obs_buffer + i * encoding::PositionEncoder::TOTAL_SIZE,
+            position_history_
+        );
+
+        // Encode legal mask
+        float* mask_ptr = mask_buffer + i * encoding::MoveEncoder::POLICY_SIZE;
+        std::fill(mask_ptr, mask_ptr + encoding::MoveEncoder::POLICY_SIZE, 0.0f);
+
+        chess::Movelist moves;
+        chess::movegen::legalmoves(moves, eval.board);
+
+        for (const auto& move : moves) {
+            int idx = encoding::MoveEncoder::move_to_index(move, eval.board);
+            if (idx >= 0 && idx < encoding::MoveEncoder::POLICY_SIZE) {
+                mask_ptr[idx] = 1.0f;
             }
-
-            backpropagate(leaf, terminal_value);
-            continue;
-        }
-
-        // If leaf hasn't been expanded yet, we need neural network evaluation
-        // For now, use a placeholder (will be replaced with actual NN inference)
-        if (!leaf->is_expanded()) {
-            // TODO: Queue for batch neural network inference
-            // For now, use random policy and value
-            std::vector<float> leaf_policy(1858, 1.0f / 1858.0f);  // Uniform policy
-            float leaf_value = 0.0f;  // Neutral value
-
-            expand(leaf, board, leaf_policy, leaf_value);
-            backpropagate(leaf, leaf_value);
         }
     }
 
-    return root;
+    simulations_in_flight_ = batch_size;
+    return batch_size;
+}
+
+void MCTSSearch::update_leaves(const std::vector<std::vector<float>>& policies,
+                                       const std::vector<float>& values) {
+    int batch_size = std::min({
+        static_cast<int>(pending_evals_.size()),
+        static_cast<int>(policies.size()),
+        static_cast<int>(values.size())
+    });
+
+    for (int i = 0; i < batch_size; ++i) {
+        const auto& eval = pending_evals_[i];
+        Node* leaf = eval.node;
+
+        // Expand the leaf with NN policy and value
+        expand(leaf, eval.board, policies[i], values[i]);
+
+        // Backpropagate the value
+        backpropagate(leaf, values[i]);
+
+        simulations_completed_++;
+    }
+
+    // Clear pending evaluations
+    pending_evals_.clear();
+    simulations_in_flight_ = 0;
+}
+
+void MCTSSearch::run_selection_phase(int num_sims) {
+    pending_evals_.clear();
+    pending_evals_.reserve(num_sims);
+
+    for (int sim = 0; sim < num_sims; ++sim) {
+        // Copy board state for this simulation
+        chess::Board board = root_position_;
+
+        // Select leaf node
+        Node* leaf = select(root_, board);
+
+        // If leaf is terminal, backpropagate immediately
+        if (leaf->is_terminal()) {
+            // Get terminal value
+            auto [reason, result] = board.isGameOver();
+            float value = 0.0f;
+
+            if (result == chess::GameResult::LOSE) {
+                // Current side to move lost (checkmate)
+                value = -1.0f;
+            } else if (result == chess::GameResult::WIN) {
+                // Current side to move won (shouldn't happen in standard chess)
+                value = 1.0f;
+            }
+            // Draw = 0.0f
+
+            backpropagate(leaf, value);
+            simulations_completed_++;
+        } else if (!leaf->is_expanded()) {
+            // Leaf needs NN evaluation - add to pending
+            pending_evals_.emplace_back(leaf, board, sim);
+        } else {
+            // Already expanded (race condition in parallel) - just backpropagate
+            float value = leaf->q_value(0.0f);
+            backpropagate(leaf, value);
+            simulations_completed_++;
+        }
+    }
 }
 
 Node* MCTSSearch::select(Node* node, chess::Board& board) {
     while (node->is_expanded() && !node->is_terminal()) {
-        // Find child with highest PUCT score
+        // Add virtual loss to prevent other threads from selecting same path
+        node->add_virtual_loss();
+
+        // Find best child using PUCT
         Node* best_child = nullptr;
         float best_score = -std::numeric_limits<float>::infinity();
+
+        float parent_q = node->q_value(0.0f);
 
         for (Node* child = node->first_child; child != nullptr; child = child->next_sibling) {
             float score = puct_score(node, child);
@@ -71,15 +158,12 @@ Node* MCTSSearch::select(Node* node, chess::Board& board) {
         }
 
         if (best_child == nullptr) {
-            break;  // No children (terminal node)
+            // No children (shouldn't happen for expanded non-terminal node)
+            break;
         }
 
-        // Add virtual loss to prevent multiple threads from selecting same path
-        best_child->add_virtual_loss();
-
-        // Make move on board
+        // Apply move to board
         board.makeMove(best_child->move);
-
         node = best_child;
     }
 
@@ -87,10 +171,15 @@ Node* MCTSSearch::select(Node* node, chess::Board& board) {
 }
 
 void MCTSSearch::expand(Node* node, const chess::Board& board,
-                        const std::vector<float>& policy, float value) {
-    // Check if game is over
-    auto game_result = board.isGameOver();
-    if (game_result.first != chess::GameResultReason::NONE) {
+                                const std::vector<float>& policy, float value) {
+    // Check if already expanded (race condition)
+    if (node->is_expanded()) {
+        return;
+    }
+
+    // Check for terminal state
+    auto [reason, result] = board.isGameOver();
+    if (reason != chess::GameResultReason::NONE) {
         node->set_terminal(true);
         node->set_expanded(true);
         return;
@@ -108,7 +197,7 @@ void MCTSSearch::expand(Node* node, const chess::Board& board,
 
     // Create child nodes for each legal move
     Node* prev_child = nullptr;
-    float prior_sum = 0.0f;  // Track sum for normalization
+    float prior_sum = 0.0f;
 
     for (const auto& move : moves) {
         Node* child = pool_.allocate();
@@ -123,7 +212,6 @@ void MCTSSearch::expand(Node* node, const chess::Board& board,
             prior = policy[policy_index];
         }
 
-        // Ensure non-negative prior (policy should already be non-negative)
         prior = std::max(prior, 0.0f);
         prior_sum += prior;
 
@@ -138,14 +226,13 @@ void MCTSSearch::expand(Node* node, const chess::Board& board,
         prev_child = child;
     }
 
-    // Normalize priors if sum is not close to 1.0 (handles edge cases)
+    // Normalize priors
     if (prior_sum > 0.0f && std::abs(prior_sum - 1.0f) > 0.01f) {
         for (Node* child = node->first_child; child != nullptr; child = child->next_sibling) {
             float normalized_prior = child->prior() / prior_sum;
             child->set_prior(normalized_prior);
         }
     } else if (prior_sum == 0.0f) {
-        // Fallback to uniform if all priors are zero (shouldn't happen with proper policy)
         float uniform_prior = 1.0f / moves.size();
         for (Node* child = node->first_child; child != nullptr; child = child->next_sibling) {
             child->set_prior(uniform_prior);
@@ -156,104 +243,51 @@ void MCTSSearch::expand(Node* node, const chess::Board& board,
 }
 
 void MCTSSearch::backpropagate(Node* node, float value) {
-    // Backpropagate value up the tree
-    // Value is negated at each level (zero-sum game)
     while (node != nullptr) {
         // Remove virtual loss
-        if (node->parent != nullptr) {
-            node->remove_virtual_loss();
-        }
+        node->remove_virtual_loss();
 
-        // Update node with value
-        // Use release semantics on root node to prevent race conditions
+        // Update node value
         if (node->parent == nullptr) {
-            node->update_root(value);  // Root node: use memory_order_release
+            // Root node - use release semantics
+            node->update_root(value);
         } else {
-            node->update(value);  // Non-root: use memory_order_relaxed
+            node->update(value);
         }
 
-        // Negate value for parent (opponent's perspective)
-        value = -value;
-
+        // Move to parent and flip value (opponent's perspective)
         node = node->parent;
+        value = -value;
     }
 }
 
-chess::Move MCTSSearch::select_move(Node* root, float temperature) {
-    if (root->first_child == nullptr) {
-        return chess::Move();  // No legal moves
-    }
+float MCTSSearch::puct_score(const Node* parent, const Node* child) const {
+    uint32_t parent_visits = parent->visit_count.load(std::memory_order_relaxed);
+    uint32_t child_visits = child->visit_count.load(std::memory_order_relaxed);
+    int16_t virtual_loss = child->virtual_loss.load(std::memory_order_relaxed);
 
-    if (temperature < 0.01f) {
-        // Greedy selection: pick move with highest visit count
-        Node* best_child = nullptr;
-        uint32_t best_visits = 0;
+    // Q-value with virtual loss
+    float parent_q = parent->q_value(0.0f);
+    float q = child->q_value(parent_q);
 
-        for (Node* child = root->first_child; child != nullptr; child = child->next_sibling) {
-            uint32_t visits = child->visit_count.load(std::memory_order_relaxed);
-            if (visits > best_visits) {
-                best_visits = visits;
-                best_child = child;
-            }
-        }
+    // Prior probability
+    float prior = child->prior();
 
-        return best_child ? best_child->move : chess::Move();
-    } else {
-        // Stochastic selection: sample proportional to visit_count^(1/temperature)
-        std::vector<Node*> children;
-        std::vector<float> weights;
+    // PUCT formula: Q + c_puct * P * sqrt(N_parent) / (1 + N_child + virtual_loss)
+    float exploration = config_.c_puct * prior * std::sqrt(static_cast<float>(parent_visits))
+                       / (1.0f + child_visits + virtual_loss);
 
-        for (Node* child = root->first_child; child != nullptr; child = child->next_sibling) {
-            children.push_back(child);
-            uint32_t visits = child->visit_count.load(std::memory_order_relaxed);
-            float weight = std::pow(static_cast<float>(visits), 1.0f / temperature);
-            weights.push_back(weight);
-        }
-
-        // Sample from distribution
-        std::discrete_distribution<> dist(weights.begin(), weights.end());
-        int idx = dist(rng_);
-
-        return children[idx]->move;
-    }
-}
-
-std::vector<float> MCTSSearch::get_policy_target(Node* root) {
-    // Get visit count distribution for training
-    // Returns normalized visit counts for all children
-
-    std::vector<float> policy_target;
-    uint32_t total_visits = 0;
-
-    // Count total visits
-    for (Node* child = root->first_child; child != nullptr; child = child->next_sibling) {
-        uint32_t visits = child->visit_count.load(std::memory_order_relaxed);
-        total_visits += visits;
-    }
-
-    // Normalize visit counts
-    for (Node* child = root->first_child; child != nullptr; child = child->next_sibling) {
-        uint32_t visits = child->visit_count.load(std::memory_order_relaxed);
-        float prob = total_visits > 0 ? static_cast<float>(visits) / total_visits : 0.0f;
-        policy_target.push_back(prob);
-    }
-
-    return policy_target;
+    return q + exploration;
 }
 
 void MCTSSearch::add_dirichlet_noise(Node* root) {
-    // Add Dirichlet noise to root node for exploration
-    // This encourages exploration of different moves during self-play
-
-    if (root->first_child == nullptr) {
-        return;
-    }
-
-    // Count number of children
+    // Count children
     int num_children = 0;
     for (Node* child = root->first_child; child != nullptr; child = child->next_sibling) {
         num_children++;
     }
+
+    if (num_children == 0) return;
 
     // Generate Dirichlet noise
     std::gamma_distribution<float> gamma(config_.dirichlet_alpha, 1.0f);
@@ -270,15 +304,55 @@ void MCTSSearch::add_dirichlet_noise(Node* root) {
         noise[i] /= noise_sum;
     }
 
-    // Mix noise with prior: P = (1 - epsilon) * P + epsilon * noise
-    int idx = 0;
+    // Apply noise to priors
+    int i = 0;
     for (Node* child = root->first_child; child != nullptr; child = child->next_sibling) {
-        float prior = child->prior();
-        float mixed_prior = (1.0f - config_.dirichlet_epsilon) * prior
-                          + config_.dirichlet_epsilon * noise[idx];
-        child->set_prior(mixed_prior);
-        idx++;
+        float original_prior = child->prior();
+        float noisy_prior = (1.0f - config_.dirichlet_epsilon) * original_prior
+                          + config_.dirichlet_epsilon * noise[i];
+        child->set_prior(noisy_prior);
+        i++;
     }
+}
+
+std::vector<int32_t> MCTSSearch::get_visit_counts() const {
+    std::vector<int32_t> visit_counts(encoding::MoveEncoder::POLICY_SIZE, 0);
+
+    if (root_ == nullptr) return visit_counts;
+
+    for (Node* child = root_->first_child; child != nullptr; child = child->next_sibling) {
+        int idx = encoding::MoveEncoder::move_to_index(child->move, root_position_);
+        if (idx >= 0 && idx < encoding::MoveEncoder::POLICY_SIZE) {
+            visit_counts[idx] = static_cast<int32_t>(
+                child->visit_count.load(std::memory_order_relaxed)
+            );
+        }
+    }
+
+    return visit_counts;
+}
+
+// Double buffering implementation for GPU/CPU overlap
+void MCTSSearch::start_next_batch_collection() {
+    // Start collecting into the inactive buffer
+    // This allows CPU to prepare the next batch while GPU processes current batch
+    auto& collection_buffer = using_buffer_a_ ? buffer_b_ : buffer_a_;
+    collection_buffer.clear();
+}
+
+std::vector<PendingEval>& MCTSSearch::get_collection_buffer() {
+    // Return the buffer currently being filled by CPU
+    return using_buffer_a_ ? buffer_b_ : buffer_a_;
+}
+
+const std::vector<PendingEval>& MCTSSearch::get_evaluation_buffer() const {
+    // Return the buffer currently being processed by GPU
+    return using_buffer_a_ ? buffer_a_ : buffer_b_;
+}
+
+void MCTSSearch::swap_buffers() {
+    // Swap which buffer is active after GPU completes evaluation
+    using_buffer_a_ = !using_buffer_a_;
 }
 
 } // namespace mcts

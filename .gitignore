@@ -15,3 +15,6 @@ wheels/
 
 # Training Logs
 logs/
+
+# replay buffers
+replay_buffer/
