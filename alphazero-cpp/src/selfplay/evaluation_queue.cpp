@@ -1,7 +1,6 @@
 #include "../../include/selfplay/evaluation_queue.hpp"
 #include <algorithm>
 #include <stdexcept>
-#include <thread>
 
 namespace selfplay {
 
@@ -148,41 +147,49 @@ int GlobalEvaluationQueue::submit_for_evaluation(
     out_request_ids.clear();
     out_request_ids.reserve(num_leaves);
 
-    // Step 1: Claim staging slots atomically (no lock needed for data writes)
-    int first_slot = staging_write_head_.fetch_add(num_leaves, std::memory_order_relaxed);
-    int actual_leaves = num_leaves;
+    int actual_leaves = 0;
 
-    // Check if we exceeded capacity
-    if (first_slot + num_leaves > static_cast<int>(queue_capacity_)) {
-        actual_leaves = std::max(0, static_cast<int>(queue_capacity_) - first_slot);
-        if (actual_leaves < num_leaves) {
-            // Roll back the excess
-            staging_write_head_.fetch_sub(num_leaves - actual_leaves, std::memory_order_relaxed);
-            metrics_.pool_exhaustion_count.fetch_add(1, std::memory_order_relaxed);
-            metrics_.submission_drops.fetch_add(num_leaves - actual_leaves, std::memory_order_relaxed);
-        }
-    }
-
-    if (actual_leaves <= 0) {
-        return 0;
-    }
-
-    // Step 2: Write observation and mask data directly into staging buffers (no lock!)
-    for (int i = 0; i < actual_leaves; ++i) {
-        int slot = first_slot + i;
-        std::memcpy(staging_obs_buffer_ + slot * OBS_SIZE,
-                    observations + i * OBS_SIZE,
-                    OBS_SIZE * sizeof(float));
-        std::memcpy(staging_mask_buffer_ + slot * POLICY_SIZE,
-                    legal_masks + i * POLICY_SIZE,
-                    POLICY_SIZE * sizeof(float));
-    }
-
-    // Step 3: Push lightweight metadata under lock (no data copies here)
+    // All staging operations happen under queue_mutex_ to synchronize with
+    // collect_batch's staging_write_head_ reset. This eliminates the race
+    // where workers claim slots via atomic fetch_add while the GPU thread
+    // resets the head, causing unbounded head growth and pool exhaustion.
+    //
+    // Lock hold time: ~80µs for 32 leaves (memcpy of ~1.6MB). Acceptable
+    // given batch cycles of ~10-80ms.
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        uint32_t gen = worker_generation_[worker_id].load(std::memory_order_acquire);
 
+        // Claim staging slots (synchronized with GPU's reset)
+        int first_slot = staging_write_head_.load(std::memory_order_relaxed);
+        actual_leaves = num_leaves;
+
+        if (first_slot + num_leaves > static_cast<int>(queue_capacity_)) {
+            actual_leaves = std::max(0, static_cast<int>(queue_capacity_) - first_slot);
+            if (actual_leaves < num_leaves) {
+                metrics_.pool_exhaustion_count.fetch_add(1, std::memory_order_relaxed);
+                metrics_.submission_drops.fetch_add(num_leaves - actual_leaves, std::memory_order_relaxed);
+            }
+        }
+
+        if (actual_leaves <= 0) {
+            return 0;
+        }
+
+        staging_write_head_.store(first_slot + actual_leaves, std::memory_order_relaxed);
+
+        // Write observation and mask data into staging buffers
+        for (int i = 0; i < actual_leaves; ++i) {
+            int slot = first_slot + i;
+            std::memcpy(staging_obs_buffer_ + slot * OBS_SIZE,
+                        observations + i * OBS_SIZE,
+                        OBS_SIZE * sizeof(float));
+            std::memcpy(staging_mask_buffer_ + slot * POLICY_SIZE,
+                        legal_masks + i * POLICY_SIZE,
+                        POLICY_SIZE * sizeof(float));
+        }
+
+        // Push metadata
+        uint32_t gen = worker_generation_[worker_id].load(std::memory_order_acquire);
         for (int i = 0; i < actual_leaves; ++i) {
             int32_t req_id = worker_request_ids_[worker_id].fetch_add(1, std::memory_order_relaxed);
             staged_requests_.emplace_back(worker_id, req_id, gen, first_slot + i);
@@ -359,11 +366,20 @@ int GlobalEvaluationQueue::collect_batch(
     {
         std::unique_lock<std::mutex> lock(queue_mutex_);
 
-        // PHASE 1a: Wait for at least 1 request (or timeout/shutdown).
-        // Using target=1 ensures we wake on the FIRST notification instead of
-        // requiring 8+ requests to accumulate. Notifications sent while we were
-        // busy (inference/result distribution) are lost, so we must be responsive
-        // to the first one that arrives while we're actually waiting.
+        // TWO-PHASE WAIT: balances batch fullness vs. straggler latency.
+        //
+        // Phase 1: Wait for ANY request to arrive (full timeout).
+        //   Handles the idle case (between iterations, during shutdown).
+        //
+        // Phase 2: Wait for batch to FILL (short deadline).
+        //   Once workers start submitting, give them a brief window to
+        //   accumulate. If one worker is slow, don't stall everyone —
+        //   fire with whatever we have after the fill deadline.
+        //
+        // This prevents one slow worker from blocking 63 fast workers
+        // for the entire gpu_timeout_ms.
+
+        // Phase 1: Wait for at least 1 request
         queue_cv_.wait_for(
             lock,
             std::chrono::milliseconds(timeout_ms),
@@ -377,13 +393,19 @@ int GlobalEvaluationQueue::collect_batch(
             return 0;
         }
 
-        // PHASE 1b: Brief coalescing window — let more workers submit before
-        // we grab the batch. Release the lock momentarily so blocked workers
-        // can push their metadata, then re-acquire and collect everything.
+        // Phase 2: Wait for batch to fill (capped at half the timeout)
         if (staged_requests_.size() < max_batch_size_) {
-            lock.unlock();
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
-            lock.lock();
+            int fill_ms = std::max(1, timeout_ms / 2);
+            auto fill_deadline = std::chrono::steady_clock::now()
+                + std::chrono::milliseconds(fill_ms);
+            queue_cv_.wait_until(
+                lock,
+                fill_deadline,
+                [this]() {
+                    return staged_requests_.size() >= max_batch_size_ ||
+                           shutdown_.load(std::memory_order_acquire);
+                }
+            );
         }
 
         // Collect up to max_batch_size requests
