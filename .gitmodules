@@ -1,0 +1,3 @@
+[submodule "alphazero-cpp/third_party/chess-library"]
+	path = alphazero-cpp/third_party/chess-library
+	url = https://github.com/Disservin/chess-library.git

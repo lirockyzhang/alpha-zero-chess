@@ -11,7 +11,9 @@
       "Bash(tree:*)",
       "Bash(g++:*)",
       "Bash(cl:*)",
-      "Bash(where:*)"
+      "Bash(where:*)",
+      "Bash(git ls-tree:*)",
+      "Bash(git submodule:*)"
     ]
   },
   "outputStyle": "Explanatory"
