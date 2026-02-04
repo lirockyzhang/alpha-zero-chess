@@ -366,18 +366,21 @@ int GlobalEvaluationQueue::collect_batch(
     {
         std::unique_lock<std::mutex> lock(queue_mutex_);
 
-        // TWO-PHASE WAIT: balances batch fullness vs. straggler latency.
+        // TWO-PHASE WAIT with stall detection.
         //
-        // Phase 1: Wait for ANY request to arrive (full timeout).
-        //   Handles the idle case (between iterations, during shutdown).
+        // Phase 1: Wait for ANY request (full timeout).
+        //   Handles the idle GPU case (between iterations, shutdown).
         //
-        // Phase 2: Wait for batch to FILL (short deadline).
-        //   Once workers start submitting, give them a brief window to
-        //   accumulate. If one worker is slow, don't stall everyone —
-        //   fire with whatever we have after the fill deadline.
+        // Phase 2: Stall-detecting accumulation.
+        //   Keep waiting as long as workers are actively submitting
+        //   (queue growing). Once no new submissions arrive within 1ms,
+        //   fire immediately with whatever we have.
         //
-        // This prevents one slow worker from blocking 63 fast workers
-        // for the entire gpu_timeout_ms.
+        //   This is optimal because:
+        //   - If all 64 workers submit in 5ms → fires at 5ms with 1024
+        //   - If 62 workers submit in 4ms, then nothing for 1ms → fires
+        //     at 5ms with 992 (doesn't waste 10ms waiting for stragglers)
+        //   - Adapts to any worker count / search_batch combination
 
         // Phase 1: Wait for at least 1 request
         queue_cv_.wait_for(
@@ -393,19 +396,33 @@ int GlobalEvaluationQueue::collect_batch(
             return 0;
         }
 
-        // Phase 2: Wait for batch to fill (capped at half the timeout)
-        if (staged_requests_.size() < max_batch_size_) {
-            int fill_ms = std::max(1, timeout_ms / 2);
-            auto fill_deadline = std::chrono::steady_clock::now()
-                + std::chrono::milliseconds(fill_ms);
-            queue_cv_.wait_until(
-                lock,
-                fill_deadline,
-                [this]() {
-                    return staged_requests_.size() >= max_batch_size_ ||
-                           shutdown_.load(std::memory_order_acquire);
+        // Phase 2: Accumulate while workers are still submitting
+        {
+            auto outer_deadline = std::chrono::steady_clock::now()
+                + std::chrono::milliseconds(timeout_ms);
+
+            while (staged_requests_.size() < max_batch_size_ &&
+                   std::chrono::steady_clock::now() < outer_deadline &&
+                   !shutdown_.load(std::memory_order_acquire))
+            {
+                size_t prev_size = staged_requests_.size();
+
+                // Wait for a new submission or 1ms stall timeout
+                queue_cv_.wait_for(
+                    lock,
+                    std::chrono::milliseconds(1),
+                    [this, prev_size]() {
+                        return staged_requests_.size() > prev_size ||
+                               staged_requests_.size() >= max_batch_size_ ||
+                               shutdown_.load(std::memory_order_acquire);
+                    }
+                );
+
+                // Stall detected: no new submissions in 1ms → fire now
+                if (staged_requests_.size() == prev_size) {
+                    break;
                 }
-            );
+            }
         }
 
         // Collect up to max_batch_size requests
