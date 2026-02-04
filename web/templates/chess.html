@@ -365,7 +365,7 @@
         <p class="subtitle">Play against the trained AI model</p>
 
         <div class="model-info">
-            <span>🧠 Model: {{ num_filters }} filters, {{ num_blocks }} blocks</span>
+            <span>🧠 {{ model_name }} — {{ num_filters }} filters, {{ num_blocks }} blocks</span>
         </div>
 
         <div class="game-container">
@@ -424,8 +424,12 @@
                     <h3>AI Evaluation</h3>
                     <div class="ai-evaluation" id="ai-evaluation">
                         <div class="eval-value">
-                            <span class="eval-label">Position Value:</span>
-                            <span class="eval-score neutral" id="eval-score">--</span>
+                            <span class="eval-label">MCTS Value:</span>
+                            <span class="eval-score neutral" id="mcts-score">--</span>
+                        </div>
+                        <div class="eval-value">
+                            <span class="eval-label">NN Value:</span>
+                            <span class="eval-score neutral" id="nn-score">--</span>
                         </div>
                         <div class="top-moves" id="top-moves">
                             <p style="color: #95a5a6; font-size: 0.9em;">No evaluation yet</p>
@@ -506,22 +510,24 @@
             historyEl.scrollTop = historyEl.scrollHeight;
         }
 
+        function colorEvalScore(el, value) {
+            el.textContent = value.toFixed(3);
+            if (value > 0.1) {
+                el.className = 'eval-score positive';
+            } else if (value < -0.1) {
+                el.className = 'eval-score negative';
+            } else {
+                el.className = 'eval-score neutral';
+            }
+        }
+
         function updateEvaluation(evaluation) {
             if (!evaluation) return;
 
-            // Update position value
-            const scoreEl = document.getElementById('eval-score');
-            const value = evaluation.value;
-            scoreEl.textContent = value.toFixed(3);
-
-            // Color code the evaluation
-            if (value > 0.1) {
-                scoreEl.className = 'eval-score positive';
-            } else if (value < -0.1) {
-                scoreEl.className = 'eval-score negative';
-            } else {
-                scoreEl.className = 'eval-score neutral';
-            }
+            // Update MCTS value
+            colorEvalScore(document.getElementById('mcts-score'), evaluation.mcts_value);
+            // Update raw NN value
+            colorEvalScore(document.getElementById('nn-score'), evaluation.nn_value);
 
             // Update top moves
             const topMovesEl = document.getElementById('top-moves');
@@ -730,8 +736,10 @@
                 updateMoveHistory();
 
                 // Clear evaluation
-                document.getElementById('eval-score').textContent = '--';
-                document.getElementById('eval-score').className = 'eval-score neutral';
+                document.getElementById('mcts-score').textContent = '--';
+                document.getElementById('mcts-score').className = 'eval-score neutral';
+                document.getElementById('nn-score').textContent = '--';
+                document.getElementById('nn-score').className = 'eval-score neutral';
                 document.getElementById('top-moves').innerHTML = '<p style="color: #95a5a6; font-size: 0.9em;">No evaluation yet</p>';
 
                 // Update board orientation
@@ -806,8 +814,10 @@
             updateMoveHistory();
 
             // Clear evaluation
-            document.getElementById('eval-score').textContent = '--';
-            document.getElementById('eval-score').className = 'eval-score neutral';
+            document.getElementById('mcts-score').textContent = '--';
+            document.getElementById('mcts-score').className = 'eval-score neutral';
+            document.getElementById('nn-score').textContent = '--';
+            document.getElementById('nn-score').className = 'eval-score neutral';
             document.getElementById('top-moves').innerHTML = '<p style="color: #95a5a6; font-size: 0.9em;">No evaluation yet</p>';
 
             updateStatus('Board reset. Click "New Game" to start playing', 'info');
@@ -851,8 +861,10 @@
                 board.position('start');
 
                 // Clear evaluation
-                document.getElementById('eval-score').textContent = '--';
-                document.getElementById('eval-score').className = 'eval-score neutral';
+                document.getElementById('mcts-score').textContent = '--';
+                document.getElementById('mcts-score').className = 'eval-score neutral';
+                document.getElementById('nn-score').textContent = '--';
+                document.getElementById('nn-score').className = 'eval-score neutral';
                 document.getElementById('top-moves').innerHTML = '<p style="color: #95a5a6; font-size: 0.9em;">AI vs AI starting...</p>';
 
                 // Start the self-play loop

@@ -402,7 +402,8 @@ public:
         int gpu_timeout_ms = 20,
         int worker_timeout_ms = 2000,
         int queue_capacity = 8192,
-        int root_eval_retries = 3)
+        int root_eval_retries = 3,
+        float draw_score = 0.0f)
         : replay_buffer_(nullptr)
         , active_coordinator_(nullptr)
     {
@@ -419,6 +420,7 @@ public:
         config_.worker_timeout_ms = worker_timeout_ms;
         config_.queue_capacity = queue_capacity;
         config_.root_eval_retries = root_eval_retries;
+        config_.draw_score = draw_score;
     }
 
     // Set replay buffer (optional - if not set, games are returned instead)
@@ -680,6 +682,7 @@ public:
         d["dirichlet_epsilon"] = config_.dirichlet_epsilon;
         d["temperature_moves"] = config_.temperature_moves;
         d["gpu_timeout_ms"] = config_.gpu_timeout_ms;
+        d["draw_score"] = config_.draw_score;
         return d;
     }
 
@@ -769,7 +772,7 @@ PYBIND11_MODULE(alphazero_cpp, m) {
 
     // Parallel self-play coordinator (cross-game batching for high GPU utilization)
     py::class_<PyParallelSelfPlayCoordinator>(m, "ParallelSelfPlayCoordinator")
-        .def(py::init<int, int, int, int, int, float, float, float, int, int, int, int, int>(),
+        .def(py::init<int, int, int, int, int, float, float, float, int, int, int, int, int, float>(),
              py::arg("num_workers") = 16,
              py::arg("games_per_worker") = 4,
              py::arg("num_simulations") = 800,
@@ -783,6 +786,7 @@ PYBIND11_MODULE(alphazero_cpp, m) {
              py::arg("worker_timeout_ms") = 2000,
              py::arg("queue_capacity") = 8192,
              py::arg("root_eval_retries") = 3,
+             py::arg("draw_score") = 0.0f,
              "Create parallel self-play coordinator with cross-game batching.\n"
              "This achieves high GPU utilization by batching NN evaluations across multiple games.\n"
              "\nParameters:\n"
@@ -798,7 +802,8 @@ PYBIND11_MODULE(alphazero_cpp, m) {
              "  gpu_timeout_ms: GPU batch collection timeout (default 20)\n"
              "  worker_timeout_ms: Worker wait time for NN results (default 2000)\n"
              "  queue_capacity: Evaluation queue capacity (default 8192)\n"
-             "  root_eval_retries: Max retries for root NN evaluation (default 3)")
+             "  root_eval_retries: Max retries for root NN evaluation (default 3)\n"
+             "  draw_score: Draw value from White's perspective (default 0.0, try -0.5 for decisive play)")
         .def("set_replay_buffer", &PyParallelSelfPlayCoordinator::set_replay_buffer,
              py::arg("buffer"),
              "Set replay buffer for direct data storage (optional).\n"

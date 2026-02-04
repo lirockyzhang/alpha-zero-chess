@@ -50,6 +50,9 @@ struct ParallelSelfPlayConfig {
 
     // Retry configuration
     int root_eval_retries = 3;          // Max retries for root NN evaluation before giving up
+
+    // Draw score
+    float draw_score = 0.0f;            // Draw value from White's perspective
 };
 
 // ============================================================================

@@ -1846,13 +1846,15 @@ class CppSelfPlay:
         num_simulations: int = 800,
         mcts_batch_size: int = 64,
         c_puct: float = 1.5,
-        temperature_moves: int = 30
+        temperature_moves: int = 30,
+        draw_score: float = 0.0
     ):
         self.evaluator = evaluator
         self.num_simulations = num_simulations
         self.mcts_batch_size = mcts_batch_size
         self.c_puct = c_puct
         self.temperature_moves = temperature_moves
+        self.draw_score = draw_score
 
         # Create C++ MCTS engine (BatchedMCTSSearch is the Python binding name)
         self.mcts = alphazero_cpp.BatchedMCTSSearch(
@@ -1965,7 +1967,7 @@ class CppSelfPlay:
         elif result == "0-1":
             value = -1.0
         else:
-            value = 0.0
+            value = self.draw_score  # Asymmetric draw value from White's perspective
 
         return observations, policies, value, move_count, total_sims, total_evals
 
@@ -2099,7 +2101,8 @@ def run_parallel_selfplay(
         gpu_timeout_ms=args.gpu_batch_timeout_ms,
         worker_timeout_ms=args.worker_timeout_ms,
         queue_capacity=queue_capacity,
-        root_eval_retries=args.root_eval_retries
+        root_eval_retries=args.root_eval_retries,
+        draw_score=args.draw_score
     )
 
     # Set replay buffer so data is stored directly
@@ -2108,6 +2111,12 @@ def run_parallel_selfplay(
     print(f"  Parallel: {args.workers} workers × {games_per_worker} games = {actual_total_games} games")
     print(f"  eval_batch={args.eval_batch}, gpu_timeout={args.gpu_batch_timeout_ms}ms, "
           f"queue_capacity={queue_capacity}, root_eval_retries={args.root_eval_retries}")
+
+    # Suggest optimal eval_batch based on worker count and search_batch
+    suggested_eval_batch = ((args.workers * args.search_batch + 31) // 32) * 32
+    if suggested_eval_batch != args.eval_batch and suggested_eval_batch > 0:
+        print(f"  💡 Hint: eval_batch={suggested_eval_batch} matches workers×search_batch "
+              f"({args.workers}×{args.search_batch}={args.workers * args.search_batch}, rounded to 32)")
 
     # Push initial progress to live dashboard (show we're in self-play phase)
     if live_dashboard is not None:
@@ -2478,6 +2487,8 @@ Examples:
                         help="Eval queue capacity. 0=auto-calculate from workers*search_batch*8 (default: 0)")
     parser.add_argument("--root-eval-retries", type=int, default=3,
                         help="Max retries for root NN evaluation before falling back to uniform (default: 3)")
+    parser.add_argument("--draw-score", type=float, default=0.0,
+                        help="Draw value from White's perspective. -0.5 = penalize White draws (default: 0.0)")
 
     # Network parameters
     parser.add_argument("--filters", type=int, default=192,
@@ -2682,7 +2693,8 @@ Examples:
             num_simulations=args.simulations,
             mcts_batch_size=args.search_batch,
             c_puct=args.c_puct,
-            temperature_moves=args.temperature_moves
+            temperature_moves=args.temperature_moves,
+            draw_score=args.draw_score
         )
 
     # Metrics tracker (for console output)
@@ -2822,9 +2834,10 @@ Examples:
 
                 # Add game data to C++ ReplayBuffer
                 # Flatten observations for storage: (122, 8, 8) -> (7808,)
-                for obs, policy in zip(obs_list, policy_list):
+                # result is from White's perspective; alternate sign per position
+                for i, (obs, policy) in enumerate(zip(obs_list, policy_list)):
                     obs_flat = obs.flatten().astype(np.float32)  # (7808,)
-                    value = result if len(obs_list) % 2 == 0 else -result
+                    value = result if i % 2 == 0 else -result
                     replay_buffer.add_sample(obs_flat, policy.astype(np.float32), float(value))
 
                 metrics.total_moves += num_moves

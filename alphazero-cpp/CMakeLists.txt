@@ -112,6 +112,7 @@ target_link_libraries(selfplay PUBLIC
     mcts_core
     encoding
     training
+    OpenMP::OpenMP_CXX
 )
 
 # Training library

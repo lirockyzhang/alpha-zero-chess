@@ -31,6 +31,7 @@ struct BatchSearchConfig {
     float dirichlet_epsilon = 0.25f; // Dirichlet noise weight
     float batch_threshold = 0.9f;   // Dispatch when this fraction ready
     int batch_timeout_ms = 20;      // Max wait time for batch
+    float draw_score = 0.0f;        // Draw value from side-to-move's perspective (for terminal draw nodes)
 };
 
 // MCTS search that collects leaves for batch evaluation

@@ -127,8 +127,11 @@ void MCTSSearch::run_selection_phase(int num_sims) {
             } else if (result == chess::GameResult::WIN) {
                 // Current side to move won (shouldn't happen in standard chess)
                 value = 1.0f;
+            } else {
+                // Draw — use asymmetric draw score from side-to-move's perspective
+                value = (board.sideToMove() == chess::Color::WHITE)
+                    ? config_.draw_score : -config_.draw_score;
             }
-            // Draw = 0.0f
 
             backpropagate(leaf, value);
             simulations_completed_++;
@@ -375,6 +378,10 @@ int MCTSSearch::collect_leaves_async(float* obs_buffer, float* mask_buffer, int 
                 value = -1.0f;
             } else if (result == chess::GameResult::WIN) {
                 value = 1.0f;
+            } else {
+                // Draw — use asymmetric draw score from side-to-move's perspective
+                value = (board.sideToMove() == chess::Color::WHITE)
+                    ? config_.draw_score : -config_.draw_score;
             }
             backpropagate(leaf, value);
             simulations_completed_++;

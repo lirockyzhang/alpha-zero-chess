@@ -274,6 +274,7 @@ GameTrajectory ParallelSelfPlayCoordinator::play_single_game(
         search_config.c_puct = config_.c_puct;
         search_config.dirichlet_alpha = config_.dirichlet_alpha;
         search_config.dirichlet_epsilon = config_.dirichlet_epsilon;
+        search_config.draw_score = config_.draw_score;
 
         mcts::MCTSSearch search(pool, search_config);
 
@@ -430,7 +431,7 @@ GameTrajectory ParallelSelfPlayCoordinator::play_single_game(
         result = chess::GameResult::DRAW;
     }
 
-    trajectory.set_outcomes(result);
+    trajectory.set_outcomes(result, config_.draw_score);
 
     // Update statistics
     auto game_end = std::chrono::steady_clock::now();

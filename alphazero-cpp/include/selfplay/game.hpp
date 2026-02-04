@@ -43,7 +43,9 @@ struct GameTrajectory {
 
     // Set game outcome for all states (from each player's perspective)
     // result should be WIN/LOSE/DRAW from White's perspective
-    void set_outcomes(chess::GameResult game_result) {
+    // draw_score: value assigned to draws from White's perspective (default 0.0)
+    //   e.g. -0.5 means White gets -0.5 and Black gets +0.5 for draws
+    void set_outcomes(chess::GameResult game_result, float draw_score = 0.0f) {
         result = game_result;
 
         // Convert game result to values from each player's perspective
@@ -57,8 +59,8 @@ struct GameTrajectory {
                 // White lost (Black won)
                 states[i].value = white_to_move ? -1.0f : 1.0f;
             } else {
-                // Draw
-                states[i].value = 0.0f;
+                // Draw — asymmetric draw score from White's perspective
+                states[i].value = white_to_move ? draw_score : -draw_score;
             }
         }
     }
@@ -75,6 +77,7 @@ struct SelfPlayConfig {
     bool add_dirichlet_noise = true;    // Add Dirichlet noise to root
     float dirichlet_alpha = 0.3f;       // Dirichlet noise alpha
     float dirichlet_epsilon = 0.25f;    // Dirichlet noise weight
+    float draw_score = 0.0f;            // Draw value from White's perspective
 };
 
 // Self-play game executor
@@ -202,7 +205,7 @@ GameTrajectory SelfPlayGame::play_game(NeuralEvaluator& neural_evaluator) {
 
     // Set game outcomes
     chess::GameResult result = get_game_result();
-    trajectory.set_outcomes(result);
+    trajectory.set_outcomes(result, config_.draw_score);
 
     return trajectory;
 }

@@ -9,6 +9,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <tuple>
+#include <thread>
+#include <memory>
 
 namespace selfplay {
 
@@ -228,6 +230,9 @@ private:
     void allocate_batch_buffers();
     void free_batch_buffers();
 
+    // Compact remaining staged requests to front of staging buffers (called under lock)
+    void compact_remaining_locked();
+
     // Configuration
     size_t max_batch_size_;
     size_t queue_capacity_;
@@ -238,18 +243,32 @@ private:
     float* staging_mask_buffer_;   // queue_capacity × POLICY_SIZE
     std::atomic<int32_t> staging_write_head_{0};
 
+    // Per-slot ready flags: workers set after memcpy completes (lock-free signaling)
+    // GPU thread spin-waits on these before reading staging data
+    // NOTE: Using unique_ptr<atomic[]> instead of vector<atomic> because
+    // std::atomic has deleted copy/move constructors, incompatible with std::vector on MSVC
+    std::unique_ptr<std::atomic<uint8_t>[]> slot_ready_;  // queue_capacity entries
+
     // Request metadata queue (lightweight — only metadata, no observation data)
     std::vector<StagedRequest> staged_requests_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
 
+    // Deferred compaction flag: set when staging head > 75% capacity,
+    // executed at start of NEXT collect_batch (after all previous slots consumed)
+    bool needs_compaction_{false};
+
     // Batch buffers (aligned/pinned for GPU)
-    float* batch_obs_buffer_;      // max_batch_size x OBS_SIZE (NHWC staging)
+    // NOTE: batch_obs_buffer_ (NHWC intermediate) removed — fused transpose
+    // reads directly from staging_obs_buffer_ into batch_obs_nchw_buffer_
     float* batch_obs_nchw_buffer_; // max_batch_size x OBS_SIZE (NCHW for GPU)
     float* batch_mask_buffer_;     // max_batch_size x POLICY_SIZE
     float* batch_policy_buffers_[2]; // Double-buffered: GPU writes [current], workers read [previous]
     float* batch_value_buffer_;    // max_batch_size
     int current_policy_buffer_{0}; // Which buffer GPU writes to next (only GPU thread writes; ordering via worker_cvs_ notify/wait)
+
+    // Staging slot indices for current batch (used for lock-free Phase 2 reads)
+    std::vector<int32_t> batch_staging_slots_;
 
     // Mapping for current batch (worker_id, request_id, generation) tuples
     std::vector<std::tuple<int32_t, int32_t, uint32_t>> batch_mapping_;

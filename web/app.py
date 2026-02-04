@@ -103,7 +103,7 @@ class ChessWebInterface:
     """Web interface for playing against AlphaZero model."""
 
     def __init__(self, checkpoint_path: str, num_simulations: int = 400,
-                 device: str = "cuda", port: int = 5000):
+                 device: str = "cuda", port: int = 5000, model_name: str = ""):
         """Initialize web interface.
 
         Args:
@@ -111,6 +111,7 @@ class ChessWebInterface:
             num_simulations: MCTS simulations per move
             device: Device to run model on
             port: Port to run web server on
+            model_name: Display name for the model (defaults to checkpoint directory name)
         """
         if not FLASK_AVAILABLE:
             raise ImportError("flask is required. Install with: pip install flask flask-cors")
@@ -119,6 +120,7 @@ class ChessWebInterface:
         self.num_simulations = num_simulations
         self.device = device
         self.port = port
+        self.model_name = model_name or Path(checkpoint_path).parent.name
 
         # Load model
         self.network, self.num_filters, self.num_blocks = self._load_model()
@@ -222,7 +224,8 @@ class ChessWebInterface:
                                  num_simulations=self.num_simulations,
                                  c_puct=self.c_puct,
                                  num_filters=self.num_filters,
-                                 num_blocks=self.num_blocks)
+                                 num_blocks=self.num_blocks,
+                                 model_name=self.model_name)
 
         @self.app.route('/api/update_settings', methods=['POST'])
         def update_settings():
@@ -395,7 +398,7 @@ class ChessWebInterface:
         game = self.games[session_id]
 
         # Run C++ MCTS with batched leaf evaluation
-        policy, root_value = self._run_cpp_mcts(game)
+        policy, mcts_value, nn_value = self._run_cpp_mcts(game)
 
         # Select best action
         action = int(np.argmax(policy))
@@ -405,7 +408,8 @@ class ChessWebInterface:
 
         # Get evaluation data from policy (already from visit counts)
         evaluation_data = {
-            'value': float(root_value),
+            'mcts_value': float(mcts_value),
+            'nn_value': float(nn_value),
             'top_moves': self._get_top_moves_from_policy(game, policy, top_k=5)
         }
 
@@ -421,7 +425,7 @@ class ChessWebInterface:
             game: Current game state
 
         Returns:
-            Tuple of (policy, root_value)
+            Tuple of (policy, mcts_value, nn_value)
         """
         fen = game.fen()
         board = game.board
@@ -498,7 +502,7 @@ class ChessWebInterface:
         # instead of raw NN value which doesn't reflect search results
         mcts_value = mcts.get_root_value()
 
-        return policy, float(mcts_value)
+        return policy, float(mcts_value), root_value_float
 
     def _get_top_moves_from_policy(self, game: GameState, policy: np.ndarray, top_k: int = 5) -> list:
         """Get top K moves from policy probabilities.
@@ -565,6 +569,8 @@ def main():
                        help="Device to run model on (cuda or cpu)")
     parser.add_argument("--port", type=int, default=5000,
                        help="Port to run web server on")
+    parser.add_argument("--name", type=str, default="",
+                       help="Display name for the model (defaults to checkpoint directory name)")
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug mode")
 
@@ -574,7 +580,8 @@ def main():
         checkpoint_path=args.checkpoint,
         num_simulations=args.simulations,
         device=args.device,
-        port=args.port
+        port=args.port,
+        model_name=args.name
     )
     interface.run(debug=args.debug)
 
