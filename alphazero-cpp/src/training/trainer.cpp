@@ -3,6 +3,11 @@
 
 namespace training {
 
+Trainer::Trainer()
+    : config_()
+{
+}
+
 Trainer::Trainer(const Config& config)
     : config_(config)
 {

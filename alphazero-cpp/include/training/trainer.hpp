@@ -44,7 +44,8 @@ public:
     /**
      * Create trainer with configuration.
      */
-    explicit Trainer(const Config& config = Config{});
+    Trainer();
+    explicit Trainer(const Config& config);
 
     ~Trainer() = default;
 
