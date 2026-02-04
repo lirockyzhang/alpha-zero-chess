@@ -132,8 +132,12 @@ find_package(Python COMPONENTS Interpreter Development)
 if(Python_FOUND)
     message(STATUS "Found Python: ${Python_EXECUTABLE}")
 
-    # Set pybind11 CMake directory
-    set(pybind11_DIR "C:/veighna_studio/Lib/site-packages/pybind11/share/cmake/pybind11")
+    # Set pybind11 CMake directory (use -Dpybind11_DIR=... to override)
+    if(NOT DEFINED pybind11_DIR)
+        if(WIN32)
+            set(pybind11_DIR "C:\Users\liroc\OneDrive - Duke University\2025-2026\projects\alpha-zero-chess\.venv\Lib\site-packages\pybind11\share\cmake\pybind11")
+        endif()
+    endif()
 
     find_package(pybind11 CONFIG)
 

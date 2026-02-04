@@ -150,6 +150,44 @@
             background: #ebf5fb;
         }
 
+        .btn-selfplay {
+            background: #e67e22;
+            color: white;
+        }
+
+        .btn-selfplay:hover {
+            background: #d35400;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(230, 126, 34, 0.3);
+        }
+
+        .btn-stop {
+            background: #e74c3c;
+            color: white;
+        }
+
+        .btn-stop:hover {
+            background: #c0392b;
+        }
+
+        .selfplay-controls {
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid #ddd;
+        }
+
+        .speed-slider {
+            width: 100%;
+            margin: 8px 0;
+        }
+
+        .speed-label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.85em;
+            color: #7f8c8d;
+        }
+
         .status {
             padding: 15px;
             border-radius: 8px;
@@ -349,6 +387,20 @@
                     </div>
                     <button class="btn-primary" onclick="newGame()">🎮 New Game</button>
                     <button class="btn-secondary" onclick="resetBoard()">🔄 Reset Board</button>
+
+                    <div class="selfplay-controls">
+                        <button class="btn-selfplay" id="selfplay-btn" onclick="startSelfPlay()">🤖 AI vs AI</button>
+                        <button class="btn-stop" id="stop-btn" onclick="stopSelfPlay()" style="display: none;">⏹ Stop</button>
+                        <div style="margin-top: 8px;">
+                            <label for="speed-slider" style="font-weight: 500; color: #34495e; display: block; margin-bottom: 4px;">Move Delay</label>
+                            <input type="range" id="speed-slider" class="speed-slider" min="0.1" max="3.0" step="0.1" value="0.8">
+                            <div class="speed-label">
+                                <span>Fast (0.1s)</span>
+                                <span id="speed-value">0.8s</span>
+                                <span>Slow (3s)</span>
+                            </div>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="control-group">
@@ -420,6 +472,8 @@
         let sessionId = 'session_' + Date.now();
         let moveHistory = [];
         let pendingMove = null;  // For pawn promotion
+        let selfPlayActive = false;
+        let selfPlayTimeout = null;
 
         function selectColor(color) {
             humanColor = color;
@@ -487,6 +541,9 @@
         }
 
         function onDragStart(source, piece, position, orientation) {
+            // Don't allow moves during self-play
+            if (selfPlayActive) return false;
+
             // Don't allow moves if game is over
             if (game.game_over()) return false;
 
@@ -647,6 +704,7 @@
         }
 
         function newGame() {
+            if (selfPlayActive) stopSelfPlay();
             updateStatus('Starting new game...', 'info');
 
             fetch('/api/new_game', {
@@ -741,6 +799,7 @@
         }
 
         function resetBoard() {
+            if (selfPlayActive) stopSelfPlay();
             game = new Chess();
             board.position('start');
             moveHistory = [];
@@ -753,6 +812,138 @@
 
             updateStatus('Board reset. Click "New Game" to start playing', 'info');
         }
+
+        // Speed slider live update
+        document.getElementById('speed-slider').addEventListener('input', function() {
+            document.getElementById('speed-value').textContent = this.value + 's';
+        });
+
+        // ===================== Self-Play Mode =====================
+
+        function startSelfPlay() {
+            // Start a new game for self-play
+            selfPlayActive = true;
+            document.getElementById('selfplay-btn').style.display = 'none';
+            document.getElementById('stop-btn').style.display = '';
+            updateStatus('Starting AI vs AI...', 'info');
+
+            fetch('/api/new_game', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    session_id: sessionId,
+                    color: 'white'  // doesn't matter for self-play; just creates a game
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (!data.success) {
+                    updateStatus('Error: ' + data.error, 'error');
+                    stopSelfPlay();
+                    return;
+                }
+
+                // Reset frontend state
+                game = new Chess();
+                moveHistory = [];
+                updateMoveHistory();
+                board.orientation('white');
+                board.position('start');
+
+                // Clear evaluation
+                document.getElementById('eval-score').textContent = '--';
+                document.getElementById('eval-score').className = 'eval-score neutral';
+                document.getElementById('top-moves').innerHTML = '<p style="color: #95a5a6; font-size: 0.9em;">AI vs AI starting...</p>';
+
+                // Start the self-play loop
+                selfPlayStep();
+            })
+            .catch(error => {
+                updateStatus('Error: ' + error.message, 'error');
+                stopSelfPlay();
+            });
+        }
+
+        function stopSelfPlay() {
+            selfPlayActive = false;
+            if (selfPlayTimeout) {
+                clearTimeout(selfPlayTimeout);
+                selfPlayTimeout = null;
+            }
+            document.getElementById('selfplay-btn').style.display = '';
+            document.getElementById('stop-btn').style.display = 'none';
+            updateStatus('Self-play stopped', 'info');
+        }
+
+        function selfPlayStep() {
+            if (!selfPlayActive) return;
+
+            const turn = game.turn() === 'w' ? 'White' : 'Black';
+            updateStatus(`AI vs AI — ${turn} is thinking...`, 'info');
+
+            fetch('/api/self_play_move', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: sessionId })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (!selfPlayActive) return;
+
+                if (!data.success) {
+                    updateStatus('Error: ' + data.error, 'error');
+                    stopSelfPlay();
+                    return;
+                }
+
+                // Apply the move on the frontend game
+                if (data.model_move) {
+                    const move = game.move(data.model_move);
+                    if (move) {
+                        moveHistory.push(move.san);
+                        updateMoveHistory();
+                    }
+                }
+
+                // Sync board with server state
+                game.load(data.fen);
+                board.position(data.fen, true);  // animate: true
+
+                // Update evaluation
+                if (data.evaluation) {
+                    updateEvaluation(data.evaluation);
+                }
+
+                // Check game over
+                if (data.game_over) {
+                    const result = data.result;
+                    let message = 'AI vs AI — Game Over! ';
+                    if (result.winner === 'white') {
+                        message += 'White wins';
+                    } else if (result.winner === 'black') {
+                        message += 'Black wins';
+                    } else {
+                        message += 'Draw';
+                    }
+                    message += ' (' + result.reason + ')';
+                    updateStatus(message, 'success');
+                    stopSelfPlay();
+                    return;
+                }
+
+                // Schedule next move after delay
+                const delay = parseFloat(document.getElementById('speed-slider').value) * 1000;
+                selfPlayTimeout = setTimeout(selfPlayStep, delay);
+            })
+            .catch(error => {
+                if (selfPlayActive) {
+                    updateStatus('Error: ' + error.message, 'error');
+                    stopSelfPlay();
+                }
+            });
+        }
+
+        // ===================== Board Initialization =====================
 
         // Initialize board
         const config = {

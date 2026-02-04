@@ -816,8 +816,9 @@ class IterationMetrics:
     buffer_size: int = 0
     # Evaluation metrics
     eval_win_rate: Optional[float] = None      # vs random win rate (0.0-1.0)
-    eval_endgame_score: Optional[int] = None   # endgame puzzles correct (0-5)
+    eval_endgame_score: Optional[int] = None   # puzzles fully correct (0-5)
     eval_endgame_total: int = 5                # total endgame puzzles
+    eval_endgame_move_accuracy: Optional[float] = None  # consecutive move accuracy (0.0-1.0)
     # Timing
     total_time: float = 0.0
 
@@ -945,26 +946,38 @@ class MetricsTracker:
 # =============================================================================
 
 # Endgame puzzles for testing model strength
+# Each puzzle has a move_sequence: alternating model/opponent moves.
+# Indices 0, 2, 4, ... are model moves (verified against the network's prediction).
+# Indices 1, 3, 5, ... are opponent responses (played to advance the board).
+# Scoring: consecutive correct model moves from the start (prefix match).
 ENDGAME_PUZZLES = [
-    # King + Queen vs King (should find mate or strong advantage)
-    {"fen": "8/8/8/4k3/8/8/8/4K2Q w - - 0 1", "best_moves": ["Qe4+", "Qd5+"], "type": "KQ_vs_K"},
+    # Mate in 2: Queen + King coordination (forced line)
+    # After Qa1+ the only legal king move is Kb8 (a7/b7 controlled by Kb6), then Qa8#
+    {"fen": "k7/8/1K6/8/8/8/8/7Q w - - 0 1",
+     "move_sequence": ["Qa1+", "Kb8", "Qa8#"], "type": "KQ_mate_in_2"},
 
-    # King + Rook vs King (should find strong moves)
-    {"fen": "8/8/8/4k3/8/8/4R3/4K3 w - - 0 1", "best_moves": ["Re5+", "Re4+", "Ke2"], "type": "KR_vs_K"},
+    # Mate in 2: Back rank with two rooks
+    # Ra8+ forces king to h8 corner (f7/g7/h7 pawns block), then Rb8# is mate
+    {"fen": "6k1/5ppp/8/8/8/8/8/RR4K1 w - - 0 1",
+     "move_sequence": ["Ra8+", "Kh8", "Rb8#"], "type": "back_rank_mate_in_2"},
 
-    # King + Pawn vs King (should find promotion path)
-    {"fen": "8/4P3/8/8/4k3/8/8/4K3 w - - 0 1", "best_moves": ["e8=Q", "e8=R"], "type": "pawn_promo"},
-
-    # Tactical: back rank mate threat
-    {"fen": "6k1/5ppp/8/8/8/8/8/R3K3 w - - 0 1", "best_moves": ["Ra8+"], "type": "back_rank"},
-
-    # Tactical: Scholar's mate position (if allowed)
+    # Mate in 1: Scholar's mate
     {"fen": "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4",
-     "best_moves": ["Qxf7#"], "type": "scholars_mate"},
+     "move_sequence": ["Qxf7#"], "type": "scholars_mate"},
+
+    # Best move: Back rank check
+    {"fen": "6k1/5ppp/8/8/8/8/8/R3K3 w - - 0 1",
+     "move_sequence": ["Ra8+"], "type": "back_rank"},
+
+    # Best move: Pawn promotion
+    {"fen": "8/4P3/8/8/4k3/8/8/4K3 w - - 0 1",
+     "move_sequence": ["e8=Q"], "type": "pawn_promo"},
 ]
 
 
-def play_vs_random(network: 'AlphaZeroNet', device: str, num_games: int = 5, simulations: int = 50) -> Dict[str, Any]:
+def play_vs_random(network: 'AlphaZeroNet', device: str, num_games: int = 5,
+                   simulations: int = 800, search_batch: int = 32,
+                   c_puct: float = 1.5) -> Dict[str, Any]:
     """Play games against a random opponent to test basic competence.
 
     Args:
@@ -972,6 +985,8 @@ def play_vs_random(network: 'AlphaZeroNet', device: str, num_games: int = 5, sim
         device: CUDA or CPU device
         num_games: Number of games to play
         simulations: MCTS simulations per move for the model
+        search_batch: Leaf batch size for MCTS
+        c_puct: MCTS exploration constant
 
     Returns:
         Dictionary with wins, losses, draws counts
@@ -983,8 +998,8 @@ def play_vs_random(network: 'AlphaZeroNet', device: str, num_games: int = 5, sim
     evaluator = BatchedEvaluator(network, device, use_amp=(device == "cuda"))
     mcts = alphazero_cpp.BatchedMCTSSearch(
         num_simulations=simulations,
-        batch_size=min(simulations, 32),
-        c_puct=1.5
+        batch_size=search_batch,
+        c_puct=c_puct
     )
 
     for game_idx in range(num_games):
@@ -1075,9 +1090,15 @@ def play_vs_random(network: 'AlphaZeroNet', device: str, num_games: int = 5, sim
 
 
 def test_endgame_positions(network: 'AlphaZeroNet', device: str, puzzles: List[Dict] = None) -> Dict[str, Any]:
-    """Test the model on known endgame positions.
+    """Test the model on endgame positions with move sequences.
 
-    For each puzzle, we check if the model's top move matches one of the expected best moves.
+    For each puzzle, plays through the move_sequence checking the model's
+    predictions at each model turn (indices 0, 2, 4, ...). Opponent moves
+    (indices 1, 3, 5, ...) are played automatically to advance the board.
+
+    Scoring is prefix-based: count consecutive correct model moves from the
+    start. If the answer is ABCDE and the model predicts ABDEC, only AB count
+    (2 out of 5 model moves correct).
 
     Args:
         network: The neural network to evaluate
@@ -1085,7 +1106,7 @@ def test_endgame_positions(network: 'AlphaZeroNet', device: str, puzzles: List[D
         puzzles: List of puzzle dictionaries (uses ENDGAME_PUZZLES if None)
 
     Returns:
-        Dictionary with score and details
+        Dictionary with score, move_accuracy, and details
     """
     if puzzles is None:
         puzzles = ENDGAME_PUZZLES
@@ -1093,92 +1114,122 @@ def test_endgame_positions(network: 'AlphaZeroNet', device: str, puzzles: List[D
     network.eval()
     evaluator = BatchedEvaluator(network, device, use_amp=(device == "cuda"))
 
-    correct = 0
+    puzzles_fully_correct = 0
+    total_model_moves = 0
+    total_consecutive_correct = 0
     details = []
 
     for puzzle in puzzles:
         fen = puzzle["fen"]
-        best_moves = puzzle["best_moves"]
+        move_sequence = puzzle["move_sequence"]
         puzzle_type = puzzle["type"]
 
         board = chess.Board(fen)
-        obs = alphazero_cpp.encode_position(fen)
-        obs_chw = np.transpose(obs, (2, 0, 1))
 
-        # Build legal mask
-        legal_moves = list(board.legal_moves)
-        mask = np.zeros(POLICY_SIZE, dtype=np.float32)
-        idx_to_move = {}
+        # Count model moves in this sequence (indices 0, 2, 4, ...)
+        num_model_moves = len(range(0, len(move_sequence), 2))
+        consecutive_correct = 0
+        sequence_broken = False
+        predicted_moves = []
 
-        for move in legal_moves:
-            idx = alphazero_cpp.move_to_index(move.uci(), fen)
-            if 0 <= idx < POLICY_SIZE:
-                mask[idx] = 1.0
-                idx_to_move[idx] = move
+        for i, expected_san in enumerate(move_sequence):
+            is_model_turn = (i % 2 == 0)
 
-        # Get policy from network (no MCTS, just raw policy)
-        policy, value = evaluator.evaluate(obs_chw, mask)
-        policy = policy * mask
+            if is_model_turn:
+                # Get model's prediction for this position
+                current_fen = board.fen()
+                obs = alphazero_cpp.encode_position(current_fen)
+                obs_chw = np.transpose(obs, (2, 0, 1))
 
-        # Find top move
-        if policy.sum() > 0:
-            top_idx = np.argmax(policy)
-            if top_idx in idx_to_move:
-                top_move = idx_to_move[top_idx]
-                top_move_san = board.san(top_move)
+                legal_moves = list(board.legal_moves)
+                mask = np.zeros(POLICY_SIZE, dtype=np.float32)
+                idx_to_move = {}
 
-                # Check if it matches any of the best moves
-                is_correct = top_move_san in best_moves
+                for move in legal_moves:
+                    idx = alphazero_cpp.move_to_index(move.uci(), current_fen)
+                    if 0 <= idx < POLICY_SIZE:
+                        mask[idx] = 1.0
+                        idx_to_move[idx] = move
 
-                if is_correct:
-                    correct += 1
+                policy, value = evaluator.evaluate(obs_chw, mask)
+                policy = policy * mask
 
-                details.append({
-                    "type": puzzle_type,
-                    "fen": fen,
-                    "expected": best_moves,
-                    "predicted": top_move_san,
-                    "correct": is_correct
-                })
-            else:
-                details.append({
-                    "type": puzzle_type,
-                    "fen": fen,
-                    "expected": best_moves,
-                    "predicted": "invalid",
-                    "correct": False
-                })
-        else:
-            details.append({
-                "type": puzzle_type,
-                "fen": fen,
-                "expected": best_moves,
-                "predicted": "no_legal_moves",
-                "correct": False
-            })
+                if policy.sum() > 0:
+                    top_idx = np.argmax(policy)
+                    if top_idx in idx_to_move:
+                        top_move = idx_to_move[top_idx]
+                        top_move_san = board.san(top_move)
+                        predicted_moves.append(top_move_san)
+
+                        if not sequence_broken and top_move_san == expected_san:
+                            consecutive_correct += 1
+                        else:
+                            sequence_broken = True
+                    else:
+                        predicted_moves.append("invalid")
+                        sequence_broken = True
+                else:
+                    predicted_moves.append("no_legal_moves")
+                    sequence_broken = True
+
+            # Play the expected move to advance the board
+            try:
+                expected_move = board.parse_san(expected_san)
+                board.push(expected_move)
+            except (ValueError, chess.InvalidMoveError):
+                break
+
+        all_correct = (consecutive_correct == num_model_moves)
+        if all_correct:
+            puzzles_fully_correct += 1
+
+        total_model_moves += num_model_moves
+        total_consecutive_correct += consecutive_correct
+
+        details.append({
+            "type": puzzle_type,
+            "fen": fen,
+            "move_sequence": move_sequence,
+            "predicted": predicted_moves,
+            "consecutive_correct": consecutive_correct,
+            "total_model_moves": num_model_moves,
+            "move_accuracy": consecutive_correct / num_model_moves if num_model_moves > 0 else 0,
+            "fully_correct": all_correct
+        })
 
     return {
-        "score": correct,
+        "score": puzzles_fully_correct,
         "total": len(puzzles),
-        "accuracy": correct / len(puzzles) if puzzles else 0,
+        "accuracy": puzzles_fully_correct / len(puzzles) if puzzles else 0,
+        "move_score": total_consecutive_correct,
+        "total_moves": total_model_moves,
+        "move_accuracy": total_consecutive_correct / total_model_moves if total_model_moves > 0 else 0,
         "details": details
     }
 
 
-def evaluate_checkpoint(network: 'AlphaZeroNet', device: str) -> Dict[str, Any]:
+def evaluate_checkpoint(network: 'AlphaZeroNet', device: str,
+                        simulations: int = 800, search_batch: int = 32,
+                        c_puct: float = 1.5) -> Dict[str, Any]:
     """Run full evaluation suite before saving checkpoint.
 
     Args:
         network: The neural network to evaluate
         device: CUDA or CPU device
+        simulations: MCTS simulations per move (should match training)
+        search_batch: Leaf batch size for MCTS
+        c_puct: MCTS exploration constant
 
     Returns:
         Dictionary with all evaluation results
     """
     results = {}
 
-    # 1. vs Random Agent (5 games, 50 sims each)
-    random_results = play_vs_random(network, device, num_games=5, simulations=50)
+    # 1. vs Random Agent (5 games, same MCTS params as training)
+    random_results = play_vs_random(network, device, num_games=5,
+                                    simulations=simulations,
+                                    search_batch=search_batch,
+                                    c_puct=c_puct)
     results["vs_random"] = {
         "wins": random_results["wins"],
         "losses": random_results["losses"],
@@ -1186,12 +1237,15 @@ def evaluate_checkpoint(network: 'AlphaZeroNet', device: str) -> Dict[str, Any]:
         "win_rate": random_results["wins"] / 5.0
     }
 
-    # 2. Endgame Puzzles
+    # 2. Endgame Puzzles (sequence-based evaluation)
     endgame_results = test_endgame_positions(network, device)
     results["endgame"] = {
         "score": endgame_results["score"],
         "total": endgame_results["total"],
-        "accuracy": endgame_results["accuracy"]
+        "accuracy": endgame_results["accuracy"],
+        "move_score": endgame_results["move_score"],
+        "total_moves": endgame_results["total_moves"],
+        "move_accuracy": endgame_results["move_accuracy"],
     }
 
     return results
@@ -1255,7 +1309,11 @@ def generate_summary_html(
                 </div>
                 <div class="stat">
                     <div class="stat-value">{endgame.get('score', 0)}/{endgame.get('total', 5)}</div>
-                    <div class="stat-label">Endgame Puzzles Correct</div>
+                    <div class="stat-label">Endgame Puzzles Fully Correct</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">{endgame.get('move_accuracy', 0) * 100:.0f}%</div>
+                    <div class="stat-label">Move Accuracy ({endgame.get('move_score', 0)}/{endgame.get('total_moves', 0)} moves)</div>
                 </div>
             </div>
         </div>
@@ -1264,7 +1322,7 @@ def generate_summary_html(
         # Evaluation history chart data
         eval_iters = [e.get("iteration", 0) for e in evaluations]
         eval_win_rates = [e.get("vs_random", {}).get("win_rate", 0) * 100 for e in evaluations]
-        eval_endgame = [e.get("endgame", {}).get("score", 0) for e in evaluations]
+        eval_endgame = [e.get("endgame", {}).get("move_accuracy", 0) * 100 for e in evaluations]
 
     # Build loss chart data
     loss_iters = [m.get("iteration", 0) for m in iterations]
@@ -1421,7 +1479,7 @@ def generate_summary_html(
                         yAxisID: 'y'
                     }},
                     {{
-                        label: 'Endgame Score',
+                        label: 'Endgame Move Accuracy (%)',
                         data: {eval_endgame},
                         borderColor: '#2ecc71',
                         fill: false,
@@ -1445,8 +1503,8 @@ def generate_summary_html(
                         type: 'linear',
                         position: 'right',
                         min: 0,
-                        max: 5,
-                        title: {{ display: true, text: 'Endgame Score' }},
+                        max: 100,
+                        title: {{ display: true, text: 'Endgame Move Accuracy (%)' }},
                         grid: {{ drawOnChartArea: false }}
                     }}
                 }}
@@ -2883,20 +2941,28 @@ Examples:
         if not args.no_eval:
             print(f"  Evaluating...")
             eval_start = time.time()
-            eval_results = evaluate_checkpoint(network, device)
+            eval_results = evaluate_checkpoint(
+                network, device,
+                simulations=args.simulations,
+                search_batch=max(args.search_batch, 32),
+                c_puct=args.c_puct
+            )
             eval_time = time.time() - eval_start
 
             # Display evaluation results
             vs_random = eval_results.get("vs_random", {})
             endgame = eval_results.get("endgame", {})
             print(f"    vs Random: {vs_random.get('wins', 0)}/5 wins ({vs_random.get('win_rate', 0)*100:.0f}%)")
-            print(f"    Endgame:   {endgame.get('score', 0)}/{endgame.get('total', 5)} correct ({endgame.get('accuracy', 0)*100:.0f}%)")
+            print(f"    Endgame:   {endgame.get('score', 0)}/{endgame.get('total', 5)} puzzles, "
+                  f"{endgame.get('move_score', 0)}/{endgame.get('total_moves', 7)} moves "
+                  f"({endgame.get('move_accuracy', 0)*100:.0f}%)")
             print(f"    Eval time: {eval_time:.1f}s")
 
             # Store in metrics for dashboard
             metrics.eval_win_rate = vs_random.get('win_rate', 0.0)
             metrics.eval_endgame_score = endgame.get('score', 0)
             metrics.eval_endgame_total = endgame.get('total', 5)
+            metrics.eval_endgame_move_accuracy = endgame.get('move_accuracy', 0.0)
 
             # Append to evaluation history
             eval_history["evaluations"].append({

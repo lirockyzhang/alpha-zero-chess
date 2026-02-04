@@ -342,6 +342,46 @@ class ChessWebInterface:
                 'legal_moves': legal_moves
             })
 
+        @self.app.route('/api/self_play_move', methods=['POST'])
+        def self_play_move():
+            """Make one AI move in self-play mode (AI plays both sides)."""
+            data = request.json
+            session_id = data.get('session_id', 'default')
+
+            if session_id not in self.games:
+                return jsonify({'success': False, 'error': 'Game not found'}), 404
+
+            game = self.games[session_id]
+
+            if game.is_terminal():
+                result = game.get_result()
+                return jsonify({
+                    'success': True,
+                    'fen': game.board.fen(),
+                    'game_over': True,
+                    'result': self._format_result(result)
+                })
+
+            # Get model's move for current position (whichever side is to play)
+            move_uci, eval_data = self._get_model_move(session_id)
+
+            # Reload game state after model move
+            game = self.games[session_id]
+
+            game_over = game.is_terminal()
+            result = None
+            if game_over:
+                result = self._format_result(game.get_result())
+
+            return jsonify({
+                'success': True,
+                'fen': game.board.fen(),
+                'model_move': move_uci,
+                'evaluation': eval_data,
+                'game_over': game_over,
+                'result': result
+            })
+
     def _get_model_move(self, session_id: str) -> tuple:
         """Get model's move for current position.
 

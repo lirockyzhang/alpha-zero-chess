@@ -427,6 +427,7 @@ DASHBOARD_HTML = """
             avgGameLength: [],
             evalWinRate: [],
             evalEndgameScore: [],
+            evalEndgameMoveAccuracy: [],
         };
 
         let totalGames = 0;
@@ -524,23 +525,23 @@ DASHBOARD_HTML = """
                 marker: { size: 4 }
             }], {...layoutDefaults, yaxis: {...layoutDefaults.yaxis, title: 'Moves per Game'}});
 
-            // Evaluation chart (dual Y-axis: win rate % left, endgame score right)
+            // Evaluation chart (dual Y-axis: win rate % left, move accuracy % right)
             Plotly.newPlot('eval-chart', [
                 { x: [], y: [], type: 'scatter', mode: 'lines+markers',
                   name: 'vs Random Win Rate (%)', line: { color: colors.primary, width: 2 },
                   marker: { size: 5 }, yaxis: 'y' },
                 { x: [], y: [], type: 'scatter', mode: 'lines+markers',
-                  name: 'Endgame Score', line: { color: colors.secondary, width: 2 },
+                  name: 'Endgame Move Accuracy (%)', line: { color: colors.secondary, width: 2 },
                   marker: { size: 5, symbol: 'diamond' }, yaxis: 'y2' }
             ], {
                 ...layoutDefaults,
                 yaxis: { ...layoutDefaults.yaxis, title: 'Win Rate (%)', side: 'left',
                          range: [0, 105] },
                 yaxis2: {
-                    title: 'Endgame Score',
+                    title: 'Move Accuracy (%)',
                     overlaying: 'y',
                     side: 'right',
-                    range: [0, 5.5],
+                    range: [0, 105],
                     gridcolor: 'rgba(255,255,255,0.05)',
                     tickfont: { color: '#ecf0f1' },
                     titlefont: { color: '#ecf0f1' }
@@ -567,6 +568,7 @@ DASHBOARD_HTML = """
             data.avgGameLength.push(metrics.avg_game_length);
             data.evalWinRate.push(metrics.eval_win_rate != null ? metrics.eval_win_rate * 100 : null);
             data.evalEndgameScore.push(metrics.eval_endgame_score);
+            data.evalEndgameMoveAccuracy.push(metrics.eval_endgame_move_accuracy != null ? metrics.eval_endgame_move_accuracy * 100 : null);
 
             // Update cumulative stats
             totalGames += metrics.num_games;
@@ -612,23 +614,23 @@ DASHBOARD_HTML = """
                 // Filter out null entries for clean lines
                 const evalIters = data.iterations.filter((_, i) => data.evalWinRate[i] != null);
                 const evalWR = data.evalWinRate.filter(v => v != null);
-                const evalEG = data.evalEndgameScore.filter(v => v != null);
+                const evalMA = data.evalEndgameMoveAccuracy.filter(v => v != null);
                 Plotly.react('eval-chart', [
                     { x: evalIters, y: evalWR, type: 'scatter', mode: 'lines+markers',
                       name: 'vs Random Win Rate (%)', line: { color: colors.primary, width: 2 },
                       marker: { size: 5 }, yaxis: 'y' },
-                    { x: evalIters, y: evalEG, type: 'scatter', mode: 'lines+markers',
-                      name: 'Endgame Score', line: { color: colors.secondary, width: 2 },
+                    { x: evalIters, y: evalMA, type: 'scatter', mode: 'lines+markers',
+                      name: 'Endgame Move Accuracy (%)', line: { color: colors.secondary, width: 2 },
                       marker: { size: 5, symbol: 'diamond' }, yaxis: 'y2' }
                 ], {
                     ...layoutDefaults,
                     yaxis: { ...layoutDefaults.yaxis, title: 'Win Rate (%)', side: 'left',
                              range: [0, 105] },
                     yaxis2: {
-                        title: 'Endgame Score',
+                        title: 'Move Accuracy (%)',
                         overlaying: 'y',
                         side: 'right',
-                        range: [0, 5.5],
+                        range: [0, 105],
                         gridcolor: 'rgba(255,255,255,0.05)',
                         tickfont: { color: '#ecf0f1' },
                         titlefont: { color: '#ecf0f1' }
@@ -955,6 +957,7 @@ class LiveDashboardServer:
             'eval_win_rate': metrics.eval_win_rate,
             'eval_endgame_score': metrics.eval_endgame_score,
             'eval_endgame_total': getattr(metrics, 'eval_endgame_total', 5),
+            'eval_endgame_move_accuracy': getattr(metrics, 'eval_endgame_move_accuracy', None),
         }
 
         self.history.append(dashboard_metrics)
