@@ -172,14 +172,14 @@ public:
             // Return empty arrays
             return py::make_tuple(
                 0,
-                py::array_t<float>({0, 8, 8, encoding::PositionEncoder::CHANNELS}),
-                py::array_t<float>({0, encoding::MoveEncoder::POLICY_SIZE})
+                py::array_t<float>(std::vector<ssize_t>{0, 8, 8, encoding::PositionEncoder::CHANNELS}),
+                py::array_t<float>(std::vector<ssize_t>{0, encoding::MoveEncoder::POLICY_SIZE})
             );
         }
 
         // Create numpy arrays with actual size
-        py::array_t<float> obs_array({num_leaves, 8, 8, encoding::PositionEncoder::CHANNELS});
-        py::array_t<float> mask_array({num_leaves, encoding::MoveEncoder::POLICY_SIZE});
+        py::array_t<float> obs_array(std::vector<ssize_t>{num_leaves, 8, 8, encoding::PositionEncoder::CHANNELS});
+        py::array_t<float> mask_array(std::vector<ssize_t>{num_leaves, encoding::MoveEncoder::POLICY_SIZE});
 
         // Copy data
         std::memcpy(obs_array.mutable_data(), obs_buffer.data(),
@@ -286,7 +286,7 @@ public:
             py::gil_scoped_acquire acquire;
 
             // Convert C++ buffer to numpy array
-            py::array_t<float> obs_array({num_leaves, 8, 8, encoding::PositionEncoder::CHANNELS}, obs_data);
+            py::array_t<float> obs_array(std::vector<ssize_t>{num_leaves, 8, 8, encoding::PositionEncoder::CHANNELS}, obs_data);
 
             // Call Python evaluator
             py::object result = evaluator(obs_array, num_leaves);
@@ -334,13 +334,13 @@ public:
 
             for (const auto& state : traj.states) {
                 // Observation: shape (8, 8, 122)
-                py::array_t<float> obs_array({8, 8, encoding::PositionEncoder::CHANNELS});
+                py::array_t<float> obs_array(std::vector<ssize_t>{8, 8, encoding::PositionEncoder::CHANNELS});
                 std::memcpy(obs_array.mutable_data(), state.observation.data(),
                            state.observation.size() * sizeof(float));
                 obs_list.append(obs_array);
 
                 // Policy: shape (4672,)
-                py::array_t<float> policy_array({encoding::MoveEncoder::POLICY_SIZE});
+                py::array_t<float> policy_array(std::vector<ssize_t>{encoding::MoveEncoder::POLICY_SIZE});
                 std::memcpy(policy_array.mutable_data(), state.policy.data(),
                            state.policy.size() * sizeof(float));
                 policy_list.append(policy_array);
@@ -610,12 +610,12 @@ public:
                 py::list value_list;
 
                 for (const auto& state : traj.states) {
-                    py::array_t<float> obs_array({8, 8, 122});
+                    py::array_t<float> obs_array(std::vector<ssize_t>{8, 8, 122});
                     std::memcpy(obs_array.mutable_data(), state.observation.data(),
                                state.observation.size() * sizeof(float));
                     obs_list.append(obs_array);
 
-                    py::array_t<float> policy_array({4672});
+                    py::array_t<float> policy_array(std::vector<ssize_t>{4672});
                     std::memcpy(policy_array.mutable_data(), state.policy.data(),
                                state.policy.size() * sizeof(float));
                     policy_list.append(policy_array);
