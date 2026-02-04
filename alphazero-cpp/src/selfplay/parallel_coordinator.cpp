@@ -16,6 +16,16 @@ ParallelSelfPlayCoordinator::ParallelSelfPlayCoordinator(
     , eval_queue_(config.gpu_batch_size, config.queue_capacity)
     , replay_buffer_(replay_buffer)
 {
+    if (config.num_workers > static_cast<int>(MAX_WORKERS)) {
+        fprintf(stderr,
+            "[WARNING] num_workers (%d) exceeds MAX_WORKERS (%zu). "
+            "Workers %zu-%d will silently fail all evaluations! "
+            "Clamping to %zu workers.\n",
+            config.num_workers, MAX_WORKERS, MAX_WORKERS,
+            config.num_workers - 1, MAX_WORKERS);
+        fflush(stderr);
+        config_.num_workers = static_cast<int>(MAX_WORKERS);
+    }
     stats_.reset();
 }
 

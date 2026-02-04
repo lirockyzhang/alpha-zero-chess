@@ -18,7 +18,7 @@ namespace selfplay {
 
 constexpr size_t OBS_SIZE = 8 * 8 * 122;      // 7808 floats per observation
 constexpr size_t POLICY_SIZE = 4672;           // Policy vector size
-constexpr size_t MAX_WORKERS = 32;             // Maximum concurrent workers
+constexpr size_t MAX_WORKERS = 128;            // Maximum concurrent workers
 constexpr size_t DEFAULT_MAX_BATCH = 512;      // Default max batch size
 constexpr size_t DEFAULT_QUEUE_CAPACITY = 8192; // Request queue capacity (increased from 4096 to prevent exhaustion)
 

@@ -139,7 +139,7 @@ if(Python_FOUND)
     # Set pybind11 CMake directory (use -Dpybind11_DIR=... to override)
     if(NOT DEFINED pybind11_DIR)
         if(WIN32)
-            set(pybind11_DIR "C:\Users\liroc\OneDrive - Duke University\2025-2026\projects\alpha-zero-chess\.venv\Lib\site-packages\pybind11\share\cmake\pybind11")
+            set(pybind11_DIR "C:/Users/liroc/OneDrive - Duke University/2025-2026/projects/alpha-zero-chess/.venv/Lib/site-packages/pybind11/share/cmake/pybind11")
         endif()
     endif()
 

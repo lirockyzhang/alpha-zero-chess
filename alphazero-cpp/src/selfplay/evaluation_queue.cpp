@@ -1,6 +1,7 @@
 #include "../../include/selfplay/evaluation_queue.hpp"
 #include <algorithm>
 #include <stdexcept>
+#include <thread>
 
 namespace selfplay {
 
@@ -189,12 +190,14 @@ int GlobalEvaluationQueue::submit_for_evaluation(
         }
 
         metrics_.total_requests_submitted.fetch_add(actual_leaves, std::memory_order_relaxed);
-        queue_cv_.notify_one();
 
         if (actual_leaves < num_leaves && actual_leaves > 0) {
             metrics_.partial_submissions.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    // Notify OUTSIDE the lock — the GPU thread can immediately acquire
+    // the mutex when woken instead of blocking on the notifier's lock.
+    queue_cv_.notify_one();
 
     return actual_leaves;
 }
@@ -356,20 +359,31 @@ int GlobalEvaluationQueue::collect_batch(
     {
         std::unique_lock<std::mutex> lock(queue_mutex_);
 
-        // ADAPTIVE BATCHING: Use a low threshold to avoid root evaluation stalls
-        size_t target_batch = std::max(size_t(1), std::min(size_t(8), max_batch_size_ / 64));
-
+        // PHASE 1a: Wait for at least 1 request (or timeout/shutdown).
+        // Using target=1 ensures we wake on the FIRST notification instead of
+        // requiring 8+ requests to accumulate. Notifications sent while we were
+        // busy (inference/result distribution) are lost, so we must be responsive
+        // to the first one that arrives while we're actually waiting.
         queue_cv_.wait_for(
             lock,
             std::chrono::milliseconds(timeout_ms),
-            [this, target_batch]() {
-                return staged_requests_.size() >= target_batch ||
+            [this]() {
+                return !staged_requests_.empty() ||
                        shutdown_.load(std::memory_order_acquire);
             }
         );
 
         if (staged_requests_.empty()) {
             return 0;
+        }
+
+        // PHASE 1b: Brief coalescing window — let more workers submit before
+        // we grab the batch. Release the lock momentarily so blocked workers
+        // can push their metadata, then re-acquire and collect everything.
+        if (staged_requests_.size() < max_batch_size_) {
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            lock.lock();
         }
 
         // Collect up to max_batch_size requests

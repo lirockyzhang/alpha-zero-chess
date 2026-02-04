@@ -379,6 +379,8 @@ _Python_INCLUDE_DIR:INTERNAL=C:/Program Files/WindowsApps/PythonSoftwareFoundati
 //Python Properties
 _Python_INTERPRETER_PROPERTIES:INTERNAL=Python;3;13;9;64;<none>;cp313-win_amd64;;C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.2544.0_x64__qbz5n2kfra8p0\Lib;C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.2544.0_x64__qbz5n2kfra8p0\Lib;C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.2544.0_x64__qbz5n2kfra8p0\Lib\site-packages;C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.2544.0_x64__qbz5n2kfra8p0\Lib\site-packages
 _Python_INTERPRETER_SIGNATURE:INTERNAL=4c9d258488cff9c1b02b3e696199ee35
+//Interpreter reason failure
+_Python_Interpreter_REASON_FAILURE:INTERNAL=
 //Path to a library.
 _Python_LIBRARY_DEBUG:INTERNAL=_Python_LIBRARY_DEBUG-NOTFOUND
 //Path to a library.
@@ -388,5 +390,5 @@ _Python_NumPy_REASON_FAILURE:INTERNAL=
 //Path to a library.
 _Python_RUNTIME_LIBRARY_RELEASE:INTERNAL=C:/Program Files/WindowsApps/PythonSoftwareFoundation.Python.3.13_3.13.2544.0_x64__qbz5n2kfra8p0/python313.dll
 //Directories where pybind11 and possibly Python headers are located
-pybind11_INCLUDE_DIRS:INTERNAL=C:/veighna_studio/Lib/site-packages/pybind11/include;C:/Program Files/WindowsApps/PythonSoftwareFoundation.Python.3.13_3.13.2544.0_x64__qbz5n2kfra8p0/Include
+pybind11_INCLUDE_DIRS:INTERNAL=C:/Users/liroc/OneDrive - Duke University/2025-2026/projects/alpha-zero-chess/.venv/Lib/site-packages/pybind11/include;C:/Program Files/WindowsApps/PythonSoftwareFoundation.Python.3.13_3.13.2544.0_x64__qbz5n2kfra8p0/Include
 
