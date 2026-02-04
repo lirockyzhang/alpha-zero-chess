@@ -79,23 +79,46 @@ public:
     std::vector<int32_t> get_visit_counts() const;
 
     // Cancel pending evaluations (call when evaluation times out)
-    // This clears in-flight tracking so search can continue or end gracefully
+    // This removes virtual losses and clears in-flight tracking so search can continue
     void cancel_pending_evaluations() {
+        // Remove virtual losses from all pending paths
+        for (const auto& eval : pending_evals_) {
+            remove_virtual_losses_for_path(eval.node);
+        }
         pending_evals_.clear();
         simulations_in_flight_ = 0;
     }
 
-    // Double buffering support for GPU/CPU overlap
-    // Start collecting leaves into the inactive buffer while GPU processes active buffer
+    // =========================================================================
+    // Async Double-Buffer Pipeline
+    // =========================================================================
+    // Enables CPU leaf collection to overlap with GPU evaluation of previous batch.
+    // Workers collect into the "collection buffer" while GPU processes the "evaluation buffer".
+
+    // Collect leaves into the collection buffer (async: doesn't touch pending_evals_)
+    // Returns the number of leaves collected
+    int collect_leaves_async(float* obs_buffer, float* mask_buffer, int max_batch_size);
+
+    // Get the size of the previous batch (evaluation buffer)
+    int get_prev_batch_size() const;
+
+    // Backpropagate results for the evaluation buffer (previous batch)
+    void update_prev_leaves(const std::vector<std::vector<float>>& policies,
+                           const std::vector<float>& values);
+
+    // Cancel previous batch: remove virtual losses from evaluation buffer leaves
+    void cancel_prev_pending();
+
+    // Cancel current collection batch: remove virtual losses from collection buffer leaves
+    void cancel_collection_pending();
+
+    // Swap buffers: collection buffer becomes evaluation buffer, old eval buffer is cleared
+    void commit_and_swap();
+
+    // Double buffering support (low-level)
     void start_next_batch_collection();
-
-    // Get the current collection buffer (for CPU to fill)
     std::vector<PendingEval>& get_collection_buffer();
-
-    // Get the evaluation buffer (for GPU to process)
     const std::vector<PendingEval>& get_evaluation_buffer() const;
-
-    // Swap buffers after GPU completes evaluation
     void swap_buffers();
 
 private:
@@ -118,6 +141,9 @@ private:
 
     // Add Dirichlet noise to root
     void add_dirichlet_noise(Node* root);
+
+    // Remove virtual losses along path from node to root (for cancelled evaluations)
+    void remove_virtual_losses_for_path(Node* node);
 
     NodePool& pool_;
     BatchSearchConfig config_;

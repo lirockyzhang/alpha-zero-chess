@@ -1,5 +1,6 @@
 #include "../../include/selfplay/parallel_coordinator.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <random>
 
 namespace selfplay {
@@ -43,6 +44,7 @@ void ParallelSelfPlayCoordinator::start(NeuralEvaluatorFn evaluator) {
     shutdown_.store(false, std::memory_order_release);
     running_.store(true, std::memory_order_release);
     workers_active_.store(0, std::memory_order_release);
+    games_remaining_.store(config_.num_workers * config_.games_per_worker, std::memory_order_release);
 
     evaluator_ = std::move(evaluator);
 
@@ -92,34 +94,56 @@ void ParallelSelfPlayCoordinator::stop() {
 void ParallelSelfPlayCoordinator::worker_thread_func(int worker_id) {
     workers_active_.fetch_add(1, std::memory_order_relaxed);
 
-    // Thread-local node pool
-    mcts::NodePool node_pool;
+    try {
+        // Thread-local node pool
+        mcts::NodePool node_pool;
 
-    for (int game = 0; game < config_.games_per_worker; ++game) {
-        if (shutdown_.load(std::memory_order_acquire)) {
-            break;
-        }
-
-        // Play one game
-        GameTrajectory trajectory = play_single_game(worker_id, node_pool);
-
-        // Add to replay buffer or completed queue
-        if (replay_buffer_ != nullptr) {
-            // Add each state to replay buffer
-            for (const auto& state : trajectory.states) {
-                // Pass vectors directly - add_sample expects const vector references
-                replay_buffer_->add_sample(
-                    state.observation,
-                    state.policy,
-                    state.value
-                );
+        while (!shutdown_.load(std::memory_order_acquire)) {
+            int remaining = games_remaining_.fetch_sub(1, std::memory_order_acq_rel);
+            if (remaining <= 0) {
+                games_remaining_.fetch_add(1, std::memory_order_relaxed);
+                break;
             }
-        } else {
-            completed_games_.push(std::move(trajectory));
-        }
 
-        // Reset pool for next game
-        node_pool.reset();
+            // Play one game
+            GameTrajectory trajectory = play_single_game(worker_id, node_pool);
+
+            // Add to replay buffer or completed queue
+            if (replay_buffer_ != nullptr) {
+                for (const auto& state : trajectory.states) {
+                    replay_buffer_->add_sample(
+                        state.observation,
+                        state.policy,
+                        state.value
+                    );
+                }
+            } else {
+                completed_games_.push(std::move(trajectory));
+            }
+
+            // Reset pool for next game
+            node_pool.reset();
+        }
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[FATAL] Worker %d exception: %s\n", worker_id, e.what());
+        fflush(stderr);
+        {
+            std::lock_guard<std::mutex> lock(error_mutex_);
+            if (last_error_.empty()) {
+                last_error_ = std::string("Worker ") + std::to_string(worker_id) + ": " + e.what();
+            }
+        }
+        shutdown_.store(true, std::memory_order_release);
+    } catch (...) {
+        fprintf(stderr, "[FATAL] Worker %d unknown exception\n", worker_id);
+        fflush(stderr);
+        {
+            std::lock_guard<std::mutex> lock(error_mutex_);
+            if (last_error_.empty()) {
+                last_error_ = std::string("Worker ") + std::to_string(worker_id) + ": unknown exception";
+            }
+        }
+        shutdown_.store(true, std::memory_order_release);
     }
 
     workers_active_.fetch_sub(1, std::memory_order_relaxed);
@@ -131,41 +155,69 @@ void ParallelSelfPlayCoordinator::worker_thread_func(int worker_id) {
 }
 
 void ParallelSelfPlayCoordinator::gpu_thread_func() {
-    while (!shutdown_.load(std::memory_order_acquire)) {
-        float* obs_ptr = nullptr;
-        float* mask_ptr = nullptr;
+    try {
+        // Pre-allocate output buffers (reused across batches to avoid heap allocs)
+        std::vector<float> policies(config_.gpu_batch_size * POLICY_SIZE);
+        std::vector<float> values(config_.gpu_batch_size);
 
-        // Collect batch (blocks with timeout)
-        int batch_size = eval_queue_.collect_batch(
-            &obs_ptr, &mask_ptr, config_.gpu_timeout_ms
-        );
+        while (!shutdown_.load(std::memory_order_acquire)) {
+            float* obs_ptr = nullptr;
+            float* mask_ptr = nullptr;
 
-        if (batch_size == 0) {
-            // Check if we should exit
-            if (eval_queue_.is_shutdown() ||
-                shutdown_.load(std::memory_order_acquire)) {
-                break;
+            // Collect batch (blocks with timeout)
+            int batch_size = eval_queue_.collect_batch(
+                &obs_ptr, &mask_ptr, config_.gpu_timeout_ms
+            );
+
+            if (batch_size == 0) {
+                // Check if we should exit
+                if (eval_queue_.is_shutdown() ||
+                    shutdown_.load(std::memory_order_acquire)) {
+                    break;
+                }
+                continue;
             }
-            continue;
+
+            try {
+                // Call neural network evaluator (writes to pre-allocated buffers)
+                evaluator_(obs_ptr, mask_ptr, batch_size,
+                           policies.data(), values.data());
+
+                // Distribute results to workers
+                eval_queue_.submit_results(policies.data(), values.data(), batch_size);
+            } catch (const std::exception& e) {
+                // Track error for debugging GPU thread issues
+                stats_.gpu_errors.fetch_add(1, std::memory_order_relaxed);
+                fprintf(stderr, "[ERROR] GPU thread evaluator exception: %s\n", e.what());
+                fflush(stderr);
+                {
+                    std::lock_guard<std::mutex> lock(error_mutex_);
+                    if (last_error_.empty()) {
+                        last_error_ = std::string("GPU thread: ") + e.what();
+                    }
+                }
+            }
         }
-
-        // Allocate output buffers
-        std::vector<float> policies(batch_size * POLICY_SIZE);
-        std::vector<float> values(batch_size);
-
-        try {
-            // Call neural network evaluator
-            evaluator_(obs_ptr, mask_ptr, batch_size,
-                       policies.data(), values.data());
-
-            // Distribute results to workers
-            eval_queue_.submit_results(policies.data(), values.data(), batch_size);
-        } catch (const std::exception& e) {
-            // Track error for debugging GPU thread issues
-            stats_.gpu_errors.fetch_add(1, std::memory_order_relaxed);
-            // Workers will timeout and use fallback move selection
-            (void)e;  // Suppress unused variable warning
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[FATAL] GPU thread exception: %s\n", e.what());
+        fflush(stderr);
+        {
+            std::lock_guard<std::mutex> lock(error_mutex_);
+            if (last_error_.empty()) {
+                last_error_ = std::string("GPU thread fatal: ") + e.what();
+            }
         }
+        shutdown_.store(true, std::memory_order_release);
+    } catch (...) {
+        fprintf(stderr, "[FATAL] GPU thread unknown exception\n");
+        fflush(stderr);
+        {
+            std::lock_guard<std::mutex> lock(error_mutex_);
+            if (last_error_.empty()) {
+                last_error_ = "GPU thread: unknown exception";
+            }
+        }
+        shutdown_.store(true, std::memory_order_release);
     }
 }
 
@@ -419,28 +471,42 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
         }
     }
 
-    // Submit root for evaluation
-    std::vector<int32_t> request_ids;
-    eval_queue_.submit_for_evaluation(
-        worker_id,
-        obs_buffer.data(),
-        mask_buffer.data(),
-        1,
-        request_ids
-    );
+    // Submit root for evaluation with retry on timeout
+    int got = 0;
+    for (int attempt = 0; attempt <= config_.root_eval_retries; ++attempt) {
+        if (attempt > 0) {
+            // Flush stale results from previous timed-out attempt
+            int flushed = eval_queue_.flush_worker_results(worker_id);
+            stats_.root_retries.fetch_add(1, std::memory_order_relaxed);
+            if (flushed > 0) {
+                stats_.stale_results_flushed.fetch_add(flushed, std::memory_order_relaxed);
+            }
+        }
 
-    // Wait for root evaluation
-    int got = eval_queue_.get_results(
-        worker_id,
-        policy_buffer.data(),
-        value_buffer.data(),
-        1,
-        config_.worker_timeout_ms
-    );
+        std::vector<int32_t> request_ids;
+        eval_queue_.submit_for_evaluation(
+            worker_id,
+            obs_buffer.data(),
+            mask_buffer.data(),
+            1,
+            request_ids
+        );
+
+        got = eval_queue_.get_results(
+            worker_id,
+            policy_buffer.data(),
+            value_buffer.data(),
+            1,
+            config_.worker_timeout_ms
+        );
+
+        if (got > 0 || shutdown_.load(std::memory_order_acquire)) {
+            break;
+        }
+    }
 
     if (got == 0 || shutdown_.load(std::memory_order_acquire)) {
-        // Root evaluation failed - MCTS cannot proceed
-        // Note: mcts_failures counter is incremented by play_single_game when total_visits == 0
+        // All retries exhausted - caller falls back to uniform random
         return;
     }
 
@@ -453,73 +519,190 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
                        value_buffer[0],
                        history_vec);
 
+    // =========================================================================
     // MCTS simulation loop
-    while (!search.is_search_complete() &&
-           !shutdown_.load(std::memory_order_acquire))
-    {
-        // Collect leaves
-        int num_leaves = search.collect_leaves(
-            obs_buffer.data(),
-            mask_buffer.data(),
-            config_.mcts_batch_size
-        );
+    // =========================================================================
+    // Two modes based on mcts_batch_size:
+    //
+    // search-batch=1 (default, recommended for cross-game batching):
+    //   Simple synchronous loop. GPU batching comes from multiple workers
+    //   submitting to the shared queue, NOT from per-worker leaf batching.
+    //   Minimizes virtual losses → maximizes search quality.
+    //
+    // search-batch>1 (async pipeline for experimentation):
+    //   Uses double-buffering to overlap CPU leaf collection with GPU evaluation.
+    //   Higher virtual losses but amortizes per-leaf overhead.
 
-        if (num_leaves == 0) {
-            break;
-        }
+    std::vector<int32_t> sim_request_ids;
 
-        // Submit leaves for evaluation
-        request_ids.clear();
-        int queued = eval_queue_.submit_for_evaluation(
-            worker_id,
-            obs_buffer.data(),
-            mask_buffer.data(),
-            num_leaves,
-            request_ids
-        );
+    if (config_.mcts_batch_size <= 1) {
+        // =====================================================================
+        // Synchronous single-leaf loop (optimal for cross-game batching)
+        // =====================================================================
+        // With 16+ workers each submitting 1 leaf at a time, the shared queue
+        // naturally produces GPU batches of ~16+ leaves. Virtual loss is minimal
+        // (at most 1 per worker = 16 total) so PUCT scores stay accurate.
 
-        if (queued == 0) {
-            // Queue completely full - cancel pending and retry on next iteration
-            search.cancel_pending_evaluations();
-            continue;
-        }
-
-        // CRITICAL FIX: Only wait for what was actually queued!
-        // If we submitted fewer leaves than requested (partial submission),
-        // waiting for num_leaves would cause timeout since only 'queued' results arrive.
-        // This was the root cause of 95%+ MCTS timeout failures.
-        got = eval_queue_.get_results(
-            worker_id,
-            policy_buffer.data(),
-            value_buffer.data(),
-            queued,  // Changed from num_leaves to queued
-            config_.worker_timeout_ms
-        );
-
-        if (got == 0) {
-            // Evaluation timed out - cancel pending and try again
-            // This clears simulations_in_flight_ so collect_leaves can work
-            search.cancel_pending_evaluations();
-            // Continue the loop to retry (collect_leaves may return 0 if near completion)
-            continue;
-        }
-
-        stats_.total_nn_evals.fetch_add(got, std::memory_order_relaxed);
-
-        // Convert to format expected by search
-        std::vector<std::vector<float>> policies(got);
-        std::vector<float> values(got);
-
-        for (int i = 0; i < got; ++i) {
-            policies[i].assign(
-                policy_buffer.data() + i * encoding::MoveEncoder::POLICY_SIZE,
-                policy_buffer.data() + (i + 1) * encoding::MoveEncoder::POLICY_SIZE
+        while (!search.is_search_complete() &&
+               !shutdown_.load(std::memory_order_acquire))
+        {
+            int num_leaves = search.collect_leaves(
+                obs_buffer.data(), mask_buffer.data(), 1
             );
-            values[i] = value_buffer[i];
+
+            if (num_leaves == 0) {
+                break;
+            }
+
+            sim_request_ids.clear();
+            int queued = eval_queue_.submit_for_evaluation(
+                worker_id, obs_buffer.data(), mask_buffer.data(),
+                num_leaves, sim_request_ids
+            );
+
+            if (queued == 0) {
+                search.cancel_pending_evaluations();
+                continue;
+            }
+
+            got = eval_queue_.get_results(
+                worker_id, policy_buffer.data(), value_buffer.data(),
+                queued, config_.worker_timeout_ms
+            );
+
+            if (got == 0) {
+                search.cancel_pending_evaluations();
+                int flushed = eval_queue_.flush_worker_results(worker_id);
+                if (flushed > 0) {
+                    stats_.stale_results_flushed.fetch_add(flushed, std::memory_order_relaxed);
+                }
+                continue;
+            }
+
+            stats_.total_nn_evals.fetch_add(got, std::memory_order_relaxed);
+
+            std::vector<std::vector<float>> policies(got);
+            std::vector<float> values(got);
+            for (int i = 0; i < got; ++i) {
+                policies[i].assign(
+                    policy_buffer.data() + i * encoding::MoveEncoder::POLICY_SIZE,
+                    policy_buffer.data() + (i + 1) * encoding::MoveEncoder::POLICY_SIZE
+                );
+                values[i] = value_buffer[i];
+            }
+            search.update_leaves(policies, values);
+        }
+    } else {
+        // =====================================================================
+        // Pipelined async loop (for search-batch > 1)
+        // =====================================================================
+        // Uses double-buffering: while GPU processes batch N, CPU collects N+1.
+        // Virtual losses prevent re-selecting the same paths across in-flight batches.
+
+        int prev_queued = 0;
+
+        // Phase 1: Collect first batch
+        search.start_next_batch_collection();
+        int num_leaves = search.collect_leaves_async(
+            obs_buffer.data(), mask_buffer.data(), config_.mcts_batch_size
+        );
+
+        if (num_leaves > 0 && !shutdown_.load(std::memory_order_acquire)) {
+            sim_request_ids.clear();
+            int queued = eval_queue_.submit_for_evaluation(
+                worker_id, obs_buffer.data(), mask_buffer.data(),
+                num_leaves, sim_request_ids
+            );
+
+            if (queued > 0) {
+                search.commit_and_swap();
+                prev_queued = queued;
+            } else {
+                search.cancel_collection_pending();
+            }
         }
 
-        // Update search with evaluations
-        search.update_leaves(policies, values);
+        // Phase 2: Pipelined loop
+        while (!search.is_search_complete() && !shutdown_.load(std::memory_order_acquire)) {
+            // Step A: Collect NEXT batch (overlaps GPU processing prev batch)
+            num_leaves = search.collect_leaves_async(
+                obs_buffer.data(), mask_buffer.data(), config_.mcts_batch_size
+            );
+
+            // Step B: Get results from PREVIOUS batch
+            if (prev_queued > 0) {
+                got = eval_queue_.get_results(
+                    worker_id, policy_buffer.data(), value_buffer.data(),
+                    prev_queued, config_.worker_timeout_ms
+                );
+
+                if (got > 0) {
+                    stats_.total_nn_evals.fetch_add(got, std::memory_order_relaxed);
+
+                    std::vector<std::vector<float>> policies(got);
+                    std::vector<float> values(got);
+                    for (int i = 0; i < got; ++i) {
+                        policies[i].assign(
+                            policy_buffer.data() + i * encoding::MoveEncoder::POLICY_SIZE,
+                            policy_buffer.data() + (i + 1) * encoding::MoveEncoder::POLICY_SIZE
+                        );
+                        values[i] = value_buffer[i];
+                    }
+                    search.update_prev_leaves(policies, values);
+                } else {
+                    search.cancel_prev_pending();
+                    int flushed = eval_queue_.flush_worker_results(worker_id);
+                    if (flushed > 0) {
+                        stats_.stale_results_flushed.fetch_add(flushed, std::memory_order_relaxed);
+                    }
+                }
+            }
+
+            // Step C: Submit current batch
+            if (num_leaves > 0) {
+                sim_request_ids.clear();
+                int queued = eval_queue_.submit_for_evaluation(
+                    worker_id, obs_buffer.data(), mask_buffer.data(),
+                    num_leaves, sim_request_ids
+                );
+
+                if (queued > 0) {
+                    search.commit_and_swap();
+                    prev_queued = queued;
+                } else {
+                    search.cancel_collection_pending();
+                    prev_queued = 0;
+                }
+            } else {
+                prev_queued = 0;
+            }
+        }
+
+        // Phase 3: Drain final batch
+        if (prev_queued > 0) {
+            got = eval_queue_.get_results(
+                worker_id, policy_buffer.data(), value_buffer.data(),
+                prev_queued, config_.worker_timeout_ms
+            );
+
+            if (got > 0) {
+                stats_.total_nn_evals.fetch_add(got, std::memory_order_relaxed);
+
+                std::vector<std::vector<float>> policies(got);
+                std::vector<float> values(got);
+                for (int i = 0; i < got; ++i) {
+                    policies[i].assign(
+                        policy_buffer.data() + i * encoding::MoveEncoder::POLICY_SIZE,
+                        policy_buffer.data() + (i + 1) * encoding::MoveEncoder::POLICY_SIZE
+                    );
+                    values[i] = value_buffer[i];
+                }
+                search.update_prev_leaves(policies, values);
+            } else {
+                search.cancel_prev_pending();
+                eval_queue_.flush_worker_results(worker_id);
+            }
+        }
     }
 }
 

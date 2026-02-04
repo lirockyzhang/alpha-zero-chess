@@ -15,6 +15,8 @@
 #include <functional>
 #include <chrono>
 #include <deque>
+#include <mutex>
+#include <string>
 
 namespace selfplay {
 
@@ -29,7 +31,7 @@ struct ParallelSelfPlayConfig {
 
     // MCTS configuration
     int num_simulations = 800;          // MCTS simulations per move
-    int mcts_batch_size = 64;           // Per-game MCTS batch size
+    int mcts_batch_size = 1;            // Per-game MCTS leaf batch size (1 = optimal for cross-game batching)
     float c_puct = 1.5f;                // PUCT exploration constant
     float dirichlet_alpha = 0.3f;       // Dirichlet noise alpha
     float dirichlet_epsilon = 0.25f;    // Dirichlet noise weight
@@ -45,6 +47,9 @@ struct ParallelSelfPlayConfig {
 
     // Queue configuration
     int queue_capacity = 8192;          // Evaluation queue capacity (increased to prevent exhaustion)
+
+    // Retry configuration
+    int root_eval_retries = 3;          // Max retries for root NN evaluation before giving up
 };
 
 // ============================================================================
@@ -71,6 +76,10 @@ struct ParallelSelfPlayStats {
     std::atomic<int64_t> mcts_failures{0};  // MCTS returned zero visits (eval timeout/error)
     std::atomic<int64_t> gpu_errors{0};     // GPU thread exceptions
 
+    // Retry/stale result tracking
+    std::atomic<int64_t> root_retries{0};           // Times root eval was retried (timeout recovery)
+    std::atomic<int64_t> stale_results_flushed{0};  // Total stale results discarded
+
     void reset() {
         games_completed = 0;
         total_moves = 0;
@@ -83,6 +92,8 @@ struct ParallelSelfPlayStats {
         total_mcts_time_ms = 0;
         mcts_failures = 0;
         gpu_errors = 0;
+        root_retries = 0;
+        stale_results_flushed = 0;
     }
 
     double avg_game_length() const {
@@ -122,9 +133,10 @@ struct ParallelSelfPlayStats {
 
 // Callback signature for neural network evaluation
 // Called by GPU thread with batched observations
+// Observations are in NCHW format (batch_size x 122 x 8 x 8) — C++ handles transpose
 // Should perform forward pass and write results to policies/values
 using NeuralEvaluatorFn = std::function<void(
-    const float* observations,      // batch_size x 8 x 8 x 122 (NHWC)
+    const float* observations,      // batch_size x 122 x 8 x 8 (NCHW)
     const float* legal_masks,       // batch_size x 4672
     int batch_size,
     float* out_policies,            // batch_size x 4672
@@ -172,6 +184,12 @@ public:
 
     // Stop early (graceful shutdown)
     void stop();
+
+    // Get last error from worker/GPU threads (thread-safe, first-error-wins)
+    std::string get_last_error() const {
+        std::lock_guard<std::mutex> lock(error_mutex_);
+        return last_error_;
+    }
 
     // =========================================================================
     // Status and Metrics
@@ -262,9 +280,14 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> shutdown_{false};
     std::atomic<int> workers_active_{0};
+    std::atomic<int> games_remaining_{0};
 
     // Statistics
     ParallelSelfPlayStats stats_;
+
+    // Error tracking (thread-safe, first-error-wins)
+    mutable std::mutex error_mutex_;
+    std::string last_error_;
 };
 
 } // namespace selfplay

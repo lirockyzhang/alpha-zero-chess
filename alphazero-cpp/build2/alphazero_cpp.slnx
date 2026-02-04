@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Solution>
+	<Configurations>
+		<BuildType Name="Debug"/>
+		<BuildType Name="Release"/>
+		<BuildType Name="MinSizeRel"/>
+		<BuildType Name="RelWithDebInfo"/>
+		<Platform Name="x64"/>
+	</Configurations>
+	<Project Path="ALL_BUILD.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="d540e384-2f64-3ee1-9819-1d006354375d" DefaultStartup="true">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="alphazero_cpp.vcxproj"/>
+		<BuildDependency Project="chess_engine.vcxproj"/>
+		<BuildDependency Project="encoding.vcxproj"/>
+		<BuildDependency Project="mcts_core.vcxproj"/>
+		<BuildDependency Project="selfplay.vcxproj"/>
+		<BuildDependency Project="training.vcxproj"/>
+	</Project>
+	<Project Path="INSTALL.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="4d71ad0b-876d-3bdb-ac6d-0e27c5541c13">
+		<BuildDependency Project="ALL_BUILD.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<Build Solution="Debug|*" Project="false"/>
+		<Build Solution="Release|*" Project="false"/>
+		<Build Solution="MinSizeRel|*" Project="false"/>
+		<Build Solution="RelWithDebInfo|*" Project="false"/>
+	</Project>
+	<Project Path="ZERO_CHECK.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="2dfc900a-3a84-358b-81bf-b0222ba051f9"/>
+	<Project Path="alphazero_cpp.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="0a90c254-470f-3b37-b920-f50c4439d966">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="encoding.vcxproj"/>
+		<BuildDependency Project="mcts_core.vcxproj"/>
+		<BuildDependency Project="selfplay.vcxproj"/>
+		<BuildDependency Project="training.vcxproj"/>
+	</Project>
+	<Project Path="chess_engine.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="01b3b888-233a-352d-9fa5-88f329ae9205">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="encoding.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="884ccee9-21b0-3d66-95a4-68337e7addbd">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="mcts_core.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="5365ad73-f85e-3905-ad48-b0548e5e3a13">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="encoding.vcxproj"/>
+	</Project>
+	<Project Path="selfplay.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="540a2ea2-502a-31e4-be17-e82b3ae72533">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="encoding.vcxproj"/>
+		<BuildDependency Project="mcts_core.vcxproj"/>
+		<BuildDependency Project="training.vcxproj"/>
+	</Project>
+	<Project Path="training.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="8ddd0c05-f8ac-3dda-871c-7f7576735c3e">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+</Solution>

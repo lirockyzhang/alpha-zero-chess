@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\liroc\OneDrive - Duke University\2025-2026\projects\alpha-zero-chess\alphazero-cpp\build2\CMakeFiles\f0b11037ea4ed17e9643f0b9a46d7e00\INSTALL_force.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{00FA03F6-25A0-352A-8CF2-18ED05BFDC88}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

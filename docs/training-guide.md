@@ -6,6 +6,18 @@ Complete guide for training and evaluating AlphaZero chess models using the C++ 
 
 ### Training (Recommended)
 
+Each training run creates an **organized output directory** with all artifacts:
+```
+checkpoints/f192-b15_2024-02-03_14-30-00/
+├── model_iter_001.pt            # Checkpoints (every N iterations)
+├── model_iter_005.pt
+├── model_final.pt               # Final checkpoint
+├── training_metrics.json        # Loss, games, moves per iteration
+├── evaluation_results.json      # vs_random win rate, endgame scores
+├── summary.html                 # Visual training summary (default)
+└── replay_buffer.rpbf           # Only if --buffer-persistence
+```
+
 ```bash
 # Quick test run (~10 minutes, verifies setup works)
 uv run python alphazero-cpp/scripts/train.py \
@@ -42,17 +54,20 @@ uv run python alphazero-cpp/scripts/train.py \
 
 ### Evaluation
 
+**Note:** Evaluation now runs automatically before each checkpoint save (disable with `--no-eval`).
+The results are saved to `evaluation_results.json` in the run directory.
+
 ```bash
 # Evaluate against random player (quick sanity check)
 uv run python alphazero/scripts/evaluate.py \
-    --checkpoint checkpoints/cpp_iter_20.pt \
+    --checkpoint checkpoints/f64-b5_2024-02-03_14-30-00/model_iter_020.pt \
     --opponent random \
     --games 20 \
     --simulations 100
 
 # Evaluate endgame positions
 uv run python alphazero/scripts/evaluate.py \
-    --checkpoint checkpoints/cpp_iter_20.pt \
+    --checkpoint checkpoints/f64-b5_2024-02-03_14-30-00/model_final.pt \
     --opponent endgame \
     --simulations 200
 ```
@@ -102,19 +117,22 @@ Parameters are grouped by which phase of training they affect:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--device` | cuda | Device (cuda or cpu) |
-| `--save-dir` | checkpoints | Checkpoint directory |
-| `--resume` | - | Resume from checkpoint path |
+| `--save-dir` | checkpoints | Base checkpoint directory |
+| `--resume` | - | Resume from checkpoint path (.pt file) or run directory |
 | `--save-interval` | 5 | Save every N iterations |
-| `--buffer-path` | replay_buffer/latest.rpbf | Replay buffer persistence |
 | `--progress-interval` | 30 | Print performance stats every N seconds |
 
-#### Dashboard Parameters
+#### Buffer Persistence
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--visual` | False | Enable HTML dashboard (auto-refresh, requires plotly) |
+| `--buffer-persistence` | False | Save/load replay buffer between runs (default: fresh buffer each run) |
+
+#### Visualization & Evaluation
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--no-visualization` | False | Disable summary.html generation (enabled by default) |
+| `--no-eval` | False | Skip evaluation before checkpoint (enabled by default) |
 | `--live` | False | Enable LIVE web dashboard (real-time, requires flask) |
-| `--dashboard-dir` | training_dashboard | Dashboard output directory |
-| `--dashboard-interval` | 1 | Update dashboard every N iterations |
 | `--dashboard-port` | 5000 | Port for live dashboard server |
 
 ### Architecture (AlphaZero Paper Standard)
@@ -139,14 +157,15 @@ uv run python alphazero-cpp/scripts/train.py \
     --simulations 100 \
     --filters 64 \
     --blocks 3 \
-    --train-batch 128 \
-    --save-dir checkpoints/test
+    --train-batch 128
 ```
 
 **Expected output:**
+- Creates run directory: `checkpoints/f64-b3_YYYY-MM-DD_HH-MM-SS/`
 - ~50 positions generated
 - Training skipped (buffer too small)
-- Checkpoint saved at `checkpoints/test/cpp_iter_2.pt`
+- Checkpoints saved at `model_iter_001.pt`, `model_iter_002.pt`, `model_final.pt`
+- `summary.html` generated with training metrics
 
 ### 2. Development (~2-4 hours, 8GB GPU)
 
@@ -160,14 +179,15 @@ uv run python alphazero-cpp/scripts/train.py \
     --filters 64 \
     --blocks 5 \
     --train-batch 256 \
-    --buffer-size 50000 \
-    --save-dir checkpoints/dev
+    --buffer-size 50000
 ```
 
 **Expected results:**
+- Creates run directory: `checkpoints/f64-b5_YYYY-MM-DD_HH-MM-SS/`
 - ~500 games generated
-- Model should beat random player 80%+
+- Model should beat random player 80%+ (check `evaluation_results.json`)
 - ~10-15 moves/sec during self-play
+- `summary.html` updated on each checkpoint with loss curves and evaluation metrics
 
 ### 3. Development with Parallel Self-Play (~1-2 hours, 8GB GPU)
 
@@ -182,8 +202,7 @@ uv run python alphazero-cpp/scripts/train.py \
     --filters 64 \
     --blocks 5 \
     --train-batch 256 \
-    --buffer-size 50000 \
-    --save-dir checkpoints/dev
+    --buffer-size 50000
 ```
 
 **Expected results:**
@@ -203,14 +222,14 @@ uv run python alphazero-cpp/scripts/train.py \
     --filters 128 \
     --blocks 10 \
     --train-batch 512 \
-    --buffer-size 200000 \
-    --save-dir checkpoints/serious
+    --buffer-size 200000
 ```
 
 **Expected results:**
+- Creates run directory: `checkpoints/f128-b10_YYYY-MM-DD_HH-MM-SS/`
 - ~2,500 games generated
-- Model should beat random 95%+
-- Basic tactical awareness
+- Model should beat random 95%+ (tracked in `evaluation_results.json`)
+- Basic tactical awareness (endgame puzzles 3-4/5)
 
 ### 5. Production (~24-48 hours, 16GB+ GPU)
 
@@ -225,14 +244,15 @@ uv run python alphazero-cpp/scripts/train.py \
     --filters 192 \
     --blocks 15 \
     --train-batch 1024 \
-    --buffer-size 500000 \
-    --save-dir checkpoints/production
+    --buffer-size 500000
 ```
 
 **Expected results:**
+- Creates run directory: `checkpoints/f192-b15_YYYY-MM-DD_HH-MM-SS/`
 - ~10,000 games generated
 - Strong tactical play
 - ~1500-1800 Elo estimate
+- `summary.html` tracks all training progress and evaluation metrics
 
 ---
 
@@ -334,6 +354,9 @@ Parallel (--workers 16):
 | `--workers 16` | 16 games run concurrently |
 | `--eval-batch 512` | Collect up to 512 leaves from ALL games before GPU call |
 | `--batch-timeout-ms 5` | Don't wait longer than 5ms for batch to fill |
+| `--queue-capacity 8192` | Evaluation queue capacity (increase for many workers) |
+| `--root-eval-retries 3` | Max retries for root NN eval timeout before giving up |
+| `--worker-timeout-ms 2000` | Worker wait time for NN results (per attempt) |
 
 ### Training Settings
 
@@ -610,29 +633,38 @@ Watch these metrics during training:
 
 ## Resuming Training
 
-To resume from a checkpoint:
+Resume training from either a **checkpoint file** or a **run directory**:
 
 ```bash
+# Resume from a specific checkpoint file
 uv run python alphazero-cpp/scripts/train.py \
-    --resume checkpoints/cpp_iter_50.pt \
+    --resume checkpoints/f192-b15_2024-02-03_14-30-00/model_iter_050.pt \
+    --iterations 100
+
+# Resume from a run directory (finds latest checkpoint automatically)
+uv run python alphazero-cpp/scripts/train.py \
+    --resume checkpoints/f192-b15_2024-02-03_14-30-00 \
     --iterations 100
 ```
 
 This will:
 1. Load the network weights and optimizer state
-2. Start from iteration 51
-3. Load replay buffer from `replay_buffer/latest.rpbf` (if exists)
+2. Start from the next iteration (e.g., iteration 51)
+3. Load `training_metrics.json` and append new metrics
+4. Load `evaluation_results.json` and append new evaluations
+5. Load replay buffer (only if `--buffer-persistence` is set)
+6. Continue saving to the same run directory
 
----
 
 ## Graceful Shutdown (Ctrl+C)
 
 The training script supports **graceful shutdown**. When you press Ctrl+C:
 
 1. **Finishes the current game** (doesn't interrupt mid-game)
-2. **Saves an emergency checkpoint** to `checkpoints/cpp_iter_X_emergency.pt`
-3. **Saves the replay buffer** to preserve all training data
-4. **Prints resume instructions**
+2. **Saves an emergency checkpoint** to `{run_dir}/model_iter_XXX_emergency.pt`
+3. **Saves the replay buffer** (only if `--buffer-persistence` is enabled)
+4. **Saves training metrics** to `training_metrics.json`
+5. **Prints resume instructions**
 
 ```bash
 # Example: Press Ctrl+C during training
@@ -642,9 +674,9 @@ The training script supports **graceful shutdown**. When you press Ctrl+C:
 # ! Press Ctrl+C again to force quit (may lose data)
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-# To resume after graceful shutdown:
+# To resume after graceful shutdown (use run directory):
 uv run python alphazero-cpp/scripts/train.py \
-    --resume checkpoints/cpp_iter_15_emergency.pt \
+    --resume checkpoints/f192-b15_2024-02-03_14-30-00 \
     --iterations 100
 ```
 
@@ -687,13 +719,35 @@ The training script prints **live performance statistics** every 30 seconds (con
 
 ---
 
-## Training Dashboards
+## Training Outputs & Dashboards
 
-Two dashboard options are available for monitoring training progress:
+### Default Output: summary.html
 
-### Option 1: Live Web Dashboard (`--live`) ⭐ Recommended
+By default, a **summary.html** file is generated in the run directory on every checkpoint save:
 
-Real-time dashboard with **instant WebSocket updates**:
+```bash
+# Default behavior - summary.html is generated automatically
+uv run python alphazero-cpp/scripts/train.py \
+    --iterations 50 \
+    --games-per-iter 25
+
+# Output: checkpoints/f192-b15_YYYY-MM-DD_HH-MM-SS/summary.html
+```
+
+The summary includes:
+- Training loss curves (total, policy, value)
+- Evaluation metrics (vs_random win rate, endgame puzzle scores)
+- Configuration summary
+- Performance statistics
+
+**To disable summary.html generation:**
+```bash
+--no-visualization
+```
+
+### Option: Live Web Dashboard (`--live`)
+
+For real-time monitoring with **instant WebSocket updates**:
 
 ```bash
 uv run python alphazero-cpp/scripts/train.py \
@@ -719,110 +773,57 @@ pip install flask flask-socketio
 --live --dashboard-port 8080
 ```
 
-### Option 2: Static HTML Dashboard (`--visual`)
-
-Generates HTML files that auto-refresh every 30 seconds:
-
-```bash
-uv run python alphazero-cpp/scripts/train.py \
-    --iterations 50 \
-    --games-per-iter 25 \
-    --visual
-```
-
-This creates an HTML dashboard at `training_dashboard/dashboard.html`.
-
-**Requirements:**
-```bash
-pip install plotly
-```
-
 ### Using Both Together
 
-You can enable both dashboards simultaneously:
+You can enable both outputs simultaneously:
 
 ```bash
 uv run python alphazero-cpp/scripts/train.py \
     --iterations 50 \
-    --live \
-    --visual
+    --live
 ```
 
 This gives you:
 - Real-time updates in the browser (`--live`)
-- Saved HTML/JSON files for later analysis (`--visual`)
+- Saved summary.html in the run directory (default)
 
-### Dashboard Features
+### Automatic Evaluation
 
-The dashboard displays **9 interactive charts** tracking all key metrics:
+**Evaluation runs automatically before each checkpoint save** (disable with `--no-eval`):
 
-| Chart | Metrics Shown |
-|-------|---------------|
-| 📉 Training Loss | Total loss over iterations |
-| ⚡ Performance | Moves per second |
-| 🎮 Games/Hour | Training throughput |
-| 🎯 Policy vs Value Loss | Individual loss components |
-| 🔬 MCTS Sims/s | Search efficiency |
-| 📊 Win/Draw/Loss | Game outcome distribution |
-| 💾 Buffer Size | Replay buffer growth |
-| ⏱️ Time Breakdown | Self-play vs training time |
-| 📈 Cumulative Progress | Total games and moves |
+| Evaluation | Description | Time |
+|------------|-------------|------|
+| vs Random | 5 games against random opponent | ~30-60 sec |
+| Endgame Puzzles | 5 tactical positions | ~10 sec |
 
-### Dashboard Options
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--visual` | False | Enable the dashboard |
-| `--dashboard-dir` | training_dashboard | Output directory |
-| `--dashboard-interval` | 1 | Update every N iterations |
-
-### Example Output
-
-```
-Initializing visual dashboard...
-  Dashboard enabled: training_dashboard/dashboard.html
-  Open in browser: file:///path/to/training_dashboard/dashboard.html
-
-Starting training...
-```
+Results are saved to `evaluation_results.json` and displayed in `summary.html`.
 
 ### Generated Files
 
-After training, you'll find:
+After training, you'll find in the run directory:
 
 ```
-training_dashboard/
-├── dashboard.html    # Interactive charts (auto-refreshes)
-├── summary.html      # Final training summary
-└── metrics.json      # Raw data for external analysis
+checkpoints/f192-b15_YYYY-MM-DD_HH-MM-SS/
+├── model_iter_001.pt         # Checkpoint at iteration 1
+├── model_iter_005.pt         # Checkpoint at iteration 5
+├── model_final.pt            # Final checkpoint (same as last iteration)
+├── training_metrics.json     # Per-iteration metrics (loss, games, etc.)
+├── evaluation_results.json   # Evaluation metrics per checkpoint
+├── summary.html              # Visual summary with charts
+└── replay_buffer.rpbf        # Only if --buffer-persistence
 ```
 
-### Requirements
-
-The dashboard requires **plotly**:
-
-```bash
-pip install plotly
-# or with uv:
-uv pip install plotly
-```
-
-If plotly is not installed, training continues without the dashboard.
-
-### Viewing the Dashboard
-
-1. **During training**: Open `dashboard.html` in your browser - it auto-refreshes every 30 seconds
-2. **After training**: Open `summary.html` for a final report with key statistics
+### Viewing the Summary
 
 ```bash
 # On Windows
-start training_dashboard/dashboard.html
+start checkpoints/f192-b15_YYYY-MM-DD_HH-MM-SS/summary.html
 
 # On macOS
-open training_dashboard/dashboard.html
+open checkpoints/f192-b15_YYYY-MM-DD_HH-MM-SS/summary.html
 
 # On Linux
-xdg-open training_dashboard/dashboard.html
+xdg-open checkpoints/f192-b15_YYYY-MM-DD_HH-MM-SS/summary.html
 ```
 
 ---
@@ -831,25 +832,27 @@ xdg-open training_dashboard/dashboard.html
 
 **Location**: `alphazero/scripts/evaluate.py`
 
+**Note:** Basic evaluation (vs_random + endgame puzzles) now runs automatically before each checkpoint save. Results are stored in `evaluation_results.json` in the run directory.
+
 ### Quick Evaluation Examples
 
 ```bash
 # Against random player
 uv run python alphazero/scripts/evaluate.py \
-    --checkpoint checkpoints/cpp_iter_50.pt \
+    --checkpoint checkpoints/f192-b15_2024-02-03_14-30-00/model_final.pt \
     --opponent random \
     --games 50 \
     --simulations 200
 
 # Against endgame positions
 uv run python alphazero/scripts/evaluate.py \
-    --checkpoint checkpoints/cpp_iter_50.pt \
+    --checkpoint checkpoints/f192-b15_2024-02-03_14-30-00/model_final.pt \
     --opponent endgame \
     --simulations 400
 
 # Against Stockfish (if installed)
 uv run python alphazero/scripts/evaluate.py \
-    --checkpoint checkpoints/cpp_iter_50.pt \
+    --checkpoint checkpoints/f192-b15_2024-02-03_14-30-00/model_final.pt \
     --opponent stockfish \
     --stockfish-path /path/to/stockfish \
     --stockfish-elo 1500 \
@@ -872,9 +875,9 @@ uv run python alphazero/scripts/evaluate.py \
 Play against your trained model:
 
 ```bash
-# Using C++ checkpoint
+# Using a trained checkpoint
 uv run python web/run.py \
-    --checkpoint checkpoints/cpp_iter_50.pt \
+    --checkpoint checkpoints/f192-b15_2024-02-03_14-30-00/model_final.pt \
     --simulations 400 \
     --port 5000
 ```
@@ -925,6 +928,34 @@ Reduce these parameters:
 1. Enable parallel self-play: `--workers 16 --eval-batch 512`
 2. Increase `--search-batch` (e.g., 128 instead of 64)
 3. Increase `--train-batch` during training phase
+
+### High MCTS Timeout Evals (Stale Results & Root Retries)
+
+When workers wait for GPU results and time out (`worker_timeout_ms` exceeded), two problems arise:
+
+1. **Root eval timeout**: The root position gets no NN evaluation → MCTS has zero visits → uniform random move (bad training data).
+2. **Stale result corruption**: A timed-out request may still be processing on the GPU. When it eventually completes, the result arrives in the worker's queue. On the *next* evaluation, this stale result gets consumed as if it were for the new position — silently corrupting the search tree with a policy/value computed for the wrong board state.
+
+**Built-in protections (v2.1):**
+
+- **Root eval retry loop** (`--root-eval-retries 3`): If root evaluation times out, the worker flushes stale results and retries up to 3 more times. This reduces root failure probability from P to P⁴ (e.g., 1% → 0.000001%).
+- **Generation-based stale filtering**: Each worker has a monotonic generation counter. On flush, the generation increments. All new requests carry the current generation. `get_results()` silently discards any result with a stale (older) generation, closing the race window between flush and result arrival.
+
+**Diagnosing issues via the live dashboard:**
+
+| Metric | Meaning |
+|--------|---------|
+| `root_retries` | Times root eval was retried after timeout. If high but `mcts_failures` is low, the retry mechanism is working. |
+| `stale_results_flushed` | Stale results discarded. Non-zero means timeouts occurred but corruption was prevented. |
+| `mcts_failures` (Timeout Evals) | Moves where MCTS returned zero visits (all retries exhausted). Should be near zero. |
+
+**If `mcts_failures` is high:**
+
+1. Increase `--worker-timeout-ms` (e.g., 4000 instead of 2000) — gives more time for GPU
+2. Increase `--root-eval-retries` (e.g., 5 instead of 3) — more retry attempts
+3. Reduce `--workers` — less GPU contention
+4. Increase `--queue-capacity` (e.g., 16384) — prevents observation pool exhaustion
+5. Reduce `--eval-batch` — smaller batches complete faster
 
 ### Model Not Improving
 
@@ -980,8 +1011,17 @@ train.py --iterations 50 --games-per-iter 50 --simulations 800 --filters 128 --b
 # Production (24-48 hours)
 train.py --iterations 100 --games-per-iter 100 --workers 16 --filters 192 --blocks 15
 
+# Resume from run directory
+train.py --resume checkpoints/f192-b15_2024-02-03_14-30-00 --iterations 100
+
+# With buffer persistence
+train.py --iterations 50 --buffer-persistence
+
+# Disable evaluation and visualization (faster checkpointing)
+train.py --iterations 50 --no-eval --no-visualization
+
 # Evaluate
-evaluate.py --checkpoint model.pt --opponent random --games 50
+evaluate.py --checkpoint checkpoints/f192-b15_.../model_final.pt --opponent random --games 50
 ```
 
 ### Parameter Quick Reference
@@ -991,6 +1031,24 @@ evaluate.py --checkpoint model.pt --opponent random --games 50
 | MCTS Search | `--search-batch` | 64 | Leaves per MCTS GPU call |
 | Parallel Eval | `--eval-batch` | 512 | Max leaves across all games |
 | Training | `--train-batch` | 256 | Samples per gradient step |
+
+### New in v2.1
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| Root eval retry | 3 retries | Auto-retry root NN eval on timeout (`--root-eval-retries`) |
+| Stale result filtering | Enabled | Generation-based filtering prevents corrupted evaluations |
+| Queue capacity tuning | 8192 | Configurable from Python (`--queue-capacity`) |
+| Dashboard: root retries | Shown | Pipeline health shows root retry and stale flush counts |
+
+### New in v2.0
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| Organized output | Enabled | Run directory: `f{filters}-b{blocks}_{timestamp}/` |
+| summary.html | Enabled | Visual training summary (disable: `--no-visualization`) |
+| Evaluation | Enabled | vs_random + endgame puzzles (disable: `--no-eval`) |
+| Buffer persistence | Disabled | Fresh buffer each run (enable: `--buffer-persistence`) |
 
 ---
 

@@ -133,14 +133,8 @@ class ChessWebInterface:
         print("Using C++ encoding (122 channels)")
         self.evaluator = CppEncodingEvaluator(self.network, device, use_amp=True)
 
-        # MCTS config (used for C++ MCTS)
-        self.mcts_config = MCTSConfig(
-            num_simulations=num_simulations,
-            c_puct=1.25,
-            dirichlet_alpha=0.0,  # No exploration noise
-            dirichlet_epsilon=0.0,
-            temperature=0.0  # Greedy selection
-        )
+        # MCTS parameters (configurable at runtime via /api/update_settings)
+        self.c_puct = 1.25
 
         # Game state storage (in-memory, keyed by session ID)
         self.games: Dict[str, GameState] = {}
@@ -226,8 +220,27 @@ class ChessWebInterface:
             """Serve main page."""
             return render_template('chess.html',
                                  num_simulations=self.num_simulations,
+                                 c_puct=self.c_puct,
                                  num_filters=self.num_filters,
                                  num_blocks=self.num_blocks)
+
+        @self.app.route('/api/update_settings', methods=['POST'])
+        def update_settings():
+            """Update MCTS settings at runtime."""
+            data = request.json
+            if 'num_simulations' in data:
+                val = int(data['num_simulations'])
+                if 1 <= val <= 100000:
+                    self.num_simulations = val
+            if 'c_puct' in data:
+                val = float(data['c_puct'])
+                if 0.01 <= val <= 100.0:
+                    self.c_puct = val
+            return jsonify({
+                'success': True,
+                'num_simulations': self.num_simulations,
+                'c_puct': self.c_puct
+            })
 
         @self.app.route('/api/new_game', methods=['POST'])
         def new_game():
@@ -402,7 +415,7 @@ class ChessWebInterface:
         mcts = alphazero_cpp.BatchedMCTSSearch(
             num_simulations=self.num_simulations,
             batch_size=64,
-            c_puct=1.25
+            c_puct=self.c_puct
         )
         mcts.init_search(fen, root_policy, root_value_float)
 
@@ -441,7 +454,11 @@ class ChessWebInterface:
         else:
             policy = legal_mask / legal_mask.sum()
 
-        return policy, root_value_float
+        # Use MCTS-backed root Q-value (averaged over all simulations)
+        # instead of raw NN value which doesn't reflect search results
+        mcts_value = mcts.get_root_value()
+
+        return policy, float(mcts_value)
 
     def _get_top_moves_from_policy(self, game: GameState, policy: np.ndarray, top_k: int = 5) -> list:
         """Get top K moves from policy probabilities.

@@ -17,4 +17,7 @@ wheels/
 logs/
 
 # replay buffers
-replay_buffer/
+*.rpbf
+
+# checkpoints
+checkpoints/

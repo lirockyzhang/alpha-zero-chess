@@ -328,7 +328,6 @@
 
         <div class="model-info">
             <span>🧠 Model: {{ num_filters }} filters, {{ num_blocks }} blocks</span>
-            <span>🔍 MCTS: {{ num_simulations }} simulations</span>
         </div>
 
         <div class="game-container">
@@ -350,6 +349,23 @@
                     </div>
                     <button class="btn-primary" onclick="newGame()">🎮 New Game</button>
                     <button class="btn-secondary" onclick="resetBoard()">🔄 Reset Board</button>
+                </div>
+
+                <div class="control-group">
+                    <h3>MCTS Settings</h3>
+                    <div style="margin-bottom: 10px;">
+                        <label for="sim-input" style="font-weight: 500; color: #34495e; display: block; margin-bottom: 4px;">Simulations</label>
+                        <input type="number" id="sim-input" value="{{ num_simulations }}" min="1" max="100000" step="100"
+                               style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 6px; font-size: 1em;"
+                               onchange="updateSettings()">
+                    </div>
+                    <div>
+                        <label for="cpuct-input" style="font-weight: 500; color: #34495e; display: block; margin-bottom: 4px;">C_PUCT (exploration)</label>
+                        <input type="number" id="cpuct-input" value="{{ c_puct }}" min="0.01" max="100" step="0.25"
+                               style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 6px; font-size: 1em;"
+                               onchange="updateSettings()">
+                    </div>
+                    <div id="settings-status" style="margin-top: 8px; font-size: 0.85em; color: #7f8c8d;"></div>
                 </div>
 
                 <div class="control-group">
@@ -691,6 +707,36 @@
             .catch(error => {
                 updateStatus('Error: ' + error.message, 'error');
                 console.error('Error:', error);
+            });
+        }
+
+        function updateSettings() {
+            const simulations = parseInt(document.getElementById('sim-input').value);
+            const cpuct = parseFloat(document.getElementById('cpuct-input').value);
+            const statusEl = document.getElementById('settings-status');
+
+            fetch('/api/update_settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    num_simulations: simulations,
+                    c_puct: cpuct
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    statusEl.textContent = `Updated: ${data.num_simulations} sims, c_puct=${data.c_puct}`;
+                    statusEl.style.color = '#27ae60';
+                } else {
+                    statusEl.textContent = 'Failed to update settings';
+                    statusEl.style.color = '#e74c3c';
+                }
+                setTimeout(() => { statusEl.textContent = ''; }, 3000);
+            })
+            .catch(error => {
+                statusEl.textContent = 'Error: ' + error.message;
+                statusEl.style.color = '#e74c3c';
             });
         }
 

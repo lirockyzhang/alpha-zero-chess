@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <tuple>
 
 namespace selfplay {
 
@@ -21,23 +22,8 @@ constexpr size_t MAX_WORKERS = 32;             // Maximum concurrent workers
 constexpr size_t DEFAULT_MAX_BATCH = 512;      // Default max batch size
 constexpr size_t DEFAULT_QUEUE_CAPACITY = 8192; // Request queue capacity (increased from 4096 to prevent exhaustion)
 
-// ============================================================================
-// Evaluation Request (Fixed-Size, Cache-Aligned)
-// ============================================================================
-
-// Single evaluation request - uses fixed-size arrays to avoid heap allocation
-// Aligned to cache line to prevent false sharing
-struct alignas(64) EvalRequest {
-    int32_t worker_id;
-    int32_t request_id;
-
-    // Fixed-size observation buffer (NHWC format: 8x8x122)
-    // Using separate allocation to avoid bloating this struct
-    float* observation;   // Points to pool memory
-    float* legal_mask;    // Points to pool memory
-
-    EvalRequest() : worker_id(-1), request_id(-1), observation(nullptr), legal_mask(nullptr) {}
-};
+// EvalRequest has been replaced by StagedRequest (see below)
+// Workers now write directly into pre-allocated staging buffers
 
 // ============================================================================
 // Evaluation Result
@@ -46,82 +32,28 @@ struct alignas(64) EvalRequest {
 struct EvalResult {
     int32_t worker_id;
     int32_t request_id;
-    std::vector<float> policy;  // 4672 floats
+    uint32_t generation;      // Propagated from request (for stale result filtering)
+    int32_t batch_index;      // Index into batch_policy_buffers_[buffer_id] (zero-copy reference)
+    int8_t buffer_id;         // Which of the 2 double-buffers this result references
     float value;
 
-    EvalResult() : worker_id(-1), request_id(-1), policy(POLICY_SIZE), value(0.0f) {}
+    EvalResult() : worker_id(-1), request_id(-1), generation(0),
+                   batch_index(-1), buffer_id(0), value(0.0f) {}
 };
 
 // ============================================================================
-// Memory Pool for Observations (Pre-allocated, Aligned)
+// Staged Request (replaces ObservationPool + EvalRequest indirection)
 // ============================================================================
 
-class ObservationPool {
-public:
-    explicit ObservationPool(size_t capacity = DEFAULT_QUEUE_CAPACITY)
-        : capacity_(capacity)
-        , allocated_(0)
-    {
-        // Allocate aligned memory for observations and masks
-        size_t obs_bytes = capacity * OBS_SIZE * sizeof(float);
-        size_t mask_bytes = capacity * POLICY_SIZE * sizeof(float);
+struct StagedRequest {
+    int32_t worker_id;
+    int32_t request_id;
+    uint32_t generation;
+    int32_t staging_slot;    // Index into staging buffers
 
-        // Use aligned allocation (64-byte for cache line)
-        #ifdef _WIN32
-        obs_buffer_ = static_cast<float*>(_aligned_malloc(obs_bytes, 64));
-        mask_buffer_ = static_cast<float*>(_aligned_malloc(mask_bytes, 64));
-        #else
-        obs_buffer_ = static_cast<float*>(std::aligned_alloc(64, obs_bytes));
-        mask_buffer_ = static_cast<float*>(std::aligned_alloc(64, mask_bytes));
-        #endif
-
-        if (!obs_buffer_ || !mask_buffer_) {
-            throw std::bad_alloc();
-        }
-    }
-
-    ~ObservationPool() {
-        #ifdef _WIN32
-        _aligned_free(obs_buffer_);
-        _aligned_free(mask_buffer_);
-        #else
-        std::free(obs_buffer_);
-        std::free(mask_buffer_);
-        #endif
-    }
-
-    // Get pointers for slot index
-    float* get_obs_ptr(size_t index) {
-        return obs_buffer_ + index * OBS_SIZE;
-    }
-
-    float* get_mask_ptr(size_t index) {
-        return mask_buffer_ + index * POLICY_SIZE;
-    }
-
-    // Allocate next slot (returns slot index, or -1 if full)
-    int allocate() {
-        size_t idx = allocated_.fetch_add(1, std::memory_order_relaxed);
-        if (idx >= capacity_) {
-            allocated_.fetch_sub(1, std::memory_order_relaxed);
-            return -1;
-        }
-        return static_cast<int>(idx);
-    }
-
-    // Reset allocation counter (call when queue is cleared)
-    void reset() {
-        allocated_.store(0, std::memory_order_relaxed);
-    }
-
-    size_t capacity() const { return capacity_; }
-    size_t allocated() const { return allocated_.load(std::memory_order_relaxed); }
-
-private:
-    float* obs_buffer_;
-    float* mask_buffer_;
-    size_t capacity_;
-    std::atomic<size_t> allocated_;
+    StagedRequest() : worker_id(-1), request_id(-1), generation(0), staging_slot(-1) {}
+    StagedRequest(int32_t wid, int32_t rid, uint32_t gen, int32_t slot)
+        : worker_id(wid), request_id(rid), generation(gen), staging_slot(slot) {}
 };
 
 // ============================================================================
@@ -206,6 +138,11 @@ public:
         std::vector<int32_t>& out_request_ids  // Filled with assigned request IDs
     );
 
+    // Flush all pending results for this worker and increment generation.
+    // Makes all in-flight results stale so they'll be discarded on arrival.
+    // Returns number of stale results flushed (for diagnostics).
+    int flush_worker_results(int worker_id);
+
     // Wait for and retrieve results for this worker
     // Blocks until at least min_results are available or timeout
     // Returns: number of results retrieved
@@ -215,6 +152,15 @@ public:
         float* out_values,              // max_results
         int max_results,
         int timeout_ms = 100
+    );
+
+    // Non-blocking result retrieval: returns immediately with whatever results are available
+    // Returns: number of results retrieved (0 if none ready)
+    int try_get_results(
+        int worker_id,
+        float* out_policies,            // max_results x POLICY_SIZE
+        float* out_values,              // max_results
+        int max_results
     );
 
     // =========================================================================
@@ -265,13 +211,13 @@ public:
 
     // Get raw pointers to batch buffers (for torch.from_blob)
     uintptr_t get_batch_obs_ptr() const {
-        return reinterpret_cast<uintptr_t>(batch_obs_buffer_);
+        return reinterpret_cast<uintptr_t>(batch_obs_nchw_buffer_);
     }
     uintptr_t get_batch_mask_ptr() const {
         return reinterpret_cast<uintptr_t>(batch_mask_buffer_);
     }
     uintptr_t get_batch_policy_ptr() const {
-        return reinterpret_cast<uintptr_t>(batch_policy_buffer_);
+        return reinterpret_cast<uintptr_t>(batch_policy_buffers_[current_policy_buffer_]);
     }
     uintptr_t get_batch_value_ptr() const {
         return reinterpret_cast<uintptr_t>(batch_value_buffer_);
@@ -286,22 +232,27 @@ private:
     size_t max_batch_size_;
     size_t queue_capacity_;
 
-    // Memory pool for incoming requests
-    ObservationPool obs_pool_;
+    // Pre-allocated staging buffers: workers write directly into these slots
+    // via atomic staging_write_head_ (no lock needed for data write)
+    float* staging_obs_buffer_;    // queue_capacity × OBS_SIZE
+    float* staging_mask_buffer_;   // queue_capacity × POLICY_SIZE
+    std::atomic<int32_t> staging_write_head_{0};
 
-    // Request queue
-    std::vector<EvalRequest> pending_requests_;
+    // Request metadata queue (lightweight — only metadata, no observation data)
+    std::vector<StagedRequest> staged_requests_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
 
     // Batch buffers (aligned/pinned for GPU)
-    float* batch_obs_buffer_;      // max_batch_size x OBS_SIZE
+    float* batch_obs_buffer_;      // max_batch_size x OBS_SIZE (NHWC staging)
+    float* batch_obs_nchw_buffer_; // max_batch_size x OBS_SIZE (NCHW for GPU)
     float* batch_mask_buffer_;     // max_batch_size x POLICY_SIZE
-    float* batch_policy_buffer_;   // max_batch_size x POLICY_SIZE
+    float* batch_policy_buffers_[2]; // Double-buffered: GPU writes [current], workers read [previous]
     float* batch_value_buffer_;    // max_batch_size
+    int current_policy_buffer_{0}; // Which buffer GPU writes to next (only GPU thread writes; ordering via worker_cvs_ notify/wait)
 
-    // Mapping for current batch (worker_id, request_id) pairs
-    std::vector<std::pair<int32_t, int32_t>> batch_mapping_;
+    // Mapping for current batch (worker_id, request_id, generation) tuples
+    std::vector<std::tuple<int32_t, int32_t, uint32_t>> batch_mapping_;
 
     // Per-worker result queues
     std::array<std::vector<EvalResult>, MAX_WORKERS> worker_results_;
@@ -310,6 +261,9 @@ private:
 
     // Request ID generator (per worker to avoid contention)
     std::array<std::atomic<int32_t>, MAX_WORKERS> worker_request_ids_;
+
+    // Per-worker generation counters (incremented on flush to invalidate stale results)
+    std::array<std::atomic<uint32_t>, MAX_WORKERS> worker_generation_{};
 
     // Lifecycle
     std::atomic<bool> shutdown_{false};

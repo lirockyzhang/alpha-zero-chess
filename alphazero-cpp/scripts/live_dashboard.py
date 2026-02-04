@@ -157,98 +157,104 @@ DASHBOARD_HTML = """
             width: 100%;
             height: 250px;
         }
-        .metrics-grid {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 10px;
-        }
-        .metric {
-            background: rgba(255,255,255,0.05);
-            padding: 15px;
-            border-radius: 10px;
-            text-align: center;
-        }
-        .metric-value {
-            font-size: 1.8em;
-            font-weight: bold;
-            color: #3498db;
-        }
-        .metric-label {
-            font-size: 0.8em;
-            opacity: 0.7;
-            margin-top: 5px;
-        }
         .footer {
             text-align: center;
             padding: 20px;
             opacity: 0.5;
             font-size: 0.9em;
         }
-        .live-progress {
+        .system-monitoring {
             background: rgba(0,0,0,0.3);
             padding: 15px 20px;
             margin: 0;
         }
-        .progress-header {
+        .monitoring-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 10px;
+            margin-bottom: 15px;
         }
-        .progress-phase {
+        .monitoring-phase {
             font-size: 1.1em;
             font-weight: bold;
             color: #a8d8ea;
         }
-        .progress-phase .phase-icon {
+        .monitoring-phase .phase-icon {
             margin-right: 8px;
         }
-        .progress-eta {
+        .monitoring-eta {
             font-size: 0.9em;
             color: #95a5a6;
         }
-        .progress-bar-container {
-            background: rgba(255,255,255,0.1);
-            border-radius: 10px;
-            height: 24px;
-            overflow: hidden;
-            margin-bottom: 10px;
-        }
-        .progress-bar {
-            height: 100%;
-            background: linear-gradient(90deg, #3498db, #2ecc71);
-            border-radius: 10px;
-            transition: width 0.3s ease;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 0.8em;
-            font-weight: bold;
-            color: white;
-            text-shadow: 0 1px 2px rgba(0,0,0,0.3);
-        }
-        .live-stats {
-            display: flex;
-            justify-content: space-around;
-            flex-wrap: wrap;
+        .monitoring-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 15px;
+            margin-bottom: 15px;
         }
-        .live-stat {
-            text-align: center;
-            min-width: 100px;
+        .monitoring-card {
+            background: rgba(255,255,255,0.05);
+            border-radius: 10px;
+            padding: 12px;
         }
-        .live-stat-value {
-            font-size: 1.3em;
+        .monitoring-card h4 {
+            font-size: 0.9em;
+            color: #a8d8ea;
+            margin: 0 0 10px 0;
+            padding-bottom: 5px;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        .metric-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.85em;
+            padding: 3px 0;
+        }
+        .metric-row span:first-child {
+            color: #95a5a6;
+        }
+        .metric-row span:last-child {
             font-weight: bold;
             color: #3498db;
         }
-        .live-stat-label {
-            font-size: 0.75em;
-            opacity: 0.7;
+        .bottleneck-indicator {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 10px;
+            padding: 10px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+            font-size: 0.95em;
         }
-        .live-stat-value.highlight {
+        .bottleneck-value {
+            font-weight: bold;
+            padding: 4px 12px;
+            border-radius: 4px;
+            background: rgba(255,255,255,0.1);
+        }
+        .bottleneck-value.cpu-bound {
+            color: #e74c3c;
+            background: rgba(231, 76, 60, 0.2);
+        }
+        .bottleneck-value.gpu-bound {
+            color: #3498db;
+            background: rgba(52, 152, 219, 0.2);
+        }
+        .bottleneck-value.balanced {
+            color: #2ecc71;
+            background: rgba(46, 204, 113, 0.2);
+        }
+        .metric-row span.highlight {
             color: #2ecc71;
             animation: pulse 1s ease-in-out;
+        }
+        .metric-row span.warn {
+            color: #e67e22;
+            font-weight: bold;
+        }
+        .metric-row span.ok {
+            color: #2ecc71;
         }
         @keyframes pulse {
             0%, 100% { transform: scale(1); }
@@ -272,46 +278,8 @@ DASHBOARD_HTML = """
     </style>
 </head>
 <body>
-    <!-- Live Progress Bar -->
-    <div class="live-progress" id="live-progress">
-        <div class="progress-header">
-            <div class="progress-phase">
-                <span class="phase-icon" id="phase-icon">🎮</span>
-                <span id="phase-text">Waiting to start...</span>
-            </div>
-            <div class="progress-eta">
-                ETA: <span id="phase-eta">--</span>
-            </div>
-        </div>
-        <div class="progress-bar-container">
-            <div class="progress-bar" id="progress-bar" style="width: 0%">0%</div>
-        </div>
-        <div class="live-stats">
-            <div class="live-stat">
-                <div class="live-stat-value" id="live-games">0/0</div>
-                <div class="live-stat-label">Games</div>
-            </div>
-            <div class="live-stat">
-                <div class="live-stat-value" id="live-moves">0</div>
-                <div class="live-stat-label">Moves/sec</div>
-            </div>
-            <div class="live-stat">
-                <div class="live-stat-value" id="live-sims">0</div>
-                <div class="live-stat-label">Sims/sec</div>
-            </div>
-            <div class="live-stat">
-                <div class="live-stat-value" id="live-evals">0</div>
-                <div class="live-stat-label">NN/sec</div>
-            </div>
-            <div class="live-stat">
-                <div class="live-stat-value" id="live-gph">0</div>
-                <div class="live-stat-label">Games/hr</div>
-            </div>
-        </div>
-    </div>
-
     <div class="header">
-        <h1>🧠 AlphaZero Live Training Dashboard</h1>
+        <h1>AlphaZero Live Training Dashboard</h1>
         <div class="stats">
             <div class="stat">
                 <div class="stat-value" id="elapsed">00:00:00</div>
@@ -333,15 +301,72 @@ DASHBOARD_HTML = """
                 <div class="stat-value" id="buffer-size">0</div>
                 <div class="stat-label">Buffer Size</div>
             </div>
+            <div class="stat">
+                <div class="stat-value" id="current-loss">-</div>
+                <div class="stat-label">Loss</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value" id="avg-iter-time">-</div>
+                <div class="stat-label">Avg Iter Time</div>
+            </div>
         </div>
         <div class="status disconnected" id="status">Connecting...</div>
     </div>
 
+    <!-- System Monitoring Section -->
+    <div class="system-monitoring" id="system-monitoring">
+        <div class="monitoring-header">
+            <div class="monitoring-phase">
+                <span class="phase-icon" id="phase-icon">🎮</span>
+                <span id="phase-text">Waiting to start...</span>
+            </div>
+            <div class="monitoring-eta">
+                ETA: <span id="phase-eta">--</span>
+            </div>
+        </div>
+        <div class="monitoring-grid">
+            <!-- MCTS Performance Card -->
+            <div class="monitoring-card">
+                <h4>🔄 MCTS Performance</h4>
+                <div class="metric-row"><span>Sims/sec:</span><span id="sys-sims-sec">0</span></div>
+                <div class="metric-row"><span>Moves/sec:</span><span id="sys-moves-sec">0</span></div>
+                <div class="metric-row"><span>Drop Rate:</span><span id="pool-load">0%</span></div>
+                <div class="metric-row"><span>Root Retries:</span><span id="root-retries" class="ok">0</span></div>
+                <div class="metric-row"><span>Stale Flushed:</span><span id="stale-flushed" class="ok">0</span></div>
+                <div class="metric-row"><span>Pipeline:</span><span id="pipeline-status">✅ Healthy</span></div>
+            </div>
+
+            <!-- GPU Performance Card -->
+            <div class="monitoring-card">
+                <h4>🎮 GPU Performance</h4>
+                <div class="metric-row"><span>Avg Batch Size:</span><span id="avg-batch-size">0</span></div>
+                <div class="metric-row"><span>NN Evals/sec:</span><span id="sys-evals-sec">0</span></div>
+                <div class="metric-row"><span>Batch Fill:</span><span id="batch-fill-ratio">0%</span></div>
+                <div class="metric-row"><span>Timeout Evals:</span><span id="timeout-evals">0</span></div>
+            </div>
+
+            <!-- Iteration Progress Card -->
+            <div class="monitoring-card">
+                <h4>📊 Iteration Progress</h4>
+                <div class="metric-row"><span>Games:</span><span id="live-games">0/0</span></div>
+                <div class="metric-row"><span>W/D/L:</span><span id="live-wdl">0 / 0 / 0</span></div>
+                <div class="metric-row"><span>Moves:</span><span id="live-moves">0</span></div>
+                <div class="metric-row"><span>Games/min:</span><span id="live-gph">0</span></div>
+            </div>
+        </div>
+
+        <!-- Bottleneck Indicator -->
+        <div class="bottleneck-indicator">
+            <span>System Status:</span>
+            <span id="bottleneck-type" class="bottleneck-value">--</span>
+        </div>
+    </div>
+
     <div class="grid">
-        <!-- Loss Chart -->
+        <!-- Policy & Value Loss -->
         <div class="card">
-            <h3>📉 Training Loss</h3>
-            <div id="loss-chart" class="chart"></div>
+            <h3>📈 Policy vs Value Loss</h3>
+            <div id="pv-loss-chart" class="chart"></div>
         </div>
 
         <!-- Performance Chart -->
@@ -350,10 +375,10 @@ DASHBOARD_HTML = """
             <div id="perf-chart" class="chart"></div>
         </div>
 
-        <!-- Policy vs Value Loss -->
+        <!-- Win/Draw/Loss -->
         <div class="card">
-            <h3>🎯 Policy vs Value Loss</h3>
-            <div id="pv-loss-chart" class="chart"></div>
+            <h3>🎯 Game Results</h3>
+            <div id="wdl-chart" class="chart"></div>
         </div>
 
         <!-- MCTS Simulations -->
@@ -362,55 +387,24 @@ DASHBOARD_HTML = """
             <div id="sims-chart" class="chart"></div>
         </div>
 
-        <!-- Win/Draw/Loss -->
-        <div class="card">
-            <h3>📊 Game Results (Last 10 Iterations)</h3>
-            <div id="wdl-chart" class="chart"></div>
-        </div>
-
         <!-- Time Breakdown -->
         <div class="card">
-            <h3>⏱️ Time Breakdown (Last 10 Iterations)</h3>
+            <h3>⏱️ Time Breakdown</h3>
             <div id="time-chart" class="chart"></div>
         </div>
 
-        <!-- Current Metrics -->
+        <!-- Model Evaluation -->
         <div class="card">
-            <h3>📈 Current Iteration Metrics</h3>
-            <div class="metrics-grid">
-                <div class="metric">
-                    <div class="metric-value" id="current-loss">-</div>
-                    <div class="metric-label">Loss</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value" id="current-moves">-</div>
-                    <div class="metric-label">Moves/sec</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value" id="current-sims">-</div>
-                    <div class="metric-label">Sims/sec</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value" id="current-games">-</div>
-                    <div class="metric-label">Games/hour</div>
-                </div>
-            </div>
+            <h3>🧪 Model Evaluation</h3>
+            <div id="eval-chart" class="chart"></div>
         </div>
 
-        <!-- ETA -->
+        <!-- Average Game Length -->
         <div class="card">
-            <h3>🕐 Estimated Time</h3>
-            <div class="metrics-grid">
-                <div class="metric">
-                    <div class="metric-value" id="eta">-</div>
-                    <div class="metric-label">Time Remaining</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value" id="avg-iter-time">-</div>
-                    <div class="metric-label">Avg Iteration Time</div>
-                </div>
-            </div>
+            <h3>📊 Average Game Length</h3>
+            <div id="game-length-chart" class="chart"></div>
         </div>
+
     </div>
 
     <div class="footer">
@@ -421,7 +415,6 @@ DASHBOARD_HTML = """
         // Data storage
         const data = {
             iterations: [],
-            totalLoss: [],
             policyLoss: [],
             valueLoss: [],
             movesPerSec: [],
@@ -431,6 +424,9 @@ DASHBOARD_HTML = """
             draws: [],
             selfplayTime: [],
             trainTime: [],
+            avgGameLength: [],
+            evalWinRate: [],
+            evalEndgameScore: [],
         };
 
         let totalGames = 0;
@@ -472,13 +468,6 @@ DASHBOARD_HTML = """
 
         // Initialize charts
         function initCharts() {
-            // Loss chart
-            Plotly.newPlot('loss-chart', [{
-                x: [], y: [], type: 'scatter', mode: 'lines+markers',
-                name: 'Total Loss', line: { color: colors.primary, width: 2 },
-                marker: { size: 4 }
-            }], {...layoutDefaults, yaxis: {...layoutDefaults.yaxis, title: 'Loss'}});
-
             // Performance chart
             Plotly.newPlot('perf-chart', [{
                 x: [], y: [], type: 'scatter', mode: 'lines+markers',
@@ -487,13 +476,24 @@ DASHBOARD_HTML = """
                 marker: { size: 4 }
             }], {...layoutDefaults, yaxis: {...layoutDefaults.yaxis, title: 'Moves/sec'}});
 
-            // Policy vs Value Loss
+            // Policy vs Value Loss (Dual Y-Axis)
             Plotly.newPlot('pv-loss-chart', [
                 { x: [], y: [], type: 'scatter', mode: 'lines+markers',
-                  name: 'Policy Loss', line: { color: colors.primary, width: 2 }, marker: { size: 4 } },
+                  name: 'Policy Loss', line: { color: colors.primary, width: 2 }, marker: { size: 4 },
+                  yaxis: 'y' },
                 { x: [], y: [], type: 'scatter', mode: 'lines+markers',
-                  name: 'Value Loss', line: { color: colors.tertiary, width: 2 }, marker: { size: 4 } }
-            ], {...layoutDefaults, yaxis: {...layoutDefaults.yaxis, title: 'Loss'}});
+                  name: 'Value Loss', line: { color: colors.tertiary, width: 2 }, marker: { size: 4 },
+                  yaxis: 'y2' }
+            ], {
+                ...layoutDefaults,
+                yaxis: { ...layoutDefaults.yaxis, title: 'Policy Loss', side: 'left' },
+                yaxis2: {
+                    title: 'Value Loss',
+                    overlaying: 'y',
+                    side: 'right',
+                    gridcolor: 'rgba(255,255,255,0.05)'
+                }
+            });
 
             // Simulations chart
             Plotly.newPlot('sims-chart', [{
@@ -515,6 +515,37 @@ DASHBOARD_HTML = """
                 { x: [], y: [], type: 'bar', name: 'Self-Play', marker: { color: colors.primary } },
                 { x: [], y: [], type: 'bar', name: 'Training', marker: { color: colors.tertiary } }
             ], {...layoutDefaults, barmode: 'stack', yaxis: {...layoutDefaults.yaxis, title: 'Seconds'}});
+
+            // Average game length chart
+            Plotly.newPlot('game-length-chart', [{
+                x: [], y: [], type: 'scatter', mode: 'lines+markers',
+                name: 'Avg Moves/Game', line: { color: colors.secondary, width: 2 },
+                fill: 'tozeroy', fillcolor: 'rgba(46, 204, 113, 0.2)',
+                marker: { size: 4 }
+            }], {...layoutDefaults, yaxis: {...layoutDefaults.yaxis, title: 'Moves per Game'}});
+
+            // Evaluation chart (dual Y-axis: win rate % left, endgame score right)
+            Plotly.newPlot('eval-chart', [
+                { x: [], y: [], type: 'scatter', mode: 'lines+markers',
+                  name: 'vs Random Win Rate (%)', line: { color: colors.primary, width: 2 },
+                  marker: { size: 5 }, yaxis: 'y' },
+                { x: [], y: [], type: 'scatter', mode: 'lines+markers',
+                  name: 'Endgame Score', line: { color: colors.secondary, width: 2 },
+                  marker: { size: 5, symbol: 'diamond' }, yaxis: 'y2' }
+            ], {
+                ...layoutDefaults,
+                yaxis: { ...layoutDefaults.yaxis, title: 'Win Rate (%)', side: 'left',
+                         range: [0, 105] },
+                yaxis2: {
+                    title: 'Endgame Score',
+                    overlaying: 'y',
+                    side: 'right',
+                    range: [0, 5.5],
+                    gridcolor: 'rgba(255,255,255,0.05)',
+                    tickfont: { color: '#ecf0f1' },
+                    titlefont: { color: '#ecf0f1' }
+                }
+            });
         }
 
         // Update charts with new data
@@ -523,7 +554,7 @@ DASHBOARD_HTML = """
 
             // Store data
             data.iterations.push(iter);
-            data.totalLoss.push(metrics.total_loss);
+
             data.policyLoss.push(metrics.policy_loss);
             data.valueLoss.push(metrics.value_loss);
             data.movesPerSec.push(metrics.moves_per_sec);
@@ -533,15 +564,13 @@ DASHBOARD_HTML = """
             data.draws.push(metrics.draws);
             data.selfplayTime.push(metrics.selfplay_time);
             data.trainTime.push(metrics.train_time);
+            data.avgGameLength.push(metrics.avg_game_length);
+            data.evalWinRate.push(metrics.eval_win_rate != null ? metrics.eval_win_rate * 100 : null);
+            data.evalEndgameScore.push(metrics.eval_endgame_score);
 
             // Update cumulative stats
             totalGames += metrics.num_games;
             totalMoves += Math.round(metrics.moves_per_sec * metrics.selfplay_time);
-
-            // Update loss chart
-            Plotly.extendTraces('loss-chart', {
-                x: [[iter]], y: [[metrics.total_loss]]
-            }, [0]);
 
             // Update performance chart
             Plotly.extendTraces('perf-chart', {
@@ -559,19 +588,53 @@ DASHBOARD_HTML = """
                 x: [[iter]], y: [[metrics.sims_per_sec]]
             }, [0]);
 
-            // Update WDL chart (last 10)
-            const last10 = Math.max(0, data.iterations.length - 10);
+            // Update game length chart
+            Plotly.extendTraces('game-length-chart', {
+                x: [[iter]], y: [[metrics.avg_game_length]]
+            }, [0]);
+
+            // Update WDL chart (all iterations)
+            // Use .slice() to create fresh array references so Plotly detects the change
             Plotly.react('wdl-chart', [
-                { x: data.iterations.slice(last10), y: data.whiteWins.slice(last10), type: 'bar', name: 'White', marker: { color: colors.white } },
-                { x: data.iterations.slice(last10), y: data.draws.slice(last10), type: 'bar', name: 'Draw', marker: { color: colors.draw } },
-                { x: data.iterations.slice(last10), y: data.blackWins.slice(last10), type: 'bar', name: 'Black', marker: { color: colors.black } }
+                { x: data.iterations.slice(), y: data.whiteWins.slice(), type: 'bar', name: 'White', marker: { color: colors.white } },
+                { x: data.iterations.slice(), y: data.draws.slice(), type: 'bar', name: 'Draw', marker: { color: colors.draw } },
+                { x: data.iterations.slice(), y: data.blackWins.slice(), type: 'bar', name: 'Black', marker: { color: colors.black } }
             ], {...layoutDefaults, barmode: 'stack', yaxis: {...layoutDefaults.yaxis, title: 'Games'}});
 
-            // Update time chart (last 10)
+            // Update time chart (all iterations)
             Plotly.react('time-chart', [
-                { x: data.iterations.slice(last10), y: data.selfplayTime.slice(last10), type: 'bar', name: 'Self-Play', marker: { color: colors.primary } },
-                { x: data.iterations.slice(last10), y: data.trainTime.slice(last10), type: 'bar', name: 'Training', marker: { color: colors.tertiary } }
+                { x: data.iterations.slice(), y: data.selfplayTime.slice(), type: 'bar', name: 'Self-Play', marker: { color: colors.primary } },
+                { x: data.iterations.slice(), y: data.trainTime.slice(), type: 'bar', name: 'Training', marker: { color: colors.tertiary } }
             ], {...layoutDefaults, barmode: 'stack', yaxis: {...layoutDefaults.yaxis, title: 'Seconds'}});
+
+            // Update evaluation chart (only if eval data exists)
+            if (metrics.eval_win_rate != null) {
+                // Filter out null entries for clean lines
+                const evalIters = data.iterations.filter((_, i) => data.evalWinRate[i] != null);
+                const evalWR = data.evalWinRate.filter(v => v != null);
+                const evalEG = data.evalEndgameScore.filter(v => v != null);
+                Plotly.react('eval-chart', [
+                    { x: evalIters, y: evalWR, type: 'scatter', mode: 'lines+markers',
+                      name: 'vs Random Win Rate (%)', line: { color: colors.primary, width: 2 },
+                      marker: { size: 5 }, yaxis: 'y' },
+                    { x: evalIters, y: evalEG, type: 'scatter', mode: 'lines+markers',
+                      name: 'Endgame Score', line: { color: colors.secondary, width: 2 },
+                      marker: { size: 5, symbol: 'diamond' }, yaxis: 'y2' }
+                ], {
+                    ...layoutDefaults,
+                    yaxis: { ...layoutDefaults.yaxis, title: 'Win Rate (%)', side: 'left',
+                             range: [0, 105] },
+                    yaxis2: {
+                        title: 'Endgame Score',
+                        overlaying: 'y',
+                        side: 'right',
+                        range: [0, 5.5],
+                        gridcolor: 'rgba(255,255,255,0.05)',
+                        tickfont: { color: '#ecf0f1' },
+                        titlefont: { color: '#ecf0f1' }
+                    }
+                });
+            }
 
             // Update header stats
             document.getElementById('iteration').textContent = iter;
@@ -581,18 +644,11 @@ DASHBOARD_HTML = """
 
             // Update current metrics
             document.getElementById('current-loss').textContent = metrics.total_loss ? metrics.total_loss.toFixed(4) : '-';
-            document.getElementById('current-moves').textContent = metrics.moves_per_sec.toFixed(1);
-            document.getElementById('current-sims').textContent = Math.round(metrics.sims_per_sec).toLocaleString();
-            document.getElementById('current-games').textContent = metrics.games_per_hour.toFixed(1);
 
-            // Calculate and update ETA
+            // Calculate and update avg iteration time
             const avgIterTime = data.iterations.length > 0 ?
                 (data.selfplayTime.reduce((a,b) => a+b, 0) + data.trainTime.reduce((a,b) => a+b, 0)) / data.iterations.length : 0;
-            const remainingIters = totalIterations - iter;
-            const etaSeconds = avgIterTime * remainingIters;
-
             document.getElementById('avg-iter-time').textContent = formatTime(avgIterTime);
-            document.getElementById('eta').textContent = formatTime(etaSeconds);
         }
 
         // Format seconds to HH:MM:SS
@@ -652,18 +708,12 @@ DASHBOARD_HTML = """
             socket.on('progress', (data) => {
                 console.log('Progress update:', data);
 
-                // Update progress bar
-                const progressBar = document.getElementById('progress-bar');
-                const progressPercent = data.progress_percent.toFixed(1);
-                progressBar.style.width = progressPercent + '%';
-                progressBar.textContent = progressPercent + '%';
-
                 // Update phase indicator
                 const phaseIcon = document.getElementById('phase-icon');
                 const phaseText = document.getElementById('phase-text');
                 if (data.phase === 'selfplay') {
                     phaseIcon.textContent = '🎮';
-                    phaseText.textContent = `Iteration ${data.iteration} - Self-Play`;
+                    phaseText.textContent = `Iteration ${data.iteration} - Self-Play (${data.games_completed}/${data.total_games} games)`;
                 } else if (data.phase === 'training') {
                     phaseIcon.textContent = '🧠';
                     phaseText.textContent = `Iteration ${data.iteration} - Training`;
@@ -673,29 +723,92 @@ DASHBOARD_HTML = """
                 const phaseEta = document.getElementById('phase-eta');
                 phaseEta.textContent = formatTime(data.phase_eta);
 
-                // Update live stats with animation
-                updateLiveStat('live-games', `${data.games_completed}/${data.total_games}`);
-                updateLiveStat('live-moves', data.moves_per_sec.toFixed(1));
-                updateLiveStat('live-sims', Math.round(data.sims_per_sec).toLocaleString());
-                updateLiveStat('live-evals', Math.round(data.evals_per_sec).toLocaleString());
-                updateLiveStat('live-gph', data.games_per_hour.toFixed(1));
+                // MCTS Performance metrics
+                updateMetricWithHighlight('sys-sims-sec', Math.round(data.sims_per_sec).toLocaleString());
+                updateMetricWithHighlight('sys-moves-sec', data.moves_per_sec.toFixed(1));
+                updateMetricWithHighlight('pool-load', ((data.pool_load || 0) * 100).toFixed(1) + '%');
+
+                // Pipeline health status
+                const pipelineEl = document.getElementById('pipeline-status');
+                const drops = data.submission_drops || 0;
+                const exhaustions = data.pool_exhaustion || 0;
+                const partials = data.partial_subs || 0;
+                const failures = data.timeout_evals || 0;
+                const retries = data.root_retries || 0;
+                const staleFlushed = data.stale_flushed || 0;
+                const totalIssues = drops + exhaustions + failures;
+                if (totalIssues === 0 && retries === 0) {
+                    pipelineEl.textContent = '✅ Healthy';
+                    pipelineEl.style.color = '#2ecc71';
+                } else {
+                    const parts = [];
+                    if (failures > 0) parts.push(`${failures} timeouts`);
+                    if (retries > 0) parts.push(`${retries} root retries`);
+                    if (staleFlushed > 0) parts.push(`${staleFlushed} stale flushed`);
+                    if (exhaustions > 0) parts.push(`${exhaustions.toLocaleString()} exhaustions`);
+                    if (drops > 0) parts.push(`${drops.toLocaleString()} drops`);
+                    pipelineEl.textContent = '⚠️ ' + parts.join(', ');
+                    pipelineEl.style.color = '#e74c3c';
+                }
+
+                // Retry/stale metrics with conditional warning color
+                const retriesEl = document.getElementById('root-retries');
+                retriesEl.textContent = retries.toLocaleString();
+                retriesEl.className = retries > 0 ? 'warn' : 'ok';
+
+                const staleEl = document.getElementById('stale-flushed');
+                staleEl.textContent = staleFlushed.toLocaleString();
+                staleEl.className = staleFlushed > 0 ? 'warn' : 'ok';
+
+                // GPU Performance metrics
+                updateMetricWithHighlight('avg-batch-size', (data.avg_batch_size || 0).toFixed(1));
+                updateMetricWithHighlight('sys-evals-sec', Math.round(data.evals_per_sec).toLocaleString());
+                updateMetricWithHighlight('batch-fill-ratio', ((data.batch_fill_ratio || 0) * 100).toFixed(1) + '%');
+                updateMetricWithHighlight('timeout-evals', data.timeout_evals || 0);
+
+                // Iteration progress
+                updateMetricWithHighlight('live-games', `${data.games_completed}/${data.total_games}`);
+                updateMetricWithHighlight('live-wdl', `${data.white_wins || 0} / ${data.draws || 0} / ${data.black_wins || 0}`);
+                updateMetricWithHighlight('live-moves', (data.moves || 0).toLocaleString());
+                updateMetricWithHighlight('live-gph', (data.games_per_hour / 60).toFixed(2));
 
                 // Update buffer size in header
                 document.getElementById('buffer-size').textContent = data.buffer_size.toLocaleString();
+
+                // Bottleneck indicator
+                // High fill ratio = batches full = GPU is the bottleneck (workers waiting)
+                // Low fill ratio = batches sparse = CPU is the bottleneck (GPU waiting)
+                const bottleneckEl = document.getElementById('bottleneck-type');
+                const fillRatio = data.batch_fill_ratio || 0;
+                bottleneckEl.classList.remove('cpu-bound', 'gpu-bound', 'balanced');
+                if (fillRatio > 0.8) {
+                    bottleneckEl.textContent = 'GPU-bound (workers waiting)';
+                    bottleneckEl.classList.add('gpu-bound');
+                } else if (fillRatio < 0.3 && fillRatio > 0) {
+                    bottleneckEl.textContent = 'CPU-bound (GPU waiting)';
+                    bottleneckEl.classList.add('cpu-bound');
+                } else if (fillRatio > 0) {
+                    bottleneckEl.textContent = 'Balanced';
+                    bottleneckEl.classList.add('balanced');
+                } else {
+                    bottleneckEl.textContent = 'Initializing...';
+                }
 
                 // Update elapsed time from server
                 startTime = Date.now() - (data.total_elapsed * 1000);
             });
         }
 
-        // Helper function to update live stat with highlight animation
-        function updateLiveStat(elementId, value) {
+        // Helper function to update metric with highlight animation
+        function updateMetricWithHighlight(elementId, value) {
             const element = document.getElementById(elementId);
+            if (!element) return;
             const oldValue = element.textContent;
-            element.textContent = value;
+            const newValue = String(value);
+            element.textContent = newValue;
 
             // Add highlight animation if value changed
-            if (oldValue !== value) {
+            if (oldValue !== newValue) {
                 element.classList.add('highlight');
                 setTimeout(() => element.classList.remove('highlight'), 1000);
             }
@@ -839,6 +952,9 @@ class LiveDashboardServer:
             'selfplay_time': metrics.selfplay_time,
             'train_time': metrics.train_time,
             'iteration_time': metrics.total_time,
+            'eval_win_rate': metrics.eval_win_rate,
+            'eval_endgame_score': metrics.eval_endgame_score,
+            'eval_endgame_total': getattr(metrics, 'eval_endgame_total', 5),
         }
 
         self.history.append(dashboard_metrics)
@@ -846,7 +962,22 @@ class LiveDashboardServer:
 
     def push_progress(self, iteration: int, games_completed: int, total_games: int,
                        moves: int, sims: int, evals: int, elapsed_time: float,
-                       buffer_size: int, phase: str = "selfplay"):
+                       buffer_size: int, phase: str = "selfplay",
+                       # Game results (live W/D/L)
+                       white_wins: int = 0,
+                       black_wins: int = 0,
+                       draws: int = 0,
+                       # System monitoring metrics
+                       timeout_evals: int = 0,
+                       pool_exhaustion: int = 0,
+                       submission_drops: int = 0,
+                       partial_subs: int = 0,
+                       pool_resets: int = 0,
+                       pool_load: float = 0.0,
+                       avg_batch_size: float = 0.0,
+                       batch_fill_ratio: float = 0.0,
+                       root_retries: int = 0,
+                       stale_flushed: int = 0):
         """Push real-time progress updates during self-play (every few seconds).
 
         Args:
@@ -859,6 +990,16 @@ class LiveDashboardServer:
             elapsed_time: Seconds elapsed in this phase
             buffer_size: Current replay buffer size
             phase: Current phase ("selfplay" or "training")
+            timeout_evals: Number of MCTS evaluation timeouts (mcts_failures)
+            pool_exhaustion: Times observation pool ran out of slots
+            submission_drops: Total leaves dropped due to pool exhaustion
+            partial_subs: Times queued fewer leaves than requested
+            pool_resets: Times pool was reset
+            pool_load: Drop rate (0.0 = healthy, >0 = drops occurring)
+            avg_batch_size: Average GPU batch size
+            batch_fill_ratio: GPU batch fill ratio (>0.8 = GPU-bound, <0.3 = CPU-bound)
+            root_retries: Times root eval was retried after timeout
+            stale_flushed: Total stale results discarded via generation filtering
         """
         if not self.running or self.socketio is None:
             return
@@ -891,11 +1032,25 @@ class LiveDashboardServer:
             'evals': evals,
             'evals_per_sec': evals_per_sec,
             'games_per_hour': games_per_hour,
+            'white_wins': white_wins,
+            'black_wins': black_wins,
+            'draws': draws,
             'buffer_size': buffer_size,
             'phase_elapsed': elapsed_time,
             'phase_eta': eta_seconds,
             'total_elapsed': total_elapsed,
             'timestamp': datetime.now().strftime('%H:%M:%S'),
+            # System monitoring metrics
+            'timeout_evals': timeout_evals,
+            'pool_exhaustion': pool_exhaustion,
+            'submission_drops': submission_drops,
+            'partial_subs': partial_subs,
+            'pool_resets': pool_resets,
+            'pool_load': pool_load,
+            'avg_batch_size': avg_batch_size,
+            'batch_fill_ratio': batch_fill_ratio,
+            'root_retries': root_retries,
+            'stale_flushed': stale_flushed,
         }
 
         self.socketio.emit('progress', progress_data)

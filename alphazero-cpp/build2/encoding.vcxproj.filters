@@ -1,0 +1,19 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="C:\Users\liroc\OneDrive - Duke University\2025-2026\projects\alpha-zero-chess\alphazero-cpp\src\encoding\position_encoder.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\liroc\OneDrive - Duke University\2025-2026\projects\alpha-zero-chess\alphazero-cpp\src\encoding\move_encoder.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\liroc\OneDrive - Duke University\2025-2026\projects\alpha-zero-chess\alphazero-cpp\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{5D0EBC13-45A9-3002-9BC3-9D184928EE51}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

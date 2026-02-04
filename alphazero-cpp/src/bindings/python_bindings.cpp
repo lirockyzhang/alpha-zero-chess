@@ -2,6 +2,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include <pybind11/functional.h>
+#include <cstdio>
 #include "mcts/search.hpp"
 #include "mcts/node_pool.hpp"
 #include "mcts/batch_coordinator.hpp"
@@ -230,6 +231,14 @@ public:
         return py::array_t<int32_t>(counts.size(), counts.data());
     }
 
+    // Get root Q-value after search (MCTS-backed position evaluation)
+    float get_root_value() const {
+        auto* root = search_.get_root();
+        if (!root) return 0.0f;
+        // Root has no parent, so parent_q = 0.0f (no FPU needed for visited root)
+        return root->q_value(0.0f);
+    }
+
     // Reset for new search
     void reset() {
         pool_.reset();
@@ -384,15 +393,18 @@ public:
         int num_workers = 16,
         int games_per_worker = 4,
         int num_simulations = 800,
-        int mcts_batch_size = 64,
+        int mcts_batch_size = 1,
         int gpu_batch_size = 512,
         float c_puct = 1.5f,
         float dirichlet_alpha = 0.3f,
         float dirichlet_epsilon = 0.25f,
         int temperature_moves = 30,
         int gpu_timeout_ms = 20,
-        int worker_timeout_ms = 2000)
+        int worker_timeout_ms = 2000,
+        int queue_capacity = 8192,
+        int root_eval_retries = 3)
         : replay_buffer_(nullptr)
+        , active_coordinator_(nullptr)
     {
         config_.num_workers = num_workers;
         config_.games_per_worker = games_per_worker;
@@ -405,6 +417,8 @@ public:
         config_.temperature_moves = temperature_moves;
         config_.gpu_timeout_ms = gpu_timeout_ms;
         config_.worker_timeout_ms = worker_timeout_ms;
+        config_.queue_capacity = queue_capacity;
+        config_.root_eval_retries = root_eval_retries;
     }
 
     // Set replay buffer (optional - if not set, games are returned instead)
@@ -412,15 +426,82 @@ public:
         replay_buffer_ = buffer;
     }
 
+    // Stop the currently running self-play generation (for graceful shutdown)
+    void stop() {
+        if (active_coordinator_) {
+            active_coordinator_->stop();
+        }
+    }
+
+    // Check if self-play is currently running
+    bool is_running() const {
+        return active_coordinator_ && active_coordinator_->is_running();
+    }
+
+    // Get live statistics while self-play is running (thread-safe)
+    // Reads atomic counters from the active coordinator without blocking
+    py::dict get_live_stats() {
+        py::dict result;
+        if (!active_coordinator_) {
+            return result;
+        }
+        auto m = active_coordinator_->get_detailed_metrics();
+        const auto& stats = active_coordinator_->get_stats();
+        const auto& qm = active_coordinator_->get_queue_metrics();
+
+        // Game stats
+        result["games_completed"] = m.games_completed;
+        result["total_moves"] = m.total_moves;
+        result["total_simulations"] = m.total_simulations;
+        result["total_nn_evals"] = m.total_nn_evals;
+        result["white_wins"] = m.white_wins;
+        result["black_wins"] = m.black_wins;
+        result["draws"] = m.draws;
+        result["avg_game_length"] = m.avg_game_length;
+
+        // Throughput rates
+        result["moves_per_sec"] = m.moves_per_sec;
+        result["sims_per_sec"] = m.sims_per_sec;
+        result["nn_evals_per_sec"] = m.nn_evals_per_sec;
+
+        // GPU/batch metrics
+        result["mcts_failures"] = stats.mcts_failures.load(std::memory_order_relaxed);
+        result["avg_batch_size"] = m.avg_batch_size;
+        result["batch_fill_ratio"] = m.batch_fill_ratio;
+        result["pending_requests"] = m.pending_requests;
+
+        // Pipeline health diagnostics (cumulative counters)
+        uint64_t total_leaves = qm.total_leaves.load(std::memory_order_relaxed);
+        uint64_t drops = qm.submission_drops.load(std::memory_order_relaxed);
+        result["pool_exhaustion_count"] = qm.pool_exhaustion_count.load(std::memory_order_relaxed);
+        result["partial_submissions"] = qm.partial_submissions.load(std::memory_order_relaxed);
+        result["submission_drops"] = drops;
+        result["pool_resets"] = qm.pool_resets.load(std::memory_order_relaxed);
+        result["total_leaves"] = total_leaves;
+
+        // Retry/stale result tracking
+        result["root_retries"] = stats.root_retries.load(std::memory_order_relaxed);
+        result["stale_results_flushed"] = stats.stale_results_flushed.load(std::memory_order_relaxed);
+
+        // Pool load: fraction of leaves dropped (0.0 = healthy, >0 = pool bottleneck)
+        result["pool_load"] = (total_leaves + drops) > 0
+            ? static_cast<double>(drops) / static_cast<double>(total_leaves + drops)
+            : 0.0;
+
+        result["is_running"] = active_coordinator_->is_running();
+        return result;
+    }
+
     // Generate games using Python neural network evaluator
     // evaluator: callable that takes (observations: np.array, legal_masks: np.array, batch_size: int)
     //            and writes results to (policies: np.array, values: np.array)
     // Returns list of game dictionaries if no replay buffer is set
     py::object generate_games(py::object evaluator) {
-        // Create coordinator
-        auto coordinator = std::make_unique<selfplay::ParallelSelfPlayCoordinator>(
+        // Create coordinator and store reference for stop()
+        active_coordinator_ = std::make_unique<selfplay::ParallelSelfPlayCoordinator>(
             config_, replay_buffer_
         );
+        auto& coordinator = active_coordinator_;
 
         // Create C++ evaluator callback that wraps Python callable
         selfplay::NeuralEvaluatorFn cpp_evaluator = [&evaluator](
@@ -433,33 +514,77 @@ public:
             // Acquire GIL before calling Python from C++ thread
             py::gil_scoped_acquire acquire;
 
-            // Create numpy arrays wrapping C++ memory (no copy for input)
-            // Note: we need to create copies for safety since Python may do async operations
-            py::array_t<float> obs_array({batch_size, 8, 8, 122});
-            py::array_t<float> mask_array({batch_size, 4672});
+            // Zero-copy numpy wrapping: observations are already NCHW from C++ transpose
+            // Use capsule with no-op destructor to prevent Python from freeing C++ memory
+            py::array_t<float> obs_array(
+                {batch_size, 122, 8, 8},
+                {122 * 8 * 8 * (int)sizeof(float), 8 * 8 * (int)sizeof(float),
+                 8 * (int)sizeof(float), (int)sizeof(float)},
+                const_cast<float*>(observations),
+                py::capsule(observations, [](void*) {})
+            );
 
-            std::memcpy(obs_array.mutable_data(), observations,
-                       batch_size * 8 * 8 * 122 * sizeof(float));
-            std::memcpy(mask_array.mutable_data(), legal_masks,
-                       batch_size * 4672 * sizeof(float));
+            py::array_t<float> mask_array(
+                {batch_size, 4672},
+                {4672 * (int)sizeof(float), (int)sizeof(float)},
+                const_cast<float*>(legal_masks),
+                py::capsule(legal_masks, [](void*) {})
+            );
 
-            // Call Python evaluator
-            // Expected signature: evaluator(observations, legal_masks, batch_size) -> (policies, values)
-            py::object result = evaluator(obs_array, mask_array, batch_size);
+            // Create writable numpy views over C++ output buffers (zero-copy output)
+            py::array_t<float> out_policy_array(
+                {batch_size, 4672},
+                {4672 * (int)sizeof(float), (int)sizeof(float)},
+                out_policies,
+                py::capsule(out_policies, [](void*) {})
+            );
+            py::array_t<float> out_value_array(
+                {batch_size},
+                {(int)sizeof(float)},
+                out_values,
+                py::capsule(out_values, [](void*) {})
+            );
 
-            // Extract results
-            py::tuple result_tuple = result.cast<py::tuple>();
-            py::array_t<float> py_policies = result_tuple[0].cast<py::array_t<float>>();
-            py::array_t<float> py_values = result_tuple[1].cast<py::array_t<float>>();
+            // Call Python evaluator with output buffers
+            // Signature: evaluator(obs, masks, batch_size, out_policies, out_values) -> None
+            // Or legacy: evaluator(obs, masks, batch_size) -> (policies, values)
+            try {
+                py::object result = evaluator(obs_array, mask_array, batch_size,
+                                             out_policy_array, out_value_array);
+                // If evaluator returns None, it wrote directly to output buffers
+                if (!result.is_none()) {
+                    // Legacy path: evaluator returned (policies, values) tuple
+                    py::tuple result_tuple = result.cast<py::tuple>();
+                    py::array_t<float> py_policies = result_tuple[0].cast<py::array_t<float>>();
+                    py::array_t<float> py_values = result_tuple[1].cast<py::array_t<float>>();
 
-            // Copy results back to C++ buffers
-            auto policies_buf = py_policies.request();
-            auto values_buf = py_values.request();
+                    auto policies_buf = py_policies.request();
+                    auto values_buf = py_values.request();
 
-            std::memcpy(out_policies, policies_buf.ptr,
-                       batch_size * 4672 * sizeof(float));
-            std::memcpy(out_values, values_buf.ptr,
-                       batch_size * sizeof(float));
+                    std::memcpy(out_policies, policies_buf.ptr,
+                               batch_size * 4672 * sizeof(float));
+                    std::memcpy(out_values, values_buf.ptr,
+                               batch_size * sizeof(float));
+                }
+            } catch (py::error_already_set& e) {
+                // If the new 5-arg signature fails, fall back to 3-arg legacy
+                fprintf(stderr, "[WARNING] Evaluator 5-arg call failed: %s\n", e.what());
+                fflush(stderr);
+                PyErr_Clear();
+                py::object result = evaluator(obs_array, mask_array, batch_size);
+
+                py::tuple result_tuple = result.cast<py::tuple>();
+                py::array_t<float> py_policies = result_tuple[0].cast<py::array_t<float>>();
+                py::array_t<float> py_values = result_tuple[1].cast<py::array_t<float>>();
+
+                auto policies_buf = py_policies.request();
+                auto values_buf = py_values.request();
+
+                std::memcpy(out_policies, policies_buf.ptr,
+                           batch_size * 4672 * sizeof(float));
+                std::memcpy(out_values, values_buf.ptr,
+                           batch_size * sizeof(float));
+            }
         };
 
         // Run generation (releases GIL during C++ execution)
@@ -525,6 +650,11 @@ public:
         result["gpu_errors"] = stats.gpu_errors.load();  // Track GPU thread exceptions
         result["total_simulations"] = stats.total_simulations.load();
         result["total_nn_evals"] = stats.total_nn_evals.load();
+        result["root_retries"] = stats.root_retries.load();
+        result["stale_results_flushed"] = stats.stale_results_flushed.load();
+
+        // Surface C++ thread errors to Python
+        result["cpp_error"] = coordinator->get_last_error();
 
         // Queue diagnostic metrics (for debugging parallel pipeline health)
         result["pool_exhaustion_count"] = queue_metrics.pool_exhaustion_count.load();
@@ -561,6 +691,7 @@ public:
 private:
     selfplay::ParallelSelfPlayConfig config_;
     training::ReplayBuffer* replay_buffer_;
+    std::unique_ptr<selfplay::ParallelSelfPlayCoordinator> active_coordinator_;
 };
 
 PYBIND11_MODULE(alphazero_cpp, m) {
@@ -590,6 +721,8 @@ PYBIND11_MODULE(alphazero_cpp, m) {
              "Get number of simulations completed")
         .def("get_visit_counts", &PyBatchedMCTSSearch::get_visit_counts,
              "Get visit counts as policy vector (4672 dimensions)")
+        .def("get_root_value", &PyBatchedMCTSSearch::get_root_value,
+             "Get root Q-value after search (MCTS-backed position evaluation)")
         .def("reset", &PyBatchedMCTSSearch::reset,
              "Reset search tree for new search");
 
@@ -636,11 +769,11 @@ PYBIND11_MODULE(alphazero_cpp, m) {
 
     // Parallel self-play coordinator (cross-game batching for high GPU utilization)
     py::class_<PyParallelSelfPlayCoordinator>(m, "ParallelSelfPlayCoordinator")
-        .def(py::init<int, int, int, int, int, float, float, float, int, int, int>(),
+        .def(py::init<int, int, int, int, int, float, float, float, int, int, int, int, int>(),
              py::arg("num_workers") = 16,
              py::arg("games_per_worker") = 4,
              py::arg("num_simulations") = 800,
-             py::arg("mcts_batch_size") = 64,
+             py::arg("mcts_batch_size") = 1,
              py::arg("gpu_batch_size") = 512,
              py::arg("c_puct") = 1.5f,
              py::arg("dirichlet_alpha") = 0.3f,
@@ -648,6 +781,8 @@ PYBIND11_MODULE(alphazero_cpp, m) {
              py::arg("temperature_moves") = 30,
              py::arg("gpu_timeout_ms") = 20,
              py::arg("worker_timeout_ms") = 2000,
+             py::arg("queue_capacity") = 8192,
+             py::arg("root_eval_retries") = 3,
              "Create parallel self-play coordinator with cross-game batching.\n"
              "This achieves high GPU utilization by batching NN evaluations across multiple games.\n"
              "\nParameters:\n"
@@ -661,7 +796,9 @@ PYBIND11_MODULE(alphazero_cpp, m) {
              "  dirichlet_epsilon: Dirichlet noise weight (default 0.25)\n"
              "  temperature_moves: Moves with temperature=1.0 (default 30)\n"
              "  gpu_timeout_ms: GPU batch collection timeout (default 20)\n"
-             "  worker_timeout_ms: Worker wait time for NN results (default 2000)")
+             "  worker_timeout_ms: Worker wait time for NN results (default 2000)\n"
+             "  queue_capacity: Evaluation queue capacity (default 8192)\n"
+             "  root_eval_retries: Max retries for root NN evaluation (default 3)")
         .def("set_replay_buffer", &PyParallelSelfPlayCoordinator::set_replay_buffer,
              py::arg("buffer"),
              "Set replay buffer for direct data storage (optional).\n"
@@ -679,7 +816,20 @@ PYBIND11_MODULE(alphazero_cpp, m) {
         .def("get_config", &PyParallelSelfPlayCoordinator::get_config,
              "Get configuration as dictionary")
         .def("total_games", &PyParallelSelfPlayCoordinator::total_games,
-             "Get total number of games that will be generated");
+             "Get total number of games that will be generated")
+        .def("stop", &PyParallelSelfPlayCoordinator::stop,
+             "Stop self-play generation (for graceful shutdown). Can be called from another thread.")
+        .def("is_running", &PyParallelSelfPlayCoordinator::is_running,
+             "Check if self-play is currently running")
+        .def("get_live_stats", &PyParallelSelfPlayCoordinator::get_live_stats,
+             "Get live statistics while self-play is running.\n"
+             "Thread-safe: reads atomic counters without blocking.\n"
+             "Returns empty dict if no coordinator is active.")
+        .def("get_last_error", [](PyParallelSelfPlayCoordinator& self) -> std::string {
+            // Error is primarily surfaced via cpp_error key in generate_games() result dict
+            return "";
+        },
+        "Get last C++ error (use cpp_error key in generate_games result instead)");
 
     // Replay Buffer
     py::class_<training::ReplayBuffer>(m, "ReplayBuffer")

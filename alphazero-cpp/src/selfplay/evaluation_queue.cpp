@@ -11,14 +11,32 @@ namespace selfplay {
 GlobalEvaluationQueue::GlobalEvaluationQueue(size_t max_batch_size, size_t queue_capacity)
     : max_batch_size_(max_batch_size)
     , queue_capacity_(queue_capacity)
-    , obs_pool_(queue_capacity)
+    , staging_obs_buffer_(nullptr)
+    , staging_mask_buffer_(nullptr)
     , batch_obs_buffer_(nullptr)
+    , batch_obs_nchw_buffer_(nullptr)
     , batch_mask_buffer_(nullptr)
-    , batch_policy_buffer_(nullptr)
+    , batch_policy_buffers_{nullptr, nullptr}
     , batch_value_buffer_(nullptr)
 {
-    // Pre-allocate request queue
-    pending_requests_.reserve(queue_capacity);
+    // Allocate staging buffers (workers write directly into these)
+    size_t staging_obs_bytes = queue_capacity * OBS_SIZE * sizeof(float);
+    size_t staging_mask_bytes = queue_capacity * POLICY_SIZE * sizeof(float);
+
+    #ifdef _WIN32
+    staging_obs_buffer_ = static_cast<float*>(_aligned_malloc(staging_obs_bytes, 64));
+    staging_mask_buffer_ = static_cast<float*>(_aligned_malloc(staging_mask_bytes, 64));
+    #else
+    staging_obs_buffer_ = static_cast<float*>(std::aligned_alloc(64, staging_obs_bytes));
+    staging_mask_buffer_ = static_cast<float*>(std::aligned_alloc(64, staging_mask_bytes));
+    #endif
+
+    if (!staging_obs_buffer_ || !staging_mask_buffer_) {
+        throw std::bad_alloc();
+    }
+
+    // Pre-allocate staged request metadata queue
+    staged_requests_.reserve(queue_capacity);
 
     // Pre-allocate batch mapping
     batch_mapping_.reserve(max_batch_size);
@@ -38,6 +56,14 @@ GlobalEvaluationQueue::GlobalEvaluationQueue(size_t max_batch_size, size_t queue
 GlobalEvaluationQueue::~GlobalEvaluationQueue() {
     shutdown();
     free_batch_buffers();
+
+    #ifdef _WIN32
+    if (staging_obs_buffer_) _aligned_free(staging_obs_buffer_);
+    if (staging_mask_buffer_) _aligned_free(staging_mask_buffer_);
+    #else
+    if (staging_obs_buffer_) std::free(staging_obs_buffer_);
+    if (staging_mask_buffer_) std::free(staging_mask_buffer_);
+    #endif
 }
 
 // ============================================================================
@@ -53,18 +79,22 @@ void GlobalEvaluationQueue::allocate_batch_buffers() {
     // Allocate aligned memory (64-byte for cache line / GPU compatibility)
     #ifdef _WIN32
     batch_obs_buffer_ = static_cast<float*>(_aligned_malloc(obs_bytes, 64));
+    batch_obs_nchw_buffer_ = static_cast<float*>(_aligned_malloc(obs_bytes, 64));
     batch_mask_buffer_ = static_cast<float*>(_aligned_malloc(mask_bytes, 64));
-    batch_policy_buffer_ = static_cast<float*>(_aligned_malloc(policy_bytes, 64));
+    batch_policy_buffers_[0] = static_cast<float*>(_aligned_malloc(policy_bytes, 64));
+    batch_policy_buffers_[1] = static_cast<float*>(_aligned_malloc(policy_bytes, 64));
     batch_value_buffer_ = static_cast<float*>(_aligned_malloc(value_bytes, 64));
     #else
     batch_obs_buffer_ = static_cast<float*>(std::aligned_alloc(64, obs_bytes));
+    batch_obs_nchw_buffer_ = static_cast<float*>(std::aligned_alloc(64, obs_bytes));
     batch_mask_buffer_ = static_cast<float*>(std::aligned_alloc(64, mask_bytes));
-    batch_policy_buffer_ = static_cast<float*>(std::aligned_alloc(64, policy_bytes));
+    batch_policy_buffers_[0] = static_cast<float*>(std::aligned_alloc(64, policy_bytes));
+    batch_policy_buffers_[1] = static_cast<float*>(std::aligned_alloc(64, policy_bytes));
     batch_value_buffer_ = static_cast<float*>(std::aligned_alloc(64, value_bytes));
     #endif
 
-    if (!batch_obs_buffer_ || !batch_mask_buffer_ ||
-        !batch_policy_buffer_ || !batch_value_buffer_) {
+    if (!batch_obs_buffer_ || !batch_obs_nchw_buffer_ || !batch_mask_buffer_ ||
+        !batch_policy_buffers_[0] || !batch_policy_buffers_[1] || !batch_value_buffer_) {
         free_batch_buffers();
         throw std::bad_alloc();
     }
@@ -73,19 +103,25 @@ void GlobalEvaluationQueue::allocate_batch_buffers() {
 void GlobalEvaluationQueue::free_batch_buffers() {
     #ifdef _WIN32
     if (batch_obs_buffer_) _aligned_free(batch_obs_buffer_);
+    if (batch_obs_nchw_buffer_) _aligned_free(batch_obs_nchw_buffer_);
     if (batch_mask_buffer_) _aligned_free(batch_mask_buffer_);
-    if (batch_policy_buffer_) _aligned_free(batch_policy_buffer_);
+    if (batch_policy_buffers_[0]) _aligned_free(batch_policy_buffers_[0]);
+    if (batch_policy_buffers_[1]) _aligned_free(batch_policy_buffers_[1]);
     if (batch_value_buffer_) _aligned_free(batch_value_buffer_);
     #else
     if (batch_obs_buffer_) std::free(batch_obs_buffer_);
+    if (batch_obs_nchw_buffer_) std::free(batch_obs_nchw_buffer_);
     if (batch_mask_buffer_) std::free(batch_mask_buffer_);
-    if (batch_policy_buffer_) std::free(batch_policy_buffer_);
+    if (batch_policy_buffers_[0]) std::free(batch_policy_buffers_[0]);
+    if (batch_policy_buffers_[1]) std::free(batch_policy_buffers_[1]);
     if (batch_value_buffer_) std::free(batch_value_buffer_);
     #endif
 
     batch_obs_buffer_ = nullptr;
+    batch_obs_nchw_buffer_ = nullptr;
     batch_mask_buffer_ = nullptr;
-    batch_policy_buffer_ = nullptr;
+    batch_policy_buffers_[0] = nullptr;
+    batch_policy_buffers_[1] = nullptr;
     batch_value_buffer_ = nullptr;
 }
 
@@ -111,53 +147,56 @@ int GlobalEvaluationQueue::submit_for_evaluation(
     out_request_ids.clear();
     out_request_ids.reserve(num_leaves);
 
-    int queued = 0;
+    // Step 1: Claim staging slots atomically (no lock needed for data writes)
+    int first_slot = staging_write_head_.fetch_add(num_leaves, std::memory_order_relaxed);
+    int actual_leaves = num_leaves;
 
+    // Check if we exceeded capacity
+    if (first_slot + num_leaves > static_cast<int>(queue_capacity_)) {
+        actual_leaves = std::max(0, static_cast<int>(queue_capacity_) - first_slot);
+        if (actual_leaves < num_leaves) {
+            // Roll back the excess
+            staging_write_head_.fetch_sub(num_leaves - actual_leaves, std::memory_order_relaxed);
+            metrics_.pool_exhaustion_count.fetch_add(1, std::memory_order_relaxed);
+            metrics_.submission_drops.fetch_add(num_leaves - actual_leaves, std::memory_order_relaxed);
+        }
+    }
+
+    if (actual_leaves <= 0) {
+        return 0;
+    }
+
+    // Step 2: Write observation and mask data directly into staging buffers (no lock!)
+    for (int i = 0; i < actual_leaves; ++i) {
+        int slot = first_slot + i;
+        std::memcpy(staging_obs_buffer_ + slot * OBS_SIZE,
+                    observations + i * OBS_SIZE,
+                    OBS_SIZE * sizeof(float));
+        std::memcpy(staging_mask_buffer_ + slot * POLICY_SIZE,
+                    legal_masks + i * POLICY_SIZE,
+                    POLICY_SIZE * sizeof(float));
+    }
+
+    // Step 3: Push lightweight metadata under lock (no data copies here)
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
+        uint32_t gen = worker_generation_[worker_id].load(std::memory_order_acquire);
 
-        for (int i = 0; i < num_leaves; ++i) {
-            // Allocate slot in observation pool
-            int slot = obs_pool_.allocate();
-            if (slot < 0) {
-                // Pool full, can't accept more - track for diagnostics
-                metrics_.pool_exhaustion_count.fetch_add(1, std::memory_order_relaxed);
-                metrics_.submission_drops.fetch_add(num_leaves - i, std::memory_order_relaxed);
-                break;
-            }
-
-            // Copy observation and mask to pool
-            float* obs_ptr = obs_pool_.get_obs_ptr(slot);
-            float* mask_ptr = obs_pool_.get_mask_ptr(slot);
-
-            std::memcpy(obs_ptr, observations + i * OBS_SIZE, OBS_SIZE * sizeof(float));
-            std::memcpy(mask_ptr, legal_masks + i * POLICY_SIZE, POLICY_SIZE * sizeof(float));
-
-            // Create request
-            EvalRequest req;
-            req.worker_id = worker_id;
-            req.request_id = worker_request_ids_[worker_id].fetch_add(1, std::memory_order_relaxed);
-            req.observation = obs_ptr;
-            req.legal_mask = mask_ptr;
-
-            pending_requests_.push_back(req);
-            out_request_ids.push_back(req.request_id);
-            queued++;
+        for (int i = 0; i < actual_leaves; ++i) {
+            int32_t req_id = worker_request_ids_[worker_id].fetch_add(1, std::memory_order_relaxed);
+            staged_requests_.emplace_back(worker_id, req_id, gen, first_slot + i);
+            out_request_ids.push_back(req_id);
         }
 
-        // Notify GPU thread INSIDE the lock to avoid lost wakeup race condition
-        if (queued > 0) {
-            metrics_.total_requests_submitted.fetch_add(queued, std::memory_order_relaxed);
-            queue_cv_.notify_one();
-        }
+        metrics_.total_requests_submitted.fetch_add(actual_leaves, std::memory_order_relaxed);
+        queue_cv_.notify_one();
 
-        // Track partial submissions for diagnostics
-        if (queued < num_leaves && queued > 0) {
+        if (actual_leaves < num_leaves && actual_leaves > 0) {
             metrics_.partial_submissions.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
-    return queued;
+    return actual_leaves;
 }
 
 int GlobalEvaluationQueue::get_results(
@@ -190,17 +229,27 @@ int GlobalEvaluationQueue::get_results(
         return 0;
     }
 
-    // Retrieve available results
+    // Filter stale results (from timed-out requests that completed after flush)
     auto& results = worker_results_[worker_id];
+    uint32_t current_gen = worker_generation_[worker_id].load(std::memory_order_acquire);
+    results.erase(
+        std::remove_if(results.begin(), results.end(),
+            [current_gen](const EvalResult& r) { return r.generation < current_gen; }),
+        results.end()
+    );
+
+    // Retrieve available results
     int to_retrieve = std::min(static_cast<int>(results.size()), max_results);
 
     for (int i = 0; i < to_retrieve; ++i) {
         const auto& result = results[i];
 
-        // Copy policy
-        std::memcpy(out_policies + i * POLICY_SIZE,
-                    result.policy.data(),
-                    POLICY_SIZE * sizeof(float));
+        // Copy policy from double-buffered batch buffer using stored buffer_id
+        if (result.batch_index >= 0) {
+            std::memcpy(out_policies + i * POLICY_SIZE,
+                        batch_policy_buffers_[result.buffer_id] + result.batch_index * POLICY_SIZE,
+                        POLICY_SIZE * sizeof(float));
+        }
 
         // Copy value
         out_values[i] = result.value;
@@ -222,6 +271,75 @@ int GlobalEvaluationQueue::get_results(
     return retrieved;
 }
 
+int GlobalEvaluationQueue::try_get_results(
+    int worker_id,
+    float* out_policies,
+    float* out_values,
+    int max_results)
+{
+    if (worker_id < 0 || worker_id >= static_cast<int>(MAX_WORKERS)) {
+        return 0;
+    }
+
+    // Non-blocking: try to acquire lock immediately
+    std::unique_lock<std::mutex> lock(worker_mutexes_[worker_id], std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return 0;
+    }
+
+    // Filter stale results
+    auto& results = worker_results_[worker_id];
+    uint32_t current_gen = worker_generation_[worker_id].load(std::memory_order_acquire);
+    results.erase(
+        std::remove_if(results.begin(), results.end(),
+            [current_gen](const EvalResult& r) { return r.generation < current_gen; }),
+        results.end()
+    );
+
+    if (results.empty()) {
+        return 0;
+    }
+
+    int to_retrieve = std::min(static_cast<int>(results.size()), max_results);
+    int retrieved = 0;
+
+    for (int i = 0; i < to_retrieve; ++i) {
+        const auto& result = results[i];
+
+        if (result.batch_index >= 0) {
+            std::memcpy(out_policies + i * POLICY_SIZE,
+                        batch_policy_buffers_[result.buffer_id] + result.batch_index * POLICY_SIZE,
+                        POLICY_SIZE * sizeof(float));
+        }
+
+        out_values[i] = result.value;
+        retrieved++;
+    }
+
+    if (to_retrieve > 0) {
+        results.erase(results.begin(), results.begin() + to_retrieve);
+    }
+
+    return retrieved;
+}
+
+int GlobalEvaluationQueue::flush_worker_results(int worker_id) {
+    if (worker_id < 0 || worker_id >= static_cast<int>(MAX_WORKERS)) {
+        return 0;
+    }
+    // Increment generation FIRST (makes all in-flight results stale)
+    worker_generation_[worker_id].fetch_add(1, std::memory_order_release);
+
+    // Then clear any already-arrived stale results
+    int count;
+    {
+        std::lock_guard<std::mutex> lock(worker_mutexes_[worker_id]);
+        count = static_cast<int>(worker_results_[worker_id].size());
+        worker_results_[worker_id].clear();
+    }
+    return count;
+}
+
 // ============================================================================
 // GPU Thread Interface
 // ============================================================================
@@ -232,83 +350,87 @@ int GlobalEvaluationQueue::collect_batch(
     int timeout_ms)
 {
     auto start = std::chrono::steady_clock::now();
+    size_t batch_size = 0;
 
-    // Local staging area for requests - allows unlocking early
-    std::vector<EvalRequest> staging;
-    staging.reserve(max_batch_size_);
-    bool reset_pool = false;
-
+    // Phase 1 (under queue_mutex_): Collect staged requests, copy staging → batch buffers
     {
         std::unique_lock<std::mutex> lock(queue_mutex_);
 
         // ADAPTIVE BATCHING: Use a low threshold to avoid root evaluation stalls
-        // Root evaluations submit 1 leaf per worker, so we need to wake quickly.
-        // For simulation phase (64 leaves per worker), we'll naturally get larger batches.
-        // Target: ~8 leaves or any work after timeout (whichever comes first)
         size_t target_batch = std::max(size_t(1), std::min(size_t(8), max_batch_size_ / 64));
 
         queue_cv_.wait_for(
             lock,
             std::chrono::milliseconds(timeout_ms),
             [this, target_batch]() {
-                return pending_requests_.size() >= target_batch ||
+                return staged_requests_.size() >= target_batch ||
                        shutdown_.load(std::memory_order_acquire);
             }
         );
 
-        // No work available
-        if (pending_requests_.empty()) {
+        if (staged_requests_.empty()) {
             return 0;
         }
 
         // Collect up to max_batch_size requests
-        size_t batch_size = std::min(pending_requests_.size(), max_batch_size_);
+        batch_size = std::min(staged_requests_.size(), max_batch_size_);
 
-        // QUICK SWAP: Move requests to staging area to minimize lock time
-        std::move(pending_requests_.begin(),
-                  pending_requests_.begin() + batch_size,
-                  std::back_inserter(staging));
-        pending_requests_.erase(pending_requests_.begin(),
-                                pending_requests_.begin() + batch_size);
+        // Build batch mapping and copy data from staging slots to batch buffers
+        batch_mapping_.clear();
+        batch_mapping_.reserve(batch_size);
 
-        // Check if pool should be reset (before unlocking)
-        // Reset more aggressively when below threshold to prevent exhaustion
-        // This is safe because we hold the queue_mutex_ which blocks allocate()
-        reset_pool = pending_requests_.size() < queue_capacity_ / 4;
+        for (size_t i = 0; i < batch_size; ++i) {
+            const auto& req = staged_requests_[i];
 
-        // Lock released here - workers can now submit new requests
+            // Copy from staging slot directly to batch buffer (NHWC)
+            std::memcpy(batch_obs_buffer_ + i * OBS_SIZE,
+                        staging_obs_buffer_ + req.staging_slot * OBS_SIZE,
+                        OBS_SIZE * sizeof(float));
+
+            std::memcpy(batch_mask_buffer_ + i * POLICY_SIZE,
+                        staging_mask_buffer_ + req.staging_slot * POLICY_SIZE,
+                        POLICY_SIZE * sizeof(float));
+
+            batch_mapping_.emplace_back(req.worker_id, req.request_id, req.generation);
+        }
+
+        // Remove collected requests and compact staging
+        staged_requests_.erase(staged_requests_.begin(),
+                                staged_requests_.begin() + batch_size);
+
+        // STAGING COMPACTION: If remaining requests exist, compact their staging slots
+        // to the front so the write head can be reset
+        size_t remaining = staged_requests_.size();
+        if (remaining > 0) {
+            for (size_t i = 0; i < remaining; ++i) {
+                int old_slot = staged_requests_[i].staging_slot;
+                if (old_slot != static_cast<int>(i)) {
+                    std::memcpy(staging_obs_buffer_ + i * OBS_SIZE,
+                                staging_obs_buffer_ + old_slot * OBS_SIZE,
+                                OBS_SIZE * sizeof(float));
+                    std::memcpy(staging_mask_buffer_ + i * POLICY_SIZE,
+                                staging_mask_buffer_ + old_slot * POLICY_SIZE,
+                                POLICY_SIZE * sizeof(float));
+                    staged_requests_[i].staging_slot = static_cast<int>(i);
+                }
+            }
+        }
+        staging_write_head_.store(static_cast<int>(remaining), std::memory_order_release);
+        metrics_.pool_resets.fetch_add(1, std::memory_order_relaxed);
     }
+    // Lock released — workers can submit new leaves during Phase 2
 
-    // HEAVY OPERATIONS OUTSIDE LOCK: memcpy to batch buffers
-    size_t batch_size = staging.size();
-    batch_mapping_.clear();
-    batch_mapping_.reserve(batch_size);
-
-    for (size_t i = 0; i < batch_size; ++i) {
-        const auto& req = staging[i];
-
-        // Copy to contiguous batch buffer
-        std::memcpy(batch_obs_buffer_ + i * OBS_SIZE,
-                    req.observation,
-                    OBS_SIZE * sizeof(float));
-
-        std::memcpy(batch_mask_buffer_ + i * POLICY_SIZE,
-                    req.legal_mask,
-                    POLICY_SIZE * sizeof(float));
-
-        // Track mapping for result distribution
-        batch_mapping_.emplace_back(req.worker_id, req.request_id);
-    }
-
-    // Reset observation pool when queue is low (need to re-lock briefly)
-    // This prevents pool exhaustion by freeing slots more frequently
-    if (reset_pool) {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        // Re-check - another thread may have added requests
-        // Reset when below threshold to prevent exhaustion under load
-        if (pending_requests_.size() < queue_capacity_ / 4) {
-            obs_pool_.reset();
-            metrics_.pool_resets.fetch_add(1, std::memory_order_relaxed);
+    // Phase 2 (NO lock): NHWC→NCHW transpose on batch_obs_buffer_ → batch_obs_nchw_buffer_
+    // Safe: both buffers are only accessed by the GPU thread
+    for (size_t b = 0; b < batch_size; ++b) {
+        const float* nhwc = batch_obs_buffer_ + b * OBS_SIZE;
+        float* nchw = batch_obs_nchw_buffer_ + b * OBS_SIZE;
+        for (int h = 0; h < 8; ++h) {
+            for (int w = 0; w < 8; ++w) {
+                for (int c = 0; c < 122; ++c) {
+                    nchw[c * 64 + h * 8 + w] = nhwc[h * (8 * 122) + w * 122 + c];
+                }
+            }
         }
     }
 
@@ -321,7 +443,7 @@ int GlobalEvaluationQueue::collect_batch(
     metrics_.total_batches.fetch_add(1, std::memory_order_relaxed);
     metrics_.total_leaves.fetch_add(batch_size, std::memory_order_relaxed);
 
-    *out_obs_ptr = batch_obs_buffer_;
+    *out_obs_ptr = batch_obs_nchw_buffer_;
     *out_mask_ptr = batch_mask_buffer_;
 
     return static_cast<int>(batch_size);
@@ -336,15 +458,20 @@ void GlobalEvaluationQueue::submit_results(
         return;
     }
 
+    // Write policies to the CURRENT double-buffer slot
+    int buf_id = current_policy_buffer_;
+    std::memcpy(batch_policy_buffers_[buf_id], policies, batch_size * POLICY_SIZE * sizeof(float));
+    std::memcpy(batch_value_buffer_, values, batch_size * sizeof(float));
+
     // Track which workers need notification (avoid redundant notifications)
     bool workers_to_notify[MAX_WORKERS] = {false};
 
-    // BATCH PREPARATION: Build results outside locks first
+    // BATCH PREPARATION: Build lightweight results (no policy copy!)
     // Group results by worker to minimize lock acquisitions
     std::vector<EvalResult> results_by_worker[MAX_WORKERS];
 
     for (int i = 0; i < batch_size; ++i) {
-        auto [worker_id, request_id] = batch_mapping_[i];
+        auto [worker_id, request_id, generation] = batch_mapping_[i];
 
         if (worker_id < 0 || worker_id >= static_cast<int>(MAX_WORKERS)) {
             continue;
@@ -353,12 +480,10 @@ void GlobalEvaluationQueue::submit_results(
         EvalResult result;
         result.worker_id = worker_id;
         result.request_id = request_id;
+        result.generation = generation;
+        result.batch_index = i;           // Index within this batch's policy buffer
+        result.buffer_id = static_cast<int8_t>(buf_id);  // Which double-buffer to read from
         result.value = values[i];
-
-        // Copy policy
-        std::memcpy(result.policy.data(),
-                    policies + i * POLICY_SIZE,
-                    POLICY_SIZE * sizeof(float));
 
         results_by_worker[worker_id].push_back(std::move(result));
         workers_to_notify[worker_id] = true;
@@ -378,6 +503,9 @@ void GlobalEvaluationQueue::submit_results(
             worker_cvs_[worker_id].notify_one();
         }
     }
+
+    // Flip to the other buffer for the NEXT batch
+    current_policy_buffer_ = 1 - current_policy_buffer_;
 
     metrics_.total_results_returned.fetch_add(batch_size, std::memory_order_relaxed);
 }
@@ -402,15 +530,17 @@ void GlobalEvaluationQueue::reset() {
     std::lock_guard<std::mutex> lock(queue_mutex_);
 
     shutdown_.store(false, std::memory_order_release);
-    pending_requests_.clear();
+    staged_requests_.clear();
     batch_mapping_.clear();
-    obs_pool_.reset();
+    staging_write_head_.store(0, std::memory_order_release);
+    current_policy_buffer_ = 0;
 
-    // Clear worker results
+    // Clear worker results and reset generation counters
     for (size_t i = 0; i < MAX_WORKERS; ++i) {
         std::lock_guard<std::mutex> wlock(worker_mutexes_[i]);
         worker_results_[i].clear();
         worker_request_ids_[i].store(0, std::memory_order_relaxed);
+        worker_generation_[i].store(0, std::memory_order_relaxed);
     }
 
     metrics_.reset();
@@ -418,7 +548,7 @@ void GlobalEvaluationQueue::reset() {
 
 size_t GlobalEvaluationQueue::pending_count() const {
     // Note: This is a snapshot, may change immediately
-    return obs_pool_.allocated();
+    return static_cast<size_t>(staging_write_head_.load(std::memory_order_relaxed));
 }
 
 } // namespace selfplay

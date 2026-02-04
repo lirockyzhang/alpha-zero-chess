@@ -93,6 +93,12 @@ void MCTSSearch::update_leaves(const std::vector<std::vector<float>>& policies,
         simulations_completed_++;
     }
 
+    // If we received fewer results than pending evaluations,
+    // remove virtual losses from the remaining paths to prevent tree corruption
+    for (int i = batch_size; i < static_cast<int>(pending_evals_.size()); ++i) {
+        remove_virtual_losses_for_path(pending_evals_[i].node);
+    }
+
     // Clear pending evaluations
     pending_evals_.clear();
     simulations_in_flight_ = 0;
@@ -280,6 +286,15 @@ float MCTSSearch::puct_score(const Node* parent, const Node* child) const {
     return q + exploration;
 }
 
+void MCTSSearch::remove_virtual_losses_for_path(Node* node) {
+    // Traverse from leaf to root, removing virtual loss from each node
+    // This undoes the virtual losses added during selection
+    while (node != nullptr) {
+        node->remove_virtual_loss();
+        node = node->parent;
+    }
+}
+
 void MCTSSearch::add_dirichlet_noise(Node* root) {
     // Count children
     int num_children = 0;
@@ -330,6 +345,128 @@ std::vector<int32_t> MCTSSearch::get_visit_counts() const {
     }
 
     return visit_counts;
+}
+
+// ============================================================================
+// Async Double-Buffer Pipeline Implementation
+// ============================================================================
+
+int MCTSSearch::collect_leaves_async(float* obs_buffer, float* mask_buffer, int max_batch_size) {
+    // Same as collect_leaves but writes to the collection buffer instead of pending_evals_
+    int leaves_needed = std::min(max_batch_size, config_.num_simulations - simulations_completed_ - simulations_in_flight_);
+
+    if (leaves_needed <= 0) {
+        return 0;
+    }
+
+    // Run selection into collection buffer
+    auto& collection = get_collection_buffer();
+    collection.clear();
+    collection.reserve(leaves_needed);
+
+    for (int sim = 0; sim < leaves_needed; ++sim) {
+        chess::Board board = root_position_;
+        Node* leaf = select(root_, board);
+
+        if (leaf->is_terminal()) {
+            auto [reason, result] = board.isGameOver();
+            float value = 0.0f;
+            if (result == chess::GameResult::LOSE) {
+                value = -1.0f;
+            } else if (result == chess::GameResult::WIN) {
+                value = 1.0f;
+            }
+            backpropagate(leaf, value);
+            simulations_completed_++;
+        } else if (!leaf->is_expanded()) {
+            collection.emplace_back(leaf, board, sim);
+        } else {
+            float value = leaf->q_value(0.0f);
+            backpropagate(leaf, value);
+            simulations_completed_++;
+        }
+    }
+
+    // Encode collected leaves into buffers
+    int batch_size = static_cast<int>(collection.size());
+
+    for (int i = 0; i < batch_size; ++i) {
+        const auto& eval = collection[i];
+
+        encoding::PositionEncoder::encode_to_buffer(
+            eval.board,
+            obs_buffer + i * encoding::PositionEncoder::TOTAL_SIZE,
+            position_history_
+        );
+
+        float* mask_ptr = mask_buffer + i * encoding::MoveEncoder::POLICY_SIZE;
+        std::fill(mask_ptr, mask_ptr + encoding::MoveEncoder::POLICY_SIZE, 0.0f);
+
+        chess::Movelist moves;
+        chess::movegen::legalmoves(moves, eval.board);
+
+        for (const auto& move : moves) {
+            int idx = encoding::MoveEncoder::move_to_index(move, eval.board);
+            if (idx >= 0 && idx < encoding::MoveEncoder::POLICY_SIZE) {
+                mask_ptr[idx] = 1.0f;
+            }
+        }
+    }
+
+    simulations_in_flight_ += batch_size;
+    return batch_size;
+}
+
+int MCTSSearch::get_prev_batch_size() const {
+    return static_cast<int>(get_evaluation_buffer().size());
+}
+
+void MCTSSearch::update_prev_leaves(const std::vector<std::vector<float>>& policies,
+                                     const std::vector<float>& values) {
+    const auto& eval_buffer = get_evaluation_buffer();
+    int batch_size = std::min({
+        static_cast<int>(eval_buffer.size()),
+        static_cast<int>(policies.size()),
+        static_cast<int>(values.size())
+    });
+
+    for (int i = 0; i < batch_size; ++i) {
+        const auto& eval = eval_buffer[i];
+        Node* leaf = eval.node;
+
+        expand(leaf, eval.board, policies[i], values[i]);
+        backpropagate(leaf, values[i]);
+        simulations_completed_++;
+    }
+
+    // Remove virtual losses from any extra leaves that didn't get results
+    for (int i = batch_size; i < static_cast<int>(eval_buffer.size()); ++i) {
+        remove_virtual_losses_for_path(eval_buffer[i].node);
+    }
+
+    simulations_in_flight_ -= static_cast<int>(eval_buffer.size());
+}
+
+void MCTSSearch::cancel_prev_pending() {
+    const auto& eval_buffer = get_evaluation_buffer();
+    for (const auto& eval : eval_buffer) {
+        remove_virtual_losses_for_path(eval.node);
+    }
+    simulations_in_flight_ -= static_cast<int>(eval_buffer.size());
+}
+
+void MCTSSearch::cancel_collection_pending() {
+    auto& coll_buffer = get_collection_buffer();
+    for (const auto& eval : coll_buffer) {
+        remove_virtual_losses_for_path(eval.node);
+    }
+    simulations_in_flight_ -= static_cast<int>(coll_buffer.size());
+    coll_buffer.clear();
+}
+
+void MCTSSearch::commit_and_swap() {
+    swap_buffers();
+    start_next_batch_collection();
 }
 
 // Double buffering implementation for GPU/CPU overlap

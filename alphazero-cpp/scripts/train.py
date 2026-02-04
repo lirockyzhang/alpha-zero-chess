@@ -4,10 +4,22 @@ AlphaZero Training with C++ Backend
 
 This script uses:
 - C++ MCTS (alphazero-cpp) for fast tree search with proper leaf evaluation
-- C++ ReplayBuffer for high-performance data storage with persistence
+- C++ ReplayBuffer for high-performance data storage with optional persistence
 - CUDA for neural network inference and training
 - 192x15 network architecture (192 filters, 15 residual blocks)
 - 122-channel position encoding
+
+Output Directory Structure:
+    Each training run creates an organized directory:
+    checkpoints/
+    └── f192-b15_2024-02-03_14-30-00/    # {filters}-{blocks}_{timestamp}
+        ├── model_iter_001.pt            # Checkpoints (every N iterations)
+        ├── model_iter_005.pt
+        ├── model_final.pt               # Final checkpoint
+        ├── training_metrics.json        # Loss, games, moves per iteration
+        ├── summary.html                 # Training summary (default, unless --no-visualization)
+        ├── evaluation_results.json      # Evaluation metrics per checkpoint
+        └── replay_buffer.rpbf           # Always saved; use --load-buffer to load on resume
 
 Usage:
     # Basic training (recommended starting point)
@@ -16,14 +28,20 @@ Usage:
     # Custom parameters
     uv run python alphazero-cpp/scripts/train.py --iterations 50 --games-per-iter 100 --simulations 800
 
-    # Resume from checkpoint (includes replay buffer)
-    uv run python alphazero-cpp/scripts/train.py --resume checkpoints/cpp_iter_10.pt
+    # Resume from checkpoint (continues in same run directory)
+    uv run python alphazero-cpp/scripts/train.py --resume checkpoints/f192-b15_2024-02-03_14-30-00/model_iter_005.pt
+
+    # Resume from run directory (finds latest checkpoint)
+    uv run python alphazero-cpp/scripts/train.py --resume checkpoints/f192-b15_2024-02-03_14-30-00
+
+    # With buffer loading (buffer always saved; --load-buffer loads on startup)
+    uv run python alphazero-cpp/scripts/train.py --load-buffer
 
 Parameters:
     --iterations        Number of training iterations (default: 100)
     --games-per-iter    Self-play games per iteration (default: 50)
     --simulations       MCTS simulations per move (default: 800)
-    --search-batch      Leaves to evaluate per MCTS iteration (default: 64)
+    --search-batch      Leaves to evaluate per MCTS iteration (default: 32)
     --train-batch       Samples per training gradient step (default: 256)
     --lr                Learning rate (default: 0.001)
     --filters           Network filters (default: 192)
@@ -33,10 +51,12 @@ Parameters:
     --temperature-moves Moves with temperature=1 (default: 30)
     --c-puct            MCTS exploration constant (default: 1.5)
     --device            Device: cuda or cpu (default: cuda)
-    --save-dir          Checkpoint directory (default: checkpoints)
-    --resume            Resume from checkpoint path
+    --save-dir          Base checkpoint directory (default: checkpoints)
+    --resume            Resume from checkpoint path or run directory
     --save-interval     Save checkpoint every N iterations (default: 5)
-    --buffer-path       Replay buffer persistence path (default: replay_buffer/latest.rpbf)
+    --load-buffer        Load replay buffer on startup (always saved regardless)
+    --no-visualization  Disable summary.html generation (default: enabled)
+    --no-eval           Skip evaluation before checkpoint (default: enabled)
 
     Parallel Self-Play (enabled automatically when --workers > 1):
     --workers              Self-play workers. 1=sequential, >1=parallel (default: 1)
@@ -52,6 +72,7 @@ Parameters:
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -60,7 +81,7 @@ import signal
 import threading
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -793,6 +814,10 @@ class IterationMetrics:
     num_train_batches: int = 0
     # Buffer metrics
     buffer_size: int = 0
+    # Evaluation metrics
+    eval_win_rate: Optional[float] = None      # vs random win rate (0.0-1.0)
+    eval_endgame_score: Optional[int] = None   # endgame puzzles correct (0-5)
+    eval_endgame_total: int = 5                # total endgame puzzles
     # Timing
     total_time: float = 0.0
 
@@ -913,6 +938,671 @@ class MetricsTracker:
             print(f"    Black wins:      {total_b} ({total_b/total*100:.1f}%)")
 
         print("\n" + "=" * 70)
+
+
+# =============================================================================
+# Evaluation Functions (vs Random + Endgame Puzzles)
+# =============================================================================
+
+# Endgame puzzles for testing model strength
+ENDGAME_PUZZLES = [
+    # King + Queen vs King (should find mate or strong advantage)
+    {"fen": "8/8/8/4k3/8/8/8/4K2Q w - - 0 1", "best_moves": ["Qe4+", "Qd5+"], "type": "KQ_vs_K"},
+
+    # King + Rook vs King (should find strong moves)
+    {"fen": "8/8/8/4k3/8/8/4R3/4K3 w - - 0 1", "best_moves": ["Re5+", "Re4+", "Ke2"], "type": "KR_vs_K"},
+
+    # King + Pawn vs King (should find promotion path)
+    {"fen": "8/4P3/8/8/4k3/8/8/4K3 w - - 0 1", "best_moves": ["e8=Q", "e8=R"], "type": "pawn_promo"},
+
+    # Tactical: back rank mate threat
+    {"fen": "6k1/5ppp/8/8/8/8/8/R3K3 w - - 0 1", "best_moves": ["Ra8+"], "type": "back_rank"},
+
+    # Tactical: Scholar's mate position (if allowed)
+    {"fen": "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4",
+     "best_moves": ["Qxf7#"], "type": "scholars_mate"},
+]
+
+
+def play_vs_random(network: 'AlphaZeroNet', device: str, num_games: int = 5, simulations: int = 50) -> Dict[str, Any]:
+    """Play games against a random opponent to test basic competence.
+
+    Args:
+        network: The neural network to evaluate
+        device: CUDA or CPU device
+        num_games: Number of games to play
+        simulations: MCTS simulations per move for the model
+
+    Returns:
+        Dictionary with wins, losses, draws counts
+    """
+    network.eval()
+    results = {"wins": 0, "losses": 0, "draws": 0}
+
+    # Create a simple evaluator
+    evaluator = BatchedEvaluator(network, device, use_amp=(device == "cuda"))
+    mcts = alphazero_cpp.BatchedMCTSSearch(
+        num_simulations=simulations,
+        batch_size=min(simulations, 32),
+        c_puct=1.5
+    )
+
+    for game_idx in range(num_games):
+        print(f"      vs_random game {game_idx + 1}/{num_games}...", end=" ", flush=True)
+        board = chess.Board()
+        model_plays_white = (game_idx % 2 == 0)
+        move_count = 0
+
+        while not board.is_game_over() and move_count < 200:
+            is_model_turn = (board.turn == chess.WHITE) == model_plays_white
+
+            if is_model_turn:
+                # Model move using MCTS
+                fen = board.fen()
+                obs = alphazero_cpp.encode_position(fen)
+                obs_chw = np.transpose(obs, (2, 0, 1))
+
+                # Build legal mask
+                legal_moves = list(board.legal_moves)
+                mask = np.zeros(POLICY_SIZE, dtype=np.float32)
+                idx_to_move = {}
+
+                for move in legal_moves:
+                    idx = alphazero_cpp.move_to_index(move.uci(), fen)
+                    if 0 <= idx < POLICY_SIZE:
+                        mask[idx] = 1.0
+                        idx_to_move[idx] = move
+
+                # Get root evaluation
+                root_policy, root_value = evaluator.evaluate(obs_chw, mask)
+
+                # Initialize and run MCTS
+                mcts.init_search(fen, root_policy.astype(np.float32), float(root_value))
+
+                while not mcts.is_complete():
+                    num_leaves, obs_batch, mask_batch = mcts.collect_leaves()
+                    if num_leaves == 0:
+                        break
+
+                    obs_nchw = np.transpose(obs_batch[:num_leaves], (0, 3, 1, 2))
+                    masks = mask_batch[:num_leaves]
+                    leaf_policies, leaf_values = evaluator.evaluate_batch(obs_nchw, masks)
+                    mcts.update_leaves(leaf_policies.astype(np.float32), leaf_values.astype(np.float32))
+
+                # Select best move
+                visit_counts = mcts.get_visit_counts()
+                policy = visit_counts * mask
+                if policy.sum() > 0:
+                    action = np.argmax(policy)
+                    if action in idx_to_move:
+                        board.push(idx_to_move[action])
+                    else:
+                        # Fallback
+                        board.push(random.choice(legal_moves))
+                else:
+                    board.push(random.choice(legal_moves))
+
+                mcts.reset()
+            else:
+                # Random opponent move
+                legal_moves = list(board.legal_moves)
+                if legal_moves:
+                    board.push(random.choice(legal_moves))
+
+            move_count += 1
+
+        # Determine result
+        result = board.result()
+        if result == "1-0":
+            if model_plays_white:
+                results["wins"] += 1
+                print("win")
+            else:
+                results["losses"] += 1
+                print("loss")
+        elif result == "0-1":
+            if model_plays_white:
+                results["losses"] += 1
+                print("loss")
+            else:
+                results["wins"] += 1
+                print("win")
+        else:
+            results["draws"] += 1
+            print("draw")
+
+    return results
+
+
+def test_endgame_positions(network: 'AlphaZeroNet', device: str, puzzles: List[Dict] = None) -> Dict[str, Any]:
+    """Test the model on known endgame positions.
+
+    For each puzzle, we check if the model's top move matches one of the expected best moves.
+
+    Args:
+        network: The neural network to evaluate
+        device: CUDA or CPU device
+        puzzles: List of puzzle dictionaries (uses ENDGAME_PUZZLES if None)
+
+    Returns:
+        Dictionary with score and details
+    """
+    if puzzles is None:
+        puzzles = ENDGAME_PUZZLES
+
+    network.eval()
+    evaluator = BatchedEvaluator(network, device, use_amp=(device == "cuda"))
+
+    correct = 0
+    details = []
+
+    for puzzle in puzzles:
+        fen = puzzle["fen"]
+        best_moves = puzzle["best_moves"]
+        puzzle_type = puzzle["type"]
+
+        board = chess.Board(fen)
+        obs = alphazero_cpp.encode_position(fen)
+        obs_chw = np.transpose(obs, (2, 0, 1))
+
+        # Build legal mask
+        legal_moves = list(board.legal_moves)
+        mask = np.zeros(POLICY_SIZE, dtype=np.float32)
+        idx_to_move = {}
+
+        for move in legal_moves:
+            idx = alphazero_cpp.move_to_index(move.uci(), fen)
+            if 0 <= idx < POLICY_SIZE:
+                mask[idx] = 1.0
+                idx_to_move[idx] = move
+
+        # Get policy from network (no MCTS, just raw policy)
+        policy, value = evaluator.evaluate(obs_chw, mask)
+        policy = policy * mask
+
+        # Find top move
+        if policy.sum() > 0:
+            top_idx = np.argmax(policy)
+            if top_idx in idx_to_move:
+                top_move = idx_to_move[top_idx]
+                top_move_san = board.san(top_move)
+
+                # Check if it matches any of the best moves
+                is_correct = top_move_san in best_moves
+
+                if is_correct:
+                    correct += 1
+
+                details.append({
+                    "type": puzzle_type,
+                    "fen": fen,
+                    "expected": best_moves,
+                    "predicted": top_move_san,
+                    "correct": is_correct
+                })
+            else:
+                details.append({
+                    "type": puzzle_type,
+                    "fen": fen,
+                    "expected": best_moves,
+                    "predicted": "invalid",
+                    "correct": False
+                })
+        else:
+            details.append({
+                "type": puzzle_type,
+                "fen": fen,
+                "expected": best_moves,
+                "predicted": "no_legal_moves",
+                "correct": False
+            })
+
+    return {
+        "score": correct,
+        "total": len(puzzles),
+        "accuracy": correct / len(puzzles) if puzzles else 0,
+        "details": details
+    }
+
+
+def evaluate_checkpoint(network: 'AlphaZeroNet', device: str) -> Dict[str, Any]:
+    """Run full evaluation suite before saving checkpoint.
+
+    Args:
+        network: The neural network to evaluate
+        device: CUDA or CPU device
+
+    Returns:
+        Dictionary with all evaluation results
+    """
+    results = {}
+
+    # 1. vs Random Agent (5 games, 50 sims each)
+    random_results = play_vs_random(network, device, num_games=5, simulations=50)
+    results["vs_random"] = {
+        "wins": random_results["wins"],
+        "losses": random_results["losses"],
+        "draws": random_results["draws"],
+        "win_rate": random_results["wins"] / 5.0
+    }
+
+    # 2. Endgame Puzzles
+    endgame_results = test_endgame_positions(network, device)
+    results["endgame"] = {
+        "score": endgame_results["score"],
+        "total": endgame_results["total"],
+        "accuracy": endgame_results["accuracy"]
+    }
+
+    return results
+
+
+# =============================================================================
+# Summary HTML Generation
+# =============================================================================
+
+def generate_summary_html(
+    run_dir: str,
+    metrics_history: Dict[str, Any],
+    eval_history: Dict[str, Any],
+    config: Dict[str, Any]
+) -> str:
+    """Generate a summary HTML file with training metrics and evaluation results.
+
+    Args:
+        run_dir: The run directory to save summary.html
+        metrics_history: Training metrics from training_metrics.json
+        eval_history: Evaluation results from evaluation_results.json
+        config: Training configuration
+
+    Returns:
+        Path to the generated summary.html file
+    """
+    iterations = metrics_history.get("iterations", [])
+    evaluations = eval_history.get("evaluations", [])
+
+    # Calculate summary statistics
+    if iterations:
+        total_games = sum(m.get("games", 0) for m in iterations)
+        total_moves = sum(m.get("moves", 0) for m in iterations)
+        avg_loss = sum(m.get("loss", 0) for m in iterations) / len(iterations)
+
+        # Loss improvement
+        if len(iterations) >= 2 and iterations[0].get("loss", 0) > 0:
+            first_loss = iterations[0]["loss"]
+            last_loss = iterations[-1]["loss"]
+            loss_improvement = (first_loss - last_loss) / first_loss * 100
+        else:
+            loss_improvement = 0
+    else:
+        total_games = total_moves = 0
+        avg_loss = loss_improvement = 0
+
+    # Build evaluation section
+    eval_section = ""
+    if evaluations:
+        latest_eval = evaluations[-1]
+        vs_random = latest_eval.get("vs_random", {})
+        endgame = latest_eval.get("endgame", {})
+
+        eval_section = f"""
+        <div class="card">
+            <h2>🎯 Latest Evaluation (Iteration {latest_eval.get('iteration', 'N/A')})</h2>
+            <div class="stat-grid">
+                <div class="stat">
+                    <div class="stat-value">{vs_random.get('win_rate', 0) * 100:.0f}%</div>
+                    <div class="stat-label">vs Random Win Rate ({vs_random.get('wins', 0)}/{5} games)</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">{endgame.get('score', 0)}/{endgame.get('total', 5)}</div>
+                    <div class="stat-label">Endgame Puzzles Correct</div>
+                </div>
+            </div>
+        </div>
+        """
+
+        # Evaluation history chart data
+        eval_iters = [e.get("iteration", 0) for e in evaluations]
+        eval_win_rates = [e.get("vs_random", {}).get("win_rate", 0) * 100 for e in evaluations]
+        eval_endgame = [e.get("endgame", {}).get("score", 0) for e in evaluations]
+
+    # Build loss chart data
+    loss_iters = [m.get("iteration", 0) for m in iterations]
+    losses = [m.get("loss", 0) for m in iterations]
+    policy_losses = [m.get("policy_loss", 0) for m in iterations]
+    value_losses = [m.get("value_loss", 0) for m in iterations]
+
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>AlphaZero Training Summary</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {{ font-family: Arial, sans-serif; background: #f5f6fa; padding: 20px; margin: 0; }}
+        .container {{ max-width: 1200px; margin: 0 auto; }}
+        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; text-align: center; margin-bottom: 20px; }}
+        .card {{ background: white; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+        .card h2 {{ color: #2c3e50; margin-top: 0; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
+        .stat-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }}
+        .stat {{ background: #f8f9fa; padding: 15px; border-radius: 8px; text-align: center; }}
+        .stat-value {{ font-size: 24px; font-weight: bold; color: #3498db; }}
+        .stat-label {{ font-size: 12px; color: #7f8c8d; margin-top: 5px; }}
+        .chart-container {{ height: 300px; margin-top: 20px; }}
+        .config-table {{ width: 100%; border-collapse: collapse; }}
+        .config-table td {{ padding: 8px; border-bottom: 1px solid #eee; }}
+        .config-table td:first-child {{ font-weight: bold; color: #7f8c8d; width: 40%; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎯 AlphaZero Training Summary</h1>
+            <p>Run: {os.path.basename(run_dir)}</p>
+            <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        </div>
+
+        <div class="card">
+            <h2>📊 Overall Statistics</h2>
+            <div class="stat-grid">
+                <div class="stat">
+                    <div class="stat-value">{len(iterations)}</div>
+                    <div class="stat-label">Iterations Completed</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">{total_games:,}</div>
+                    <div class="stat-label">Total Games Played</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">{total_moves:,}</div>
+                    <div class="stat-label">Total Moves</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">{loss_improvement:.1f}%</div>
+                    <div class="stat-label">Loss Improvement</div>
+                </div>
+            </div>
+        </div>
+
+        {eval_section}
+
+        <div class="card">
+            <h2>📉 Training Loss</h2>
+            <div class="chart-container">
+                <canvas id="lossChart"></canvas>
+            </div>
+        </div>
+
+        {"<div class='card'><h2>🎯 Evaluation Progress</h2><div class='chart-container'><canvas id='evalChart'></canvas></div></div>" if evaluations else ""}
+
+        <div class="card">
+            <h2>⚙️ Configuration</h2>
+            <table class="config-table">
+                <tr><td>Network</td><td>{config.get('filters', 192)} filters × {config.get('blocks', 15)} blocks</td></tr>
+                <tr><td>Simulations</td><td>{config.get('simulations', 800)} per move</td></tr>
+                <tr><td>Games/Iteration</td><td>{config.get('games_per_iter', 50)}</td></tr>
+                <tr><td>Buffer Size</td><td>{config.get('buffer_size', 100000):,}</td></tr>
+                <tr><td>Learning Rate</td><td>{config.get('lr', 0.001)}</td></tr>
+                <tr><td>Workers</td><td>{config.get('workers', 1)}</td></tr>
+            </table>
+        </div>
+
+        <p style="text-align: center; color: #7f8c8d; margin-top: 30px;">
+            Generated by AlphaZero Training Script
+        </p>
+    </div>
+
+    <script>
+        // Loss chart with dual Y-axis for policy/value loss
+        new Chart(document.getElementById('lossChart'), {{
+            type: 'line',
+            data: {{
+                labels: {loss_iters},
+                datasets: [
+                    {{
+                        label: 'Total Loss',
+                        data: {losses},
+                        borderColor: '#3498db',
+                        fill: false,
+                        tension: 0.1,
+                        yAxisID: 'y'
+                    }},
+                    {{
+                        label: 'Policy Loss',
+                        data: {policy_losses},
+                        borderColor: '#2ecc71',
+                        fill: false,
+                        tension: 0.1,
+                        yAxisID: 'y'
+                    }},
+                    {{
+                        label: 'Value Loss',
+                        data: {value_losses},
+                        borderColor: '#e74c3c',
+                        fill: false,
+                        tension: 0.1,
+                        yAxisID: 'y1'
+                    }}
+                ]
+            }},
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {{
+                    y: {{
+                        type: 'linear',
+                        position: 'left',
+                        beginAtZero: false,
+                        title: {{ display: true, text: 'Total/Policy Loss' }}
+                    }},
+                    y1: {{
+                        type: 'linear',
+                        position: 'right',
+                        beginAtZero: false,
+                        title: {{ display: true, text: 'Value Loss' }},
+                        grid: {{ drawOnChartArea: false }}
+                    }}
+                }}
+            }}
+        }});
+
+        {"// Evaluation chart" if evaluations else ""}
+        {f'''
+        new Chart(document.getElementById('evalChart'), {{
+            type: 'line',
+            data: {{
+                labels: {eval_iters},
+                datasets: [
+                    {{
+                        label: 'vs Random Win Rate (%)',
+                        data: {eval_win_rates},
+                        borderColor: '#3498db',
+                        fill: false,
+                        tension: 0.1,
+                        yAxisID: 'y'
+                    }},
+                    {{
+                        label: 'Endgame Score',
+                        data: {eval_endgame},
+                        borderColor: '#2ecc71',
+                        fill: false,
+                        tension: 0.1,
+                        yAxisID: 'y1'
+                    }}
+                ]
+            }},
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {{
+                    y: {{
+                        type: 'linear',
+                        position: 'left',
+                        min: 0,
+                        max: 100,
+                        title: {{ display: true, text: 'Win Rate (%)' }}
+                    }},
+                    y1: {{
+                        type: 'linear',
+                        position: 'right',
+                        min: 0,
+                        max: 5,
+                        title: {{ display: true, text: 'Endgame Score' }},
+                        grid: {{ drawOnChartArea: false }}
+                    }}
+                }}
+            }}
+        }});
+        ''' if evaluations else ""}
+    </script>
+</body>
+</html>
+"""
+
+    summary_path = os.path.join(run_dir, "summary.html")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    return summary_path
+
+
+# =============================================================================
+# Run Directory and Resume Helpers
+# =============================================================================
+
+def create_run_directory(base_dir: str, filters: int, blocks: int) -> str:
+    """Create a new organized run directory with timestamp.
+
+    Args:
+        base_dir: Base checkpoint directory (e.g., "checkpoints")
+        filters: Number of network filters
+        blocks: Number of residual blocks
+
+    Returns:
+        Path to the created run directory
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_name = f"f{filters}-b{blocks}_{timestamp}"
+    run_dir = os.path.join(base_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+
+    return run_dir
+
+
+def find_latest_checkpoint(run_dir: str) -> Optional[str]:
+    """Find the latest checkpoint in a run directory.
+
+    Args:
+        run_dir: Path to the run directory
+
+    Returns:
+        Path to the latest checkpoint, or None if not found
+    """
+    import glob
+
+    # Look for model_iter_*.pt files
+    pattern = os.path.join(run_dir, "model_iter_*.pt")
+    checkpoints = glob.glob(pattern)
+
+    if not checkpoints:
+        # Also check for old-style cpp_iter_*.pt files
+        pattern = os.path.join(run_dir, "cpp_iter_*.pt")
+        checkpoints = glob.glob(pattern)
+
+    if not checkpoints:
+        return None
+
+    # Sort by iteration number
+    def extract_iter(path):
+        name = os.path.basename(path)
+        # Handle both model_iter_001.pt and cpp_iter_1.pt formats
+        try:
+            if "model_iter_" in name:
+                return int(name.replace("model_iter_", "").replace(".pt", "").replace("_emergency", ""))
+            elif "cpp_iter_" in name:
+                return int(name.replace("cpp_iter_", "").replace(".pt", "").replace("_emergency", ""))
+        except ValueError:
+            return 0
+        return 0
+
+    checkpoints.sort(key=extract_iter)
+    return checkpoints[-1]
+
+
+def parse_resume_path(resume_arg: str) -> Tuple[str, Optional[str]]:
+    """Parse the resume argument to get run directory and checkpoint path.
+
+    Args:
+        resume_arg: Either a path to a .pt file or a run directory
+
+    Returns:
+        Tuple of (run_dir, checkpoint_path)
+    """
+    if resume_arg.endswith('.pt'):
+        # It's a checkpoint file path
+        run_dir = os.path.dirname(resume_arg)
+        checkpoint_path = resume_arg
+    else:
+        # It's a run directory
+        run_dir = resume_arg
+        checkpoint_path = find_latest_checkpoint(run_dir)
+
+    return run_dir, checkpoint_path
+
+
+def load_metrics_history(run_dir: str) -> Dict[str, Any]:
+    """Load training metrics history from a run directory.
+
+    Args:
+        run_dir: Path to the run directory
+
+    Returns:
+        Metrics history dictionary
+    """
+    metrics_path = os.path.join(run_dir, "training_metrics.json")
+    if os.path.exists(metrics_path):
+        with open(metrics_path, 'r') as f:
+            return json.load(f)
+    return {"iterations": [], "config": {}}
+
+
+def save_metrics_history(run_dir: str, metrics_history: Dict[str, Any]):
+    """Save training metrics history to a run directory.
+
+    Args:
+        run_dir: Path to the run directory
+        metrics_history: Metrics history dictionary
+    """
+    metrics_path = os.path.join(run_dir, "training_metrics.json")
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics_history, f, indent=2)
+
+
+def load_eval_history(run_dir: str) -> Dict[str, Any]:
+    """Load evaluation history from a run directory.
+
+    Args:
+        run_dir: Path to the run directory
+
+    Returns:
+        Evaluation history dictionary
+    """
+    eval_path = os.path.join(run_dir, "evaluation_results.json")
+    if os.path.exists(eval_path):
+        with open(eval_path, 'r') as f:
+            return json.load(f)
+    return {"evaluations": []}
+
+
+def save_eval_history(run_dir: str, eval_history: Dict[str, Any]):
+    """Save evaluation history to a run directory.
+
+    Args:
+        run_dir: Path to the run directory
+        eval_history: Evaluation history dictionary
+    """
+    eval_path = os.path.join(run_dir, "evaluation_results.json")
+    with open(eval_path, 'w') as f:
+        json.dump(eval_history, f, indent=2)
 
 
 # =============================================================================
@@ -1226,6 +1916,74 @@ class CppSelfPlay:
 # Parallel Self-Play with Cross-Game Batching
 # =============================================================================
 
+def run_parallel_selfplay_with_interrupt(
+    coordinator,
+    evaluator,
+    shutdown_handler: GracefulShutdown,
+    progress_callback=None,
+    progress_interval: float = 5.0
+) -> dict:
+    """Run self-play in a thread, allowing Ctrl+C to interrupt.
+
+    This wrapper runs generate_games() in a background thread while the main
+    thread monitors for shutdown signals and pushes periodic progress updates.
+    When Ctrl+C is detected, it calls coordinator.stop() to gracefully
+    terminate C++ execution.
+
+    Args:
+        coordinator: ParallelSelfPlayCoordinator instance
+        evaluator: Neural network evaluator callback
+        shutdown_handler: GracefulShutdown instance to check for Ctrl+C
+        progress_callback: Optional callable(live_stats_dict) called every
+            progress_interval seconds with live stats from C++ atomics
+        progress_interval: Seconds between progress updates (default 5.0)
+
+    Returns:
+        Result dict from generate_games() or partial results if interrupted
+    """
+    result = [None]
+    exception = [None]
+
+    def worker():
+        try:
+            result[0] = coordinator.generate_games(evaluator)
+        except Exception as e:
+            exception[0] = e
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    last_progress_time = time.time()
+
+    # Wait with periodic checks for shutdown and progress updates
+    while thread.is_alive():
+        thread.join(timeout=0.5)
+
+        # Push periodic progress updates by polling C++ atomic stats
+        now = time.time()
+        if progress_callback and (now - last_progress_time) >= progress_interval:
+            try:
+                live_stats = coordinator.get_live_stats()
+                if live_stats:
+                    progress_callback(live_stats)
+            except Exception:
+                pass  # Don't crash on monitoring errors
+            last_progress_time = now
+
+        if shutdown_handler.should_stop():
+            print("\n  Stopping self-play (Ctrl+C detected)...")
+            coordinator.stop()  # Signal C++ to stop
+            thread.join(timeout=5.0)  # Wait up to 5s for graceful stop
+            if thread.is_alive():
+                print("  Warning: Self-play thread did not stop gracefully")
+            break
+
+    if exception[0]:
+        raise exception[0]
+
+    return result[0]
+
+
 def run_parallel_selfplay(
     network: nn.Module,
     replay_buffer,
@@ -1260,6 +2018,15 @@ def run_parallel_selfplay(
     games_per_worker = max(1, args.games_per_iter // args.workers)
     actual_total_games = games_per_worker * args.workers
 
+    # Auto-calculate optimal queue capacity if not specified
+    # Formula: max(8192, workers * search_batch * 8)
+    # The *8 factor ensures capacity/4 > 2 * workers * search_batch,
+    # preventing pool reset starvation under heavy concurrent submission.
+    if args.queue_capacity > 0:
+        queue_capacity = args.queue_capacity
+    else:
+        queue_capacity = max(8192, args.workers * args.search_batch * 8)
+
     # Create parallel coordinator
     coordinator = alphazero_cpp.ParallelSelfPlayCoordinator(
         num_workers=args.workers,
@@ -1272,45 +2039,197 @@ def run_parallel_selfplay(
         dirichlet_epsilon=args.dirichlet_epsilon,
         temperature_moves=args.temperature_moves,
         gpu_timeout_ms=args.gpu_batch_timeout_ms,
-        worker_timeout_ms=args.worker_timeout_ms
+        worker_timeout_ms=args.worker_timeout_ms,
+        queue_capacity=queue_capacity,
+        root_eval_retries=args.root_eval_retries
     )
 
     # Set replay buffer so data is stored directly
     coordinator.set_replay_buffer(replay_buffer)
 
     print(f"  Parallel: {args.workers} workers × {games_per_worker} games = {actual_total_games} games")
-    print(f"  eval_batch={args.eval_batch}, gpu_timeout={args.gpu_batch_timeout_ms}ms")
+    print(f"  eval_batch={args.eval_batch}, gpu_timeout={args.gpu_batch_timeout_ms}ms, "
+          f"queue_capacity={queue_capacity}, root_eval_retries={args.root_eval_retries}")
+
+    # Push initial progress to live dashboard (show we're in self-play phase)
+    if live_dashboard is not None:
+        live_dashboard.push_progress(
+            iteration=metrics.iteration if metrics.iteration > 0 else 1,
+            games_completed=0,
+            total_games=actual_total_games,
+            moves=0, sims=0, evals=0,
+            elapsed_time=0.1,
+            buffer_size=replay_buffer.size(),
+            phase="selfplay"
+        )
+
+    # =========================================================================
+    # CUDA Graph Optimization for Inference
+    # =========================================================================
+    # CUDA Graphs capture a sequence of GPU operations and replay them with
+    # minimal CPU overhead. For fixed-batch-size inference, this eliminates
+    # kernel launch overhead (~5-10ms savings per batch).
+
+    gpu_batch_size = args.eval_batch
+    use_cuda_graph = (device == "cuda")
+    cuda_graph = None
+    static_obs = None
+    static_mask = None
+    static_policy_out = None
+    static_value_out = None
+
+    # Free fragmented GPU memory before allocating static CUDA Graph buffers
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    if use_cuda_graph:
+        try:
+            # Pre-allocate static GPU buffers for CUDA graph capture
+            static_obs = torch.zeros(gpu_batch_size, INPUT_CHANNELS, 8, 8, device='cuda')
+            static_mask = torch.zeros(gpu_batch_size, POLICY_SIZE, device='cuda')
+
+            # Warm-up pass (required before graph capture)
+            with autocast('cuda'):
+                static_policy_out, static_value_out = network(static_obs, static_mask)
+
+            # Capture CUDA graph
+            cuda_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cuda_graph):
+                with autocast('cuda'):
+                    static_policy_out, static_value_out = network(static_obs, static_mask)
+
+            print(f"  CUDA Graph captured for batch_size={gpu_batch_size}")
+        except Exception as e:
+            print(f"  CUDA Graph capture failed ({e}), falling back to eager mode")
+            use_cuda_graph = False
+            cuda_graph = None
 
     # Create evaluator callback that will be called from C++ GPU thread
-    # Signature: (observations, legal_masks, batch_size) -> (policies, values)
+    # Signature: (observations, legal_masks, batch_size, out_policies, out_values) -> None
+    # Observations arrive in NCHW format (C++ does the transpose now)
+    # Output buffers are writable numpy views over C++ memory (zero-copy)
     @torch.no_grad()
-    def neural_evaluator(obs_array: np.ndarray, mask_array: np.ndarray, batch_size: int):
+    def neural_evaluator(obs_array: np.ndarray, mask_array: np.ndarray, batch_size: int,
+                         out_policies: np.ndarray = None, out_values: np.ndarray = None):
         """Neural network evaluator callback for C++ coordinator."""
-        # Convert NHWC (batch, 8, 8, 122) to NCHW (batch, 122, 8, 8)
-        obs_nchw = np.transpose(obs_array, (0, 3, 1, 2))
-
-        # Move to GPU
-        obs_tensor = torch.from_numpy(obs_nchw).float().to(device)
-        mask_tensor = torch.from_numpy(mask_array).float().to(device)
-
-        # Forward pass with AMP if available
-        if device == "cuda":
-            with autocast('cuda'):
-                policies, values = network(obs_tensor, mask_tensor)
+        if use_cuda_graph and cuda_graph is not None and batch_size == gpu_batch_size:
+            # Fast path: replay CUDA graph (fixed batch size only)
+            static_obs.copy_(torch.from_numpy(obs_array[:batch_size]))
+            static_mask.copy_(torch.from_numpy(mask_array[:batch_size]))
+            cuda_graph.replay()
+            policies = static_policy_out
+            values = static_value_out
         else:
-            policies, values = network(obs_tensor, mask_tensor)
+            # Standard path: variable batch size or no CUDA graph
+            obs_tensor = torch.from_numpy(obs_array[:batch_size]).float().to(device)
+            mask_tensor = torch.from_numpy(mask_array[:batch_size]).float().to(device)
 
-        # Convert back to numpy for C++
-        policies_np = policies.cpu().numpy().astype(np.float32)
-        values_np = values.squeeze(-1).cpu().numpy().astype(np.float32)
+            if device == "cuda":
+                with autocast('cuda'):
+                    policies, values = network(obs_tensor, mask_tensor)
+            else:
+                policies, values = network(obs_tensor, mask_tensor)
 
-        return policies_np, values_np
+        # Write results directly to C++ output buffers (zero-copy)
+        policies_np = policies[:batch_size].cpu().numpy().astype(np.float32)
+        values_np = values[:batch_size].squeeze(-1).cpu().numpy().astype(np.float32)
 
-    # Run generation (blocking - all games complete)
-    result = coordinator.generate_games(neural_evaluator)
+        if out_policies is not None and out_values is not None:
+            np.copyto(out_policies[:batch_size], policies_np)
+            np.copyto(out_values[:batch_size], values_np)
+            return None
+        else:
+            # Legacy fallback
+            return policies_np, values_np
+
+    # Create progress callback that prints to console and optionally pushes to dashboard
+    last_console_report = [selfplay_start]
+    console_interval = getattr(args, 'progress_interval', 30.0)
+
+    def progress_cb(live_stats):
+        """Print live C++ stats to console and optionally push to dashboard."""
+        now = time.time()
+        elapsed = now - selfplay_start
+
+        # Console progress printing (always active)
+        if (now - last_console_report[0]) >= console_interval:
+            games = live_stats.get('games_completed', 0)
+            moves = live_stats.get('total_moves', 0)
+            sims = live_stats.get('total_simulations', 0)
+            evals = live_stats.get('total_nn_evals', 0)
+            failures = live_stats.get('mcts_failures', 0)
+            avg_batch = live_stats.get('avg_batch_size', 0.0)
+
+            moves_per_sec = moves / elapsed if elapsed > 0 else 0
+            sims_per_sec = sims / elapsed if elapsed > 0 else 0
+            evals_per_sec = evals / elapsed if elapsed > 0 else 0
+
+            # ETA calculation
+            if games > 0:
+                eta_sec = (actual_total_games - games) * (elapsed / games)
+                eta_str = format_duration(eta_sec)
+            else:
+                eta_str = "calculating..."
+
+            print(f"    \u23f1 {format_duration(elapsed)} | "
+                  f"Games: {games}/{actual_total_games} | "
+                  f"Moves: {moves_per_sec:.1f}/s | "
+                  f"Sims: {sims_per_sec:,.0f}/s | "
+                  f"NN: {evals_per_sec:,.0f}/s | "
+                  f"Batch: {avg_batch:.0f} | "
+                  f"Buffer: {replay_buffer.size():,} | "
+                  f"ETA: {eta_str}")
+
+            if failures > 0:
+                print(f"      Failures: {failures} MCTS timeouts")
+
+            last_console_report[0] = now
+
+        # Live dashboard push (if enabled)
+        if live_dashboard is not None:
+            live_dashboard.push_progress(
+                iteration=metrics.iteration if metrics.iteration > 0 else 1,
+                games_completed=live_stats.get('games_completed', 0),
+                total_games=actual_total_games,
+                moves=live_stats.get('total_moves', 0),
+                sims=live_stats.get('total_simulations', 0),
+                evals=live_stats.get('total_nn_evals', 0),
+                elapsed_time=max(elapsed, 0.1),
+                buffer_size=replay_buffer.size(),
+                phase="selfplay",
+                white_wins=live_stats.get('white_wins', 0),
+                black_wins=live_stats.get('black_wins', 0),
+                draws=live_stats.get('draws', 0),
+                timeout_evals=live_stats.get('mcts_failures', 0),
+                pool_exhaustion=live_stats.get('pool_exhaustion_count', 0),
+                submission_drops=live_stats.get('submission_drops', 0),
+                partial_subs=live_stats.get('partial_submissions', 0),
+                pool_resets=live_stats.get('pool_resets', 0),
+                pool_load=live_stats.get('pool_load', 0.0),
+                avg_batch_size=live_stats.get('avg_batch_size', 0.0),
+                batch_fill_ratio=live_stats.get('batch_fill_ratio', 0.0),
+                root_retries=live_stats.get('root_retries', 0),
+                stale_flushed=live_stats.get('stale_results_flushed', 0),
+            )
+
+    # Run generation with interrupt support (allows Ctrl+C to stop)
+    # Poll C++ stats every 5 seconds, console prints at progress_interval
+    result = run_parallel_selfplay_with_interrupt(
+        coordinator, neural_evaluator, shutdown_handler,
+        progress_callback=progress_cb,
+        progress_interval=5.0
+    )
 
     # Extract stats from result dict
-    if isinstance(result, dict):
+    if result is None:
+        # Interrupted before any results - return minimal metrics
+        metrics.selfplay_time = time.time() - selfplay_start
+        return metrics
+    elif isinstance(result, dict):
+        # Check for C++ thread errors surfaced from the coordinator
+        if result.get('cpp_error'):
+            print(f"\n  WARNING: C++ error during self-play: {result['cpp_error']}")
+
         metrics.num_games = result.get('games_completed', actual_total_games)
         metrics.total_moves = result.get('total_moves', 0)
         metrics.white_wins = result.get('white_wins', 0)
@@ -1327,6 +2246,8 @@ def run_parallel_selfplay(
         pool_resets = result.get('pool_resets', 0)
         avg_batch = result.get('avg_batch_size', 0)
         total_batches = result.get('total_batches', 0)
+        root_retries = result.get('root_retries', 0)
+        stale_flushed = result.get('stale_results_flushed', 0)
 
         # Calculate NN evals per move (should be ~51 for 800 sims, batch 64)
         nn_evals_per_move = metrics.total_nn_evals / max(metrics.total_moves, 1)
@@ -1335,13 +2256,15 @@ def run_parallel_selfplay(
         print(f"  Parallel stats: {metrics.total_nn_evals:,} NN evals ({nn_evals_per_move:.1f}/move), "
               f"avg_batch={avg_batch:.1f}, batches={total_batches:,}")
 
-        if mcts_failures > 0 or pool_exhaustion > 0 or partial_subs > 0:
-            print(f"  ⚠️  Pipeline issues: {mcts_failures} MCTS failures ({failure_rate:.1f}%), "
+        if mcts_failures > 0 or pool_exhaustion > 0 or partial_subs > 0 or root_retries > 0:
+            print(f"  Pipeline issues: {mcts_failures} MCTS failures ({failure_rate:.1f}%), "
                   f"pool_exhaustion={pool_exhaustion}, partial_subs={partial_subs}, "
                   f"drops={submission_drops}, resets={pool_resets}")
+            if root_retries > 0 or stale_flushed > 0:
+                print(f"  Retry stats: {root_retries} root retries, {stale_flushed} stale results flushed")
             if failure_rate > 10:
-                print(f"  ⚠️  HIGH FAILURE RATE - Consider increasing timeouts or queue capacity")
-    else:
+                print(f"  HIGH FAILURE RATE - Consider increasing --worker-timeout-ms or --queue-capacity")
+    elif isinstance(result, list):
         # result is a list of game trajectories (if no replay buffer set)
         metrics.num_games = len(result)
         for traj in result:
@@ -1357,10 +2280,13 @@ def run_parallel_selfplay(
     metrics.selfplay_time = time.time() - selfplay_start
     metrics.avg_game_length = metrics.total_moves / max(metrics.num_games, 1)
 
-    # Estimate NN evals (approximately sims_per_move * moves_per_game / batch_efficiency)
-    # This is approximate since we don't track exact evals in parallel mode
-    metrics.total_simulations = metrics.total_moves * args.simulations
-    metrics.total_nn_evals = metrics.total_simulations // (args.search_batch // 2)  # Rough estimate
+    # Only estimate if we don't have real stats from the C++ coordinator
+    # (parallel mode provides real stats, sequential mode needs estimates)
+    if metrics.total_simulations == 0:
+        metrics.total_simulations = metrics.total_moves * args.simulations
+    if metrics.total_nn_evals == 0:
+        # Rough estimate for sequential mode
+        metrics.total_nn_evals = metrics.total_simulations // (args.search_batch // 2)
 
     return metrics
 
@@ -1438,7 +2364,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Basic training
+    # Basic training (creates organized output directory)
     uv run python alphazero-cpp/scripts/train.py
 
     # Faster iteration (fewer games, more iterations)
@@ -1447,8 +2373,17 @@ Examples:
     # Higher quality (more simulations)
     uv run python alphazero-cpp/scripts/train.py --simulations 1600
 
-    # Resume training
-    uv run python alphazero-cpp/scripts/train.py --resume checkpoints/cpp_iter_50.pt
+    # Resume from checkpoint file
+    uv run python alphazero-cpp/scripts/train.py --resume checkpoints/f192-b15_2024-02-03_14-30-00/model_iter_005.pt
+
+    # Resume from run directory (finds latest checkpoint)
+    uv run python alphazero-cpp/scripts/train.py --resume checkpoints/f192-b15_2024-02-03_14-30-00
+
+    # Resume with buffer loading (buffer always saved; --load-buffer loads on startup)
+    uv run python alphazero-cpp/scripts/train.py --resume checkpoints/f192-b15_2024-02-03_14-30-00 --load-buffer
+
+    # Disable visualization and evaluation
+    uv run python alphazero-cpp/scripts/train.py --no-visualization --no-eval
         """
     )
 
@@ -1461,8 +2396,8 @@ Examples:
     # MCTS parameters
     parser.add_argument("--simulations", type=int, default=800,
                         help="MCTS simulations per move (default: 800)")
-    parser.add_argument("--search-batch", type=int, default=64,
-                        help="Leaves to evaluate per MCTS iteration (default: 64)")
+    parser.add_argument("--search-batch", type=int, default=1,
+                        help="Leaves per MCTS iteration per worker (default: 1, optimal for cross-game batching)")
     parser.add_argument("--c-puct", type=float, default=1.5,
                         help="MCTS exploration constant (default: 1.5)")
     parser.add_argument("--temperature-moves", type=int, default=30,
@@ -1481,6 +2416,10 @@ Examples:
                         help="Dirichlet noise weight for root exploration (default: 0.25)")
     parser.add_argument("--worker-timeout-ms", type=int, default=2000,
                         help="Worker wait time for NN results in ms (default: 2000)")
+    parser.add_argument("--queue-capacity", type=int, default=0,
+                        help="Eval queue capacity. 0=auto-calculate from workers*search_batch*8 (default: 0)")
+    parser.add_argument("--root-eval-retries", type=int, default=3,
+                        help="Max retries for root NN evaluation before falling back to uniform (default: 3)")
 
     # Network parameters
     parser.add_argument("--filters", type=int, default=192,
@@ -1502,29 +2441,37 @@ Examples:
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device: cuda or cpu (default: cuda)")
     parser.add_argument("--save-dir", type=str, default="checkpoints",
-                        help="Checkpoint directory (default: checkpoints)")
+                        help="Base checkpoint directory (default: checkpoints)")
     parser.add_argument("--resume", type=str, default=None,
-                        help="Resume from checkpoint path")
+                        help="Resume from checkpoint path (.pt file) or run directory")
     parser.add_argument("--save-interval", type=int, default=5,
                         help="Save checkpoint every N iterations (default: 5)")
-    parser.add_argument("--buffer-path", type=str, default="replay_buffer/latest.rpbf",
-                        help="Replay buffer persistence path (default: replay_buffer/latest.rpbf)")
     parser.add_argument("--progress-interval", type=float, default=30.0,
                         help="Print progress statistics every N seconds (default: 30)")
 
-    # Visual dashboard
-    parser.add_argument("--visual", action="store_true",
-                        help="Enable visual training dashboard (saves to HTML, requires plotly)")
+    # Buffer loading (buffer is always saved; this controls loading)
+    parser.add_argument("--load-buffer", nargs='?', const='', default=None,
+                        help="Load replay buffer on startup. No arg: check run dir. With path: load from path.")
+
+    # Visualization and evaluation
+    parser.add_argument("--no-visualization", action="store_true",
+                        help="Disable summary.html generation (default: enabled)")
+    parser.add_argument("--no-eval", action="store_true",
+                        help="Skip evaluation before checkpoint save (default: enabled)")
     parser.add_argument("--live", action="store_true",
                         help="Enable LIVE web dashboard with real-time updates (requires flask)")
-    parser.add_argument("--dashboard-dir", type=str, default="training_dashboard",
-                        help="Directory for dashboard files (default: training_dashboard)")
-    parser.add_argument("--dashboard-interval", type=int, default=1,
-                        help="Update dashboard every N iterations (default: 1)")
     parser.add_argument("--dashboard-port", type=int, default=5000,
                         help="Port for live dashboard server (default: 5000)")
 
     args = parser.parse_args()
+
+    # Install last-resort crash hook to ensure errors are visible
+    def _crash_hook(exc_type, exc_value, exc_tb):
+        import traceback
+        msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        sys.stderr.write(f"\n[FATAL CRASH]\n{msg}\n")
+        sys.stderr.flush()
+    sys.excepthook = _crash_hook
 
     # Validate parameter relationships for parallel mode
     if args.workers > 1:
@@ -1532,6 +2479,9 @@ Examples:
         if args.eval_batch < expected_batch:
             print(f"  WARNING: eval-batch ({args.eval_batch}) < search-batch*workers ({expected_batch})")
             print(f"           Consider increasing --eval-batch for better GPU utilization")
+        if args.queue_capacity == 0:
+            auto_cap = max(8192, args.workers * args.search_batch * 8)
+            print(f"  Auto queue_capacity: {auto_cap} (from {args.workers} workers * {args.search_batch} search_batch * 8)")
 
     # Handle device
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -1540,14 +2490,61 @@ Examples:
     else:
         device = args.device
 
-    # Create directories
-    os.makedirs(args.save_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(args.buffer_path) or ".", exist_ok=True)
+    # ==========================================================================
+    # Run Directory Setup
+    # ==========================================================================
+    # Determine run directory: either resume from existing or create new
+    start_iter = 0
+    metrics_history = {"iterations": [], "config": {}}
+    eval_history = {"evaluations": []}
+
+    if args.resume:
+        # Resume from existing run
+        run_dir, checkpoint_path = parse_resume_path(args.resume)
+        if not os.path.exists(run_dir):
+            print(f"ERROR: Run directory does not exist: {run_dir}")
+            sys.exit(1)
+        if checkpoint_path is None:
+            print(f"ERROR: No checkpoint found in run directory: {run_dir}")
+            sys.exit(1)
+        print(f"Resuming from: {run_dir}")
+
+        # Load existing metrics and evaluation history
+        metrics_history = load_metrics_history(run_dir)
+        eval_history = load_eval_history(run_dir)
+        if metrics_history["iterations"]:
+            print(f"  Loaded {len(metrics_history['iterations'])} previous iteration metrics")
+        if eval_history["evaluations"]:
+            print(f"  Loaded {len(eval_history['evaluations'])} previous evaluations")
+    else:
+        # Create new run directory
+        os.makedirs(args.save_dir, exist_ok=True)
+        run_dir = create_run_directory(args.save_dir, args.filters, args.blocks)
+        checkpoint_path = None
+        print(f"Created run directory: {run_dir}")
+
+    # Buffer path is inside run directory (if persistence enabled)
+    buffer_path = os.path.join(run_dir, "replay_buffer.rpbf")
+
+    # Store config in metrics history
+    config = {
+        "filters": args.filters,
+        "blocks": args.blocks,
+        "simulations": args.simulations,
+        "games_per_iter": args.games_per_iter,
+        "buffer_size": args.buffer_size,
+        "lr": args.lr,
+        "workers": args.workers,
+        "train_batch": args.train_batch,
+        "epochs": args.epochs,
+    }
+    metrics_history["config"] = config
 
     # Print configuration
     print("=" * 70)
     print("AlphaZero Training with C++ Backend")
     print("=" * 70)
+    print(f"Run directory:       {run_dir}")
     print(f"Device:              {device}" + (f" ({torch.cuda.get_device_name(0)})" if device == "cuda" else ""))
     print(f"Network:             {args.filters} filters x {args.blocks} blocks")
     print(f"Input channels:      {INPUT_CHANNELS}")
@@ -1558,8 +2555,10 @@ Examples:
         print(f"Self-play:           Sequential")
     print(f"Training:            {args.iterations} iters x {args.games_per_iter} games")
     print(f"                     train_batch={args.train_batch}, lr={args.lr}, epochs={args.epochs}")
-    print(f"Buffer:              {args.buffer_size} positions (path: {args.buffer_path})")
-    print(f"Checkpoints:         {args.save_dir}/cpp_iter_*.pt (every {args.save_interval} iters)")
+    print(f"Buffer:              {args.buffer_size} positions (always saved" + (", loading enabled)" if args.load_buffer is not None else ")"))
+    print(f"Checkpoints:         model_iter_*.pt (every {args.save_interval} iters)")
+    print(f"Visualization:       {'disabled' if args.no_visualization else 'summary.html'}")
+    print(f"Evaluation:          {'disabled' if args.no_eval else 'enabled (vs_random + endgame)'}")
     print(f"Progress reports:    Every {args.progress_interval:.0f} seconds")
     print("=" * 70)
 
@@ -1574,26 +2573,45 @@ Examples:
     optimizer = optim.Adam(network.parameters(), lr=args.lr, weight_decay=1e-4)
     scaler = GradScaler('cuda', enabled=(device == "cuda"))
 
-    # Create C++ ReplayBuffer with persistence
+    # Create C++ ReplayBuffer
     replay_buffer = alphazero_cpp.ReplayBuffer(capacity=args.buffer_size)
 
-    # Load existing replay buffer if available
-    if os.path.exists(args.buffer_path):
-        print(f"\nLoading replay buffer: {args.buffer_path}")
-        if replay_buffer.load(args.buffer_path):
-            stats = replay_buffer.get_stats()
-            print(f"Loaded {stats['size']:,} samples from previous runs")
+    # Load existing replay buffer if --load-buffer specified
+    if args.load_buffer is not None:
+        # Determine load path
+        if args.load_buffer == '':
+            # No path specified, use run directory
+            load_path = buffer_path
+        elif os.path.isdir(args.load_buffer):
+            # Directory specified, look for buffer file inside
+            load_path = os.path.join(args.load_buffer, "replay_buffer.rpbf")
         else:
-            print("Failed to load replay buffer, starting fresh")
+            # Direct file path specified
+            load_path = args.load_buffer
 
-    # Resume from checkpoint
-    start_iter = 0
-    if args.resume and os.path.exists(args.resume):
-        print(f"\nLoading checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        if os.path.exists(load_path):
+            print(f"\nLoading replay buffer: {load_path}")
+            if replay_buffer.load(load_path):
+                stats = replay_buffer.get_stats()
+                print(f"Loaded {stats['size']:,} samples from previous runs")
+            else:
+                print("Failed to load replay buffer, starting fresh")
+        else:
+            print(f"\nWARNING: Replay buffer not found at {load_path}, starting fresh")
+
+    # Resume from checkpoint (load model weights)
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"\nLoading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         network.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_iter = checkpoint.get('iteration', 0)
+
+        # Emergency checkpoints saved mid-iteration — re-run that iteration
+        is_emergency = checkpoint.get('emergency_save', False) or '_emergency' in os.path.basename(checkpoint_path)
+        if is_emergency:
+            start_iter = max(0, start_iter - 1)
+            print(f"Emergency checkpoint detected — will re-train iteration {start_iter + 1}")
         print(f"Resumed from iteration {start_iter}")
 
     # Create evaluator and self-play (only needed for sequential mode)
@@ -1609,18 +2627,15 @@ Examples:
             temperature_moves=args.temperature_moves
         )
 
-    # Metrics tracker
+    # Metrics tracker (for console output)
     metrics_tracker = MetricsTracker()
 
-    # Visual dashboard (optional - saves to HTML files)
+    # Visual dashboard (optional - saves to HTML files in run_dir)
+    # Note: The old dashboard is deprecated; we now generate summary.html directly
     dashboard = TrainingDashboard(
-        output_dir=args.dashboard_dir,
-        update_interval=args.dashboard_interval
+        output_dir=run_dir,  # Dashboard files go in run directory
+        update_interval=1
     )
-    if args.visual:
-        print("\nInitializing visual dashboard (HTML)...")
-        if dashboard.enable():
-            print(f"  Open in browser: file://{Path(args.dashboard_dir).absolute()}/dashboard.html")
 
     # Live dashboard (optional - real-time web server)
     live_dashboard = None
@@ -1651,7 +2666,7 @@ Examples:
         print(f"{'=' * 70}")
 
         # Save checkpoint
-        emergency_path = os.path.join(args.save_dir, f"cpp_iter_{iteration_num}_emergency.pt")
+        emergency_path = os.path.join(run_dir, f"model_iter_{iteration_num:03d}_emergency.pt")
         torch.save({
             'iteration': iteration_num,
             'model_state_dict': network.state_dict(),
@@ -1672,15 +2687,22 @@ Examples:
         }, emergency_path)
         print(f"  Saved checkpoint: {emergency_path}")
 
-        # Save replay buffer
-        if replay_buffer.save(args.buffer_path):
+        # Save replay buffer (always save for emergency recovery)
+        if replay_buffer.save(buffer_path):
             stats = replay_buffer.get_stats()
-            print(f"  Saved replay buffer: {args.buffer_path} ({stats['size']:,} samples)")
+            print(f"  Saved replay buffer: {buffer_path} ({stats['size']:,} samples)")
+
+        # Save metrics history
+        save_metrics_history(run_dir, metrics_history)
+        save_eval_history(run_dir, eval_history)
+        print(f"  Saved metrics to: {run_dir}")
 
         print(f"{'=' * 70}\n")
 
-    # Training loop
-    for iteration in range(start_iter, args.iterations):
+    # Training loop (wrapped in try/except to catch and report any crash)
+    iteration = start_iter  # Track for emergency save on crash
+    try:
+     for iteration in range(start_iter, args.iterations):
         iter_start = time.time()
         metrics = IterationMetrics(iteration=iteration + 1)
 
@@ -1788,13 +2810,28 @@ Examples:
 
         # Handle shutdown after self-play
         if shutdown_handler.should_stop():
-            emergency_save(iteration + 1, f"Shutdown after self-play ({games_completed} games)")
+            emergency_save(iteration + 1, f"Shutdown after self-play ({metrics.num_games} games)")
             break
 
         # Training phase
         min_samples = args.train_batch
         if replay_buffer.size() >= min_samples:
             print(f"  Training: {args.epochs} epochs on {replay_buffer.size()} positions...")
+
+            # Update live dashboard to show training phase
+            if live_dashboard is not None:
+                live_dashboard.push_progress(
+                    iteration=iteration + 1,
+                    games_completed=metrics.num_games,
+                    total_games=metrics.num_games,
+                    moves=metrics.total_moves,
+                    sims=metrics.total_simulations,
+                    evals=metrics.total_nn_evals,
+                    elapsed_time=metrics.selfplay_time,
+                    buffer_size=replay_buffer.size(),
+                    phase="training"
+                )
+
             train_start = time.time()
 
             train_metrics = train_iteration(
@@ -1817,13 +2854,59 @@ Examples:
         metrics.buffer_size = replay_buffer.size()
         metrics.total_time = time.time() - iter_start
 
-        # Track metrics
+        # Track metrics for console output
         metrics_tracker.add_iteration(metrics)
         metrics_tracker.print_iteration_summary(metrics, args)
 
-        # Update visual dashboard (HTML)
-        if args.visual:
-            dashboard.add_iteration(metrics)
+        # Append to metrics history (for JSON persistence)
+        metrics_history["iterations"].append({
+            "iteration": iteration + 1,
+            "timestamp": datetime.now().isoformat(),
+            "loss": metrics.loss,
+            "policy_loss": metrics.policy_loss,
+            "value_loss": metrics.value_loss,
+            "games": metrics.num_games,
+            "moves": metrics.total_moves,
+            "simulations": metrics.total_simulations,
+            "nn_evals": metrics.total_nn_evals,
+            "white_wins": metrics.white_wins,
+            "black_wins": metrics.black_wins,
+            "draws": metrics.draws,
+            "avg_game_length": metrics.avg_game_length,
+            "buffer_size": metrics.buffer_size,
+            "selfplay_time": metrics.selfplay_time,
+            "train_time": metrics.train_time,
+            "total_time": metrics.total_time,
+        })
+
+        # Run evaluation every iteration (unless disabled)
+        if not args.no_eval:
+            print(f"  Evaluating...")
+            eval_start = time.time()
+            eval_results = evaluate_checkpoint(network, device)
+            eval_time = time.time() - eval_start
+
+            # Display evaluation results
+            vs_random = eval_results.get("vs_random", {})
+            endgame = eval_results.get("endgame", {})
+            print(f"    vs Random: {vs_random.get('wins', 0)}/5 wins ({vs_random.get('win_rate', 0)*100:.0f}%)")
+            print(f"    Endgame:   {endgame.get('score', 0)}/{endgame.get('total', 5)} correct ({endgame.get('accuracy', 0)*100:.0f}%)")
+            print(f"    Eval time: {eval_time:.1f}s")
+
+            # Store in metrics for dashboard
+            metrics.eval_win_rate = vs_random.get('win_rate', 0.0)
+            metrics.eval_endgame_score = endgame.get('score', 0)
+            metrics.eval_endgame_total = endgame.get('total', 5)
+
+            # Append to evaluation history
+            eval_history["evaluations"].append({
+                "iteration": iteration + 1,
+                "timestamp": datetime.now().isoformat(),
+                **eval_results
+            })
+
+            # Save evaluation history
+            save_eval_history(run_dir, eval_history)
 
         # Update live dashboard (WebSocket)
         if live_dashboard is not None:
@@ -1831,8 +2914,11 @@ Examples:
 
         # Save checkpoint and replay buffer
         if (iteration + 1) % args.save_interval == 0 or iteration == args.iterations - 1:
+            is_final = (iteration == args.iterations - 1)
+
             # Save model checkpoint
-            checkpoint_path = os.path.join(args.save_dir, f"cpp_iter_{iteration + 1}.pt")
+            checkpoint_name = f"model_iter_{iteration + 1:03d}.pt"
+            checkpoint_save_path = os.path.join(run_dir, checkpoint_name)
             torch.save({
                 'iteration': iteration + 1,
                 'model_state_dict': network.state_dict(),
@@ -1849,26 +2935,61 @@ Examples:
                 },
                 'backend': 'cpp',
                 'version': '2.0'  # Updated version for new architecture
-            }, checkpoint_path)
-            print(f"  Saved checkpoint: {checkpoint_path}")
+            }, checkpoint_save_path)
+            print(f"  Saved checkpoint: {checkpoint_save_path}")
 
-            # Save replay buffer
-            if replay_buffer.save(args.buffer_path):
+            # 3. Save final checkpoint alias
+            if is_final:
+                final_path = os.path.join(run_dir, "model_final.pt")
+                torch.save({
+                    'iteration': iteration + 1,
+                    'model_state_dict': network.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'config': {
+                        'input_channels': INPUT_CHANNELS,
+                        'num_filters': args.filters,
+                        'num_blocks': args.blocks,
+                        'num_actions': POLICY_SIZE,
+                        'policy_filters': 2,
+                        'value_filters': 1,
+                        'value_hidden': 256,
+                        'simulations': args.simulations,
+                    },
+                    'backend': 'cpp',
+                    'version': '2.0'
+                }, final_path)
+                print(f"  Saved final checkpoint: {final_path}")
+
+            # 4. Save replay buffer (always save for potential resume)
+            if replay_buffer.save(buffer_path):
                 stats = replay_buffer.get_stats()
-                print(f"  Saved replay buffer: {args.buffer_path} ({stats['size']:,} samples)")
+                print(f"  Saved replay buffer: {buffer_path} ({stats['size']:,} samples)")
+
+            # 5. Save metrics history
+            save_metrics_history(run_dir, metrics_history)
+
+            # 6. Generate summary.html (unless disabled)
+            if not args.no_visualization:
+                summary_path = generate_summary_html(run_dir, metrics_history, eval_history, config)
+                print(f"  Updated summary: {summary_path}")
+
             print()
 
         # Check for shutdown after iteration complete
         if shutdown_handler.should_stop():
             emergency_save(iteration + 1, "Shutdown after training")
             break
+    except Exception as e:
+        import traceback
+        print(f"\n{'=' * 70}")
+        print(f"CRASH DETECTED: {type(e).__name__}: {e}")
+        print(f"{'=' * 70}")
+        traceback.print_exc()
+        emergency_save(iteration + 1, f"Crash: {e}")
+        raise
 
     # Uninstall handler
     shutdown_handler.uninstall_handler()
-
-    # Finalize dashboards
-    if args.visual:
-        dashboard.finalize()
 
     if live_dashboard is not None:
         live_dashboard.complete()
@@ -1880,17 +3001,22 @@ Examples:
         print("\n" + "=" * 70)
         print("TRAINING INTERRUPTED - Graceful shutdown complete")
         print("=" * 70)
-        print(f"  Resume with: --resume {args.save_dir}/cpp_iter_*_emergency.pt")
-        print(f"  Replay buffer saved: {args.buffer_path}")
+        print(f"  Run directory: {run_dir}")
+        print(f"  Resume with: --resume {run_dir}")
+        print(f"  Replay buffer saved: {buffer_path}")
     else:
         metrics_tracker.print_final_summary(args)
 
     if not shutdown_handler.should_stop():
-        print(f"\nFinal checkpoint: {args.save_dir}/cpp_iter_{args.iterations}.pt")
-        print(f"Replay buffer: {args.buffer_path}")
-        if args.visual:
-            print(f"Training dashboard: {Path(args.dashboard_dir).absolute()}/dashboard.html")
-        print("=" * 70)
+        print(f"\n{'=' * 70}")
+        print(f"TRAINING COMPLETE")
+        print(f"{'=' * 70}")
+        print(f"  Run directory:     {run_dir}")
+        print(f"  Final checkpoint:  {os.path.join(run_dir, 'model_final.pt')}")
+        if not args.no_visualization:
+            print(f"  Training summary:  {os.path.join(run_dir, 'summary.html')}")
+        print(f"  Replay buffer:     {buffer_path}")
+        print(f"{'=' * 70}")
 
 
 if __name__ == "__main__":
