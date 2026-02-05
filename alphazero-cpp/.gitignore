@@ -1,0 +1,9 @@
+# Build directories
+build/
+build2/
+
+# Compiled binaries (except scripts/ copy for portability)
+*.pyd
+*.so
+!scripts/*.pyd
+!scripts/*.so
