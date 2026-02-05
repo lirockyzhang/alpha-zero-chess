@@ -206,6 +206,7 @@ public:
     const QueueMetrics& get_metrics() const { return metrics_; }
     size_t pending_count() const;
     size_t max_batch_size() const { return max_batch_size_; }
+    size_t get_queue_capacity() const { return queue_capacity_; }
 
     // =========================================================================
     // Direct Memory Access (for zero-copy Python integration)

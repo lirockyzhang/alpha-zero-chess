@@ -490,6 +490,30 @@ public:
             ? static_cast<double>(drops) / static_cast<double>(total_leaves + drops)
             : 0.0;
 
+        // Queue status metrics for dashboard monitoring
+        const auto& eq = active_coordinator_->get_eval_queue();
+        size_t queue_cap = eq.get_queue_capacity();
+        size_t pending = eq.pending_count();  // Actual queue size (not write cursor)
+        result["queue_fill_pct"] = queue_cap > 0
+            ? (100.0 * pending) / static_cast<double>(queue_cap)
+            : 0.0;
+
+        // Per-unit averages (not cumulative totals)
+        uint64_t total_batches = qm.total_batches.load(std::memory_order_relaxed);
+        uint64_t total_submissions = qm.total_requests_submitted.load(std::memory_order_relaxed);
+        uint64_t gpu_wait_us = qm.gpu_wait_time_us.load(std::memory_order_relaxed);
+        uint64_t worker_wait_us = qm.worker_wait_time_us.load(std::memory_order_relaxed);
+
+        // Average GPU wait per batch (ms)
+        result["gpu_wait_ms"] = total_batches > 0
+            ? (gpu_wait_us / 1000.0) / static_cast<double>(total_batches)
+            : 0.0;
+        // Average worker wait per submission (ms)
+        result["worker_wait_ms"] = total_submissions > 0
+            ? (worker_wait_us / 1000.0) / static_cast<double>(total_submissions)
+            : 0.0;
+        result["buffer_swaps"] = total_batches;
+
         result["is_running"] = active_coordinator_->is_running();
         return result;
     }

@@ -206,6 +206,10 @@ public:
         return eval_queue_.get_metrics();
     }
 
+    const GlobalEvaluationQueue& get_eval_queue() const {
+        return eval_queue_;
+    }
+
     // Get detailed metrics for monitoring
     struct DetailedMetrics {
         // From stats

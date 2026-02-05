@@ -330,9 +330,9 @@ DASHBOARD_HTML = """
                 <h4>🔄 MCTS Performance</h4>
                 <div class="metric-row"><span>Sims/sec:</span><span id="sys-sims-sec">0</span></div>
                 <div class="metric-row"><span>Moves/sec:</span><span id="sys-moves-sec">0</span></div>
-                <div class="metric-row"><span>Drop Rate:</span><span id="pool-load">0%</span></div>
-                <div class="metric-row"><span>Root Retries:</span><span id="root-retries" class="ok">0</span></div>
-                <div class="metric-row"><span>Stale Flushed:</span><span id="stale-flushed" class="ok">0</span></div>
+                <div class="metric-row"><span>Queue Fill:</span><span id="queue-fill-pct">0%</span></div>
+                <div class="metric-row"><span>Worker Wait:</span><span id="worker-wait-ms">0ms</span></div>
+                <div class="metric-row"><span>Drop %:</span><span id="pool-load">0%</span></div>
                 <div class="metric-row"><span>Pipeline:</span><span id="pipeline-status">✅ Healthy</span></div>
             </div>
 
@@ -342,7 +342,10 @@ DASHBOARD_HTML = """
                 <div class="metric-row"><span>Avg Batch Size:</span><span id="avg-batch-size">0</span></div>
                 <div class="metric-row"><span>NN Evals/sec:</span><span id="sys-evals-sec">0</span></div>
                 <div class="metric-row"><span>Batch Fill:</span><span id="batch-fill-ratio">0%</span></div>
-                <div class="metric-row"><span>Timeout Evals:</span><span id="timeout-evals">0</span></div>
+                <div class="metric-row"><span>GPU Wait:</span><span id="gpu-wait-ms">0ms</span></div>
+                <div class="metric-row"><span>Avg Infer:</span><span id="avg-infer-time">0ms</span></div>
+                <div class="metric-row"><span>GPU Memory:</span><span id="gpu-memory">0 MB</span></div>
+                <div class="metric-row"><span>CUDA Graph:</span><span id="cuda-graph-status">--</span></div>
             </div>
 
             <!-- Iteration Progress Card -->
@@ -753,20 +756,29 @@ DASHBOARD_HTML = """
                     pipelineEl.style.color = '#e74c3c';
                 }
 
-                // Retry/stale metrics with conditional warning color
-                const retriesEl = document.getElementById('root-retries');
-                retriesEl.textContent = retries.toLocaleString();
-                retriesEl.className = retries > 0 ? 'warn' : 'ok';
-
-                const staleEl = document.getElementById('stale-flushed');
-                staleEl.textContent = staleFlushed.toLocaleString();
-                staleEl.className = staleFlushed > 0 ? 'warn' : 'ok';
-
                 // GPU Performance metrics
                 updateMetricWithHighlight('avg-batch-size', (data.avg_batch_size || 0).toFixed(1));
                 updateMetricWithHighlight('sys-evals-sec', Math.round(data.evals_per_sec).toLocaleString());
                 updateMetricWithHighlight('batch-fill-ratio', ((data.batch_fill_ratio || 0) * 100).toFixed(1) + '%');
-                updateMetricWithHighlight('timeout-evals', data.timeout_evals || 0);
+                updateMetricWithHighlight('gpu-wait-ms', (data.gpu_wait_ms || 0).toFixed(1) + 'ms');
+                updateMetricWithHighlight('avg-infer-time', (data.avg_infer_time_ms || 0).toFixed(2) + 'ms');
+                updateMetricWithHighlight('gpu-memory', (data.gpu_memory_used_mb || 0).toFixed(0) + ' MB');
+
+                // Queue status metrics (MCTS card)
+                updateMetricWithHighlight('queue-fill-pct', (data.queue_fill_pct || 0).toFixed(1) + '%');
+                updateMetricWithHighlight('worker-wait-ms', (data.worker_wait_ms || 0).toFixed(1) + 'ms');
+
+                // CUDA Graph status (aggregated like Pipeline)
+                const graphStatusEl = document.getElementById('cuda-graph-status');
+                if (data.cuda_graph_enabled) {
+                    const fires = (data.cuda_graph_fires || 0).toLocaleString();
+                    const rate = ((data.graph_fire_rate || 0) * 100).toFixed(1);
+                    graphStatusEl.textContent = `✅ ${fires} fires (${rate}% hit)`;
+                    graphStatusEl.style.color = '#2ecc71';
+                } else {
+                    graphStatusEl.textContent = '❌ Disabled';
+                    graphStatusEl.style.color = '#95a5a6';
+                }
 
                 // Iteration progress
                 updateMetricWithHighlight('live-games', `${data.games_completed}/${data.total_games}`);
@@ -980,7 +992,19 @@ class LiveDashboardServer:
                        avg_batch_size: float = 0.0,
                        batch_fill_ratio: float = 0.0,
                        root_retries: int = 0,
-                       stale_flushed: int = 0):
+                       stale_flushed: int = 0,
+                       # GPU metrics
+                       cuda_graph_fires: int = 0,
+                       eager_fires: int = 0,
+                       graph_fire_rate: float = 0.0,
+                       avg_infer_time_ms: float = 0.0,
+                       gpu_memory_used_mb: float = 0.0,
+                       cuda_graph_enabled: bool = False,
+                       # Queue status metrics
+                       queue_fill_pct: float = 0.0,
+                       gpu_wait_ms: float = 0.0,
+                       worker_wait_ms: float = 0.0,
+                       buffer_swaps: int = 0):
         """Push real-time progress updates during self-play (every few seconds).
 
         Args:
@@ -1054,6 +1078,18 @@ class LiveDashboardServer:
             'batch_fill_ratio': batch_fill_ratio,
             'root_retries': root_retries,
             'stale_flushed': stale_flushed,
+            # GPU metrics
+            'cuda_graph_fires': cuda_graph_fires,
+            'eager_fires': eager_fires,
+            'graph_fire_rate': graph_fire_rate,
+            'avg_infer_time_ms': avg_infer_time_ms,
+            'gpu_memory_used_mb': gpu_memory_used_mb,
+            'cuda_graph_enabled': cuda_graph_enabled,
+            # Queue status metrics
+            'queue_fill_pct': queue_fill_pct,
+            'gpu_wait_ms': gpu_wait_ms,
+            'worker_wait_ms': worker_wait_ms,
+            'buffer_swaps': buffer_swaps,
         }
 
         self.socketio.emit('progress', progress_data)

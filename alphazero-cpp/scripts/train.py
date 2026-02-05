@@ -2333,12 +2333,6 @@ def run_parallel_selfplay(
     print(f"  eval_batch={args.eval_batch}, gpu_timeout={args.gpu_batch_timeout_ms}ms, "
           f"queue_capacity={queue_capacity}, root_eval_retries={args.root_eval_retries}")
 
-    # Suggest optimal eval_batch based on worker count and search_batch
-    suggested_eval_batch = ((args.workers * args.search_batch + 31) // 32) * 32
-    if suggested_eval_batch != args.eval_batch and suggested_eval_batch > 0:
-        print(f"  💡 Hint: eval_batch={suggested_eval_batch} matches workers×search_batch "
-              f"({args.workers}×{args.search_batch}={args.workers * args.search_batch}, rounded to 32)")
-
     # Push initial progress to live dashboard (show we're in self-play phase)
     if live_dashboard is not None:
         live_dashboard.push_progress(
@@ -2392,6 +2386,13 @@ def run_parallel_selfplay(
             use_cuda_graph = False
             cuda_graph = None
 
+    # CUDA graph fire tracking (mutable dict for closure capture)
+    cuda_graph_stats = {
+        'graph_fires': 0,       # Times CUDA graph fast path was used
+        'eager_fires': 0,       # Times eager fallback was used
+        'total_infer_time_ms': 0.0,  # Cumulative inference time
+    }
+
     # Create evaluator callback that will be called from C++ GPU thread
     # Signature: (observations, legal_masks, batch_size, out_policies, out_values) -> None
     # Observations arrive in NCHW format (C++ does the transpose now)
@@ -2400,8 +2401,11 @@ def run_parallel_selfplay(
     def neural_evaluator(obs_array: np.ndarray, mask_array: np.ndarray, batch_size: int,
                          out_policies: np.ndarray = None, out_values: np.ndarray = None):
         """Neural network evaluator callback for C++ coordinator."""
+        infer_start = time.perf_counter()
+
         if use_cuda_graph and cuda_graph is not None and batch_size == gpu_batch_size:
             # Fast path: replay CUDA graph (fixed batch size only)
+            cuda_graph_stats['graph_fires'] += 1
             static_obs.copy_(torch.from_numpy(obs_array[:batch_size]))
             static_mask.copy_(torch.from_numpy(mask_array[:batch_size]))
             cuda_graph.replay()
@@ -2409,6 +2413,7 @@ def run_parallel_selfplay(
             values = static_value_out
         else:
             # Standard path: variable batch size or no CUDA graph
+            cuda_graph_stats['eager_fires'] += 1
             obs_tensor = torch.from_numpy(obs_array[:batch_size]).float().to(device)
             mask_tensor = torch.from_numpy(mask_array[:batch_size]).float().to(device)
 
@@ -2417,6 +2422,11 @@ def run_parallel_selfplay(
                     policies, values = network(obs_tensor, mask_tensor)
             else:
                 policies, values = network(obs_tensor, mask_tensor)
+
+        # Track inference time (synchronize for accurate timing on GPU)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        cuda_graph_stats['total_infer_time_ms'] += (time.perf_counter() - infer_start) * 1000
 
         # Write results directly to C++ output buffers (zero-copy)
         policies_np = policies[:batch_size].cpu().numpy().astype(np.float32)
@@ -2452,9 +2462,17 @@ def run_parallel_selfplay(
             sims_per_sec = sims / elapsed if elapsed > 0 else 0
             evals_per_sec = evals / elapsed if elapsed > 0 else 0
 
-            # ETA calculation
-            if games > 0:
-                eta_sec = (actual_total_games - games) * (elapsed / games)
+            # ETA calculation based on simulation throughput (NN-bounded)
+            # This is more stable than game-based ETA since game lengths vary widely
+            if evals > 0 and moves > 0 and games > 0:
+                avg_moves_per_game = moves / games
+                remaining_games = actual_total_games - games
+                estimated_remaining_moves = remaining_games * avg_moves_per_game
+                estimated_remaining_sims = estimated_remaining_moves * args.simulations
+                if sims_per_sec > 0:
+                    eta_sec = estimated_remaining_sims / sims_per_sec
+                else:
+                    eta_sec = remaining_games * (elapsed / games)  # fallback
                 eta_str = format_duration(eta_sec)
             else:
                 eta_str = "calculating..."
@@ -2475,6 +2493,12 @@ def run_parallel_selfplay(
 
         # Live dashboard push (if enabled)
         if live_dashboard is not None:
+            # Calculate GPU stats for dashboard
+            total_fires = cuda_graph_stats['graph_fires'] + cuda_graph_stats['eager_fires']
+            graph_fire_rate = cuda_graph_stats['graph_fires'] / total_fires if total_fires > 0 else 0.0
+            avg_infer_ms = cuda_graph_stats['total_infer_time_ms'] / total_fires if total_fires > 0 else 0.0
+            gpu_mem_mb = torch.cuda.memory_allocated() / (1024*1024) if device == "cuda" else 0.0
+
             live_dashboard.push_progress(
                 iteration=metrics.iteration,
                 games_completed=live_stats.get('games_completed', 0),
@@ -2498,6 +2522,18 @@ def run_parallel_selfplay(
                 batch_fill_ratio=live_stats.get('batch_fill_ratio', 0.0),
                 root_retries=live_stats.get('root_retries', 0),
                 stale_flushed=live_stats.get('stale_results_flushed', 0),
+                # GPU metrics
+                cuda_graph_fires=cuda_graph_stats['graph_fires'],
+                eager_fires=cuda_graph_stats['eager_fires'],
+                graph_fire_rate=graph_fire_rate,
+                avg_infer_time_ms=avg_infer_ms,
+                gpu_memory_used_mb=gpu_mem_mb,
+                cuda_graph_enabled=(use_cuda_graph and cuda_graph is not None),
+                # Queue status metrics
+                queue_fill_pct=live_stats.get('queue_fill_pct', 0.0),
+                gpu_wait_ms=live_stats.get('gpu_wait_ms', 0.0),
+                worker_wait_ms=live_stats.get('worker_wait_ms', 0.0),
+                buffer_swaps=live_stats.get('buffer_swaps', 0),
             )
 
     # Run generation with interrupt support (allows Ctrl+C to stop)
@@ -2694,8 +2730,8 @@ Examples:
     # Parallel self-play (automatically enabled when workers > 1)
     parser.add_argument("--workers", type=int, default=1,
                         help="Self-play workers. 1=sequential, >1=parallel with cross-game batching (default: 1)")
-    parser.add_argument("--eval-batch", type=int, default=512,
-                        help="Max positions per GPU call in parallel mode (default: 512)")
+    parser.add_argument("--eval-batch", type=int, default=None,
+                        help="Max positions per GPU call (default: workers × search-batch, rounded to 32)")
     parser.add_argument("--gpu-batch-timeout-ms", type=int, default=20,
                         help="GPU batch collection timeout in ms (default: 20)")
     parser.add_argument("--dirichlet-alpha", type=float, default=0.3,
@@ -2752,9 +2788,6 @@ Examples:
                         help="Enable LIVE web dashboard with real-time updates (requires flask)")
     parser.add_argument("--dashboard-port", type=int, default=5000,
                         help="Port for live dashboard server (default: 5000)")
-    parser.add_argument("--no-compile", action="store_true",
-                        help="Disable torch.compile() optimization (enabled by default on CUDA)")
-
     args = parser.parse_args()
 
     # Install last-resort crash hook to ensure errors are visible
@@ -2765,12 +2798,14 @@ Examples:
         sys.stderr.flush()
     sys.excepthook = _crash_hook
 
+    # Auto-compute eval-batch if not specified
+    if args.eval_batch is None:
+        args.eval_batch = ((args.workers * args.search_batch + 31) // 32) * 32
+        args.eval_batch = max(args.eval_batch, 32)  # Minimum 32
+        print(f"  Auto-setting eval-batch={args.eval_batch} (workers × search_batch, rounded to 32)")
+
     # Validate parameter relationships for parallel mode
     if args.workers > 1:
-        expected_batch = args.search_batch * args.workers
-        if args.eval_batch < expected_batch:
-            print(f"  WARNING: eval-batch ({args.eval_batch}) < search-batch*workers ({expected_batch})")
-            print(f"           Consider increasing --eval-batch for better GPU utilization")
         if args.queue_capacity == 0:
             auto_cap = max(8192, args.workers * args.search_batch * 8)
             print(f"  Auto queue_capacity: {auto_cap} (from {args.workers} workers * {args.search_batch} search_batch * 8)")
@@ -2935,48 +2970,6 @@ Examples:
             save_metrics_history(run_dir, metrics_history)
             save_eval_history(run_dir, eval_history)
 
-    # Apply torch.compile() for faster inference (PyTorch 2.0+)
-    # Must be done AFTER checkpoint loading (compiled models have different state_dict keys)
-    # Note: torch.compile requires Triton which only works on Linux
-    compile_enabled = False
-    compile_status = None
-    if device == "cuda":
-        if args.no_compile:
-            compile_status = "disabled (--no-compile)"
-        elif not hasattr(torch, 'compile'):
-            compile_status = "disabled (PyTorch < 2.0)"
-        elif sys.platform == "win32":
-            compile_status = "disabled (Triton not available on Windows)"
-        else:
-            try:
-                print("Applying torch.compile()...", end=" ", flush=True)
-                network = torch.compile(network, mode="reduce-overhead")
-                compile_enabled = True
-                compile_status = "enabled (reduce-overhead mode)"
-                print("done", flush=True)
-            except Exception as e:
-                compile_status = f"disabled ({e})"
-                print(f"skipped ({e})", flush=True)
-
-    # Print GPU optimization status
-    if device == "cuda":
-        print(f"cuDNN benchmark:     enabled", flush=True)
-        print(f"torch.compile:       {compile_status}", flush=True)
-
-    # Warmup forward pass to trigger JIT compilation (if torch.compile enabled)
-    if device == "cuda" and compile_enabled:
-        print("Warming up compiled model (first forward pass triggers JIT)...", flush=True)
-        import time as _time
-        _warmup_start = _time.time()
-        with torch.no_grad():
-            # Use eval_batch size for warmup since that's the main inference path
-            _warmup_batch = min(args.eval_batch, 64)  # At least 64 for meaningful compile
-            _dummy_input = torch.randn(_warmup_batch, INPUT_CHANNELS, 8, 8, device=device)
-            _ = network(_dummy_input)
-            torch.cuda.synchronize()
-        _warmup_elapsed = _time.time() - _warmup_start
-        print(f"  Warmup complete in {_warmup_elapsed:.1f}s", flush=True)
-
     # Create evaluator and self-play (only needed for sequential mode)
     evaluator = None
     self_play = None
@@ -3135,10 +3128,16 @@ Examples:
 
                 # Add game data to C++ ReplayBuffer
                 # Flatten observations for storage: (122, 8, 8) -> (7808,)
-                # result is from White's perspective; alternate sign per position
+                # Value must be from side-to-move perspective (matches C++ game.hpp::set_outcomes)
                 for i, (obs, policy) in enumerate(zip(obs_list, policy_list)):
                     obs_flat = obs.flatten().astype(np.float32)  # (7808,)
-                    value = result if i % 2 == 0 else -result
+                    white_to_move = (i % 2 == 0)
+                    if result > 0:  # White won
+                        value = 1.0 if white_to_move else -1.0
+                    elif result < 0:  # Black won
+                        value = -1.0 if white_to_move else 1.0
+                    else:  # Draw
+                        value = args.draw_score if white_to_move else -args.draw_score
                     replay_buffer.add_sample(obs_flat, policy.astype(np.float32), float(value))
 
                 metrics.total_moves += num_moves
