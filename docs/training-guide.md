@@ -358,6 +358,96 @@ Parallel (--workers 16):
 | `--root-eval-retries 3` | Max retries for root NN eval timeout before giving up |
 | `--worker-timeout-ms 2000` | Worker wait time for NN results (per attempt) |
 
+### Parameter Optimization
+
+This section explains how the parallel self-play parameters interact and how to size them for your hardware.
+
+#### The Golden Formula: `eval_batch = workers × search_batch`
+
+The three parameters `--eval-batch`, `--workers`, and `--search-batch` are fundamentally linked. Each worker submits `search_batch` leaves per MCTS round, so the maximum leaves arriving per round is `workers × search_batch`. Setting `eval_batch` equal to this product gives optimal GPU utilization:
+
+```
+eval_batch = workers × search_batch
+
+Too large  → batches never fill → GPU fires on timeout with wasted padding (underfilled)
+Too small  → excess leaves queue up → workers stall waiting for queue space
+Just right → batches fill quickly → GPU stays busy
+```
+
+| workers | search_batch | eval_batch | Fill ratio | Status |
+|---------|-------------|------------|------------|--------|
+| 16 | 16 | 256 | ~1.0 | Optimal |
+| 64 | 32 | 2048 | ~1.0 | Optimal |
+| 64 | 16 | 4096 | ~0.25 | Underfilled — reduce eval_batch to 1024 |
+| 128 | 32 | 2048 | ~2.0 | Queuing — increase eval_batch to 4096 |
+
+#### Sizing `eval-batch` by GPU Memory
+
+`eval_batch` is ultimately limited by GPU VRAM. Larger batches amortize kernel launch overhead but require more memory. Use these as starting points and adjust based on actual memory usage:
+
+| GPU VRAM | Small network | f192-b15 (default) |
+|----------|--------------|-------------------|
+| 8 GB | ≤ 2048 | 512–1024 |
+| 12 GB | ≤ 4096 | 1024–2048 |
+| 24 GB | ≤ 8192 | 2048–4096 |
+| 40 GB+ (A100) | ≤ 12288 | 4096–8192 |
+
+#### Simulations as a Hyperparameter
+
+`--simulations` controls how many MCTS nodes are expanded per move. It's the primary quality-vs-quantity knob:
+
+- **More simulations** → better move quality, slower games, fewer games/hour
+- **Fewer simulations** → noisier moves, faster games, more games/hour
+
+**Key insight for early training:** An untrained network benefits more from game quantity than move quality. Random weights produce random evaluations regardless of search depth, so more games (with fewer sims each) cover more of the state space faster. As the network improves, increase simulations to generate higher-quality training data.
+
+**Interaction with the parallel pipeline:** Higher simulations means each move takes longer, so workers submit leaves at a steadier rate (less bursty). Lower simulations means moves finish quickly and workers cycle rapidly, increasing queue pressure. If you lower simulations significantly, you may need to reduce `eval_batch` to maintain a good fill ratio.
+
+Typical progression: start with 400 sims, increase to 800–1600 as the network matures.
+
+#### Sizing `search-batch`: Simulations Matter
+
+`search_batch` controls how many leaves a single game's MCTS selects per GPU call. The key constraint is:
+
+> **`search_batch ≤ simulations / 4`** — the tree needs at least 4 rounds of expansion for convergence.
+
+Each batch applies virtual loss to all selected leaves. With too few rounds, the first batch greedily expands shallow nodes, then virtual loss forces the second batch onto suboptimal branches — and there aren't enough remaining rounds to recover.
+
+| simulations | Max search_batch | Recommended |
+|-------------|-----------------|-------------|
+| 100 | 25 | 16 |
+| 400 | 100 | 16–32 |
+| 800 | 200 | 16–32 |
+| 1600 | 400 | 16–32 |
+
+**Parallel mode (`workers > 1`):** Use 16–32. Cross-game batching via `eval_batch` handles GPU utilization, so `search_batch` primarily affects search quality.
+
+**Sequential mode (`workers = 1`):** Use 64–128. `search_batch` is the only batching mechanism, so it must be larger to keep the GPU busy. The constraint `sims ≥ 4 × search_batch` still applies.
+
+**Does changing simulations require changing search_batch?** Usually not in parallel mode — 16–32 is safe across the 400–1600 range. Only at very low sims (≤100) should you use 16 instead of 32.
+
+#### Sizing `workers`
+
+The optimal number of workers follows from the golden formula:
+
+```
+workers = eval_batch / search_batch
+```
+
+Additional considerations:
+- **Must not exceed `--games-per-iter`** — excess workers sit idle
+- **Diminishing returns** beyond `eval_batch / search_batch` — extra workers just queue up
+- **Memory:** each worker holds an MCTS tree in RAM (~50–200 MB depending on simulations and tree reuse), so 128 workers may need 10–25 GB of system RAM
+
+#### Quick Reference: Parallel Configurations
+
+| GPU | eval_batch | workers | search_batch | Notes |
+|-----|-----------|---------|-------------|-------|
+| 8 GB | 1024 | 64 | 16 | `64 × 16 = 1024` ✓ |
+| 12 GB | 2048 | 64 | 32 | `64 × 32 = 2048` ✓ |
+| 24 GB | 2048 | 64 | 32 | Room to increase eval_batch |
+| 40 GB (A100) | 4096 | 128 | 32 | `128 × 32 = 4096` ✓ |
+
 ### Training Settings
 
 | Parameter | Recommended | Notes |

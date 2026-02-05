@@ -978,7 +978,10 @@ ENDGAME_PUZZLES = [
 def play_vs_random(network: 'AlphaZeroNet', device: str, num_games: int = 5,
                    simulations: int = 800, search_batch: int = 32,
                    c_puct: float = 1.5) -> Dict[str, Any]:
-    """Play games against a random opponent to test basic competence.
+    """Play games against a random opponent to test basic competence (batched parallel).
+
+    Runs multiple games concurrently with batched GPU evaluation. All games share
+    a single evaluation loop that batches leaves across games for efficient GPU use.
 
     Args:
         network: The neural network to evaluate
@@ -992,99 +995,200 @@ def play_vs_random(network: 'AlphaZeroNet', device: str, num_games: int = 5,
         Dictionary with wins, losses, draws counts
     """
     network.eval()
-    results = {"wins": 0, "losses": 0, "draws": 0}
-
-    # Create a simple evaluator
     evaluator = BatchedEvaluator(network, device, use_amp=(device == "cuda"))
-    mcts = alphazero_cpp.BatchedMCTSSearch(
-        num_simulations=simulations,
-        batch_size=search_batch,
-        c_puct=c_puct
-    )
 
-    for game_idx in range(num_games):
-        print(f"      vs_random game {game_idx + 1}/{num_games}...", end=" ", flush=True)
-        board = chess.Board()
-        model_plays_white = (game_idx % 2 == 0)
-        move_count = 0
+    print(f"      vs_random: {num_games} games batched...", end=" ", flush=True)
+    start_time = time.time()
 
-        while not board.is_game_over() and move_count < 200:
-            is_model_turn = (board.turn == chess.WHITE) == model_plays_white
+    # Game state for each concurrent game
+    class GameState:
+        def __init__(self, game_idx: int):
+            self.game_idx = game_idx
+            self.board = chess.Board()
+            self.model_plays_white = (game_idx % 2 == 0)
+            self.move_count = 0
+            self.mcts = alphazero_cpp.BatchedMCTSSearch(
+                num_simulations=simulations,
+                batch_size=search_batch,
+                c_puct=c_puct
+            )
+            self.result = None  # "win", "loss", "draw" when game ends
+            self.needs_root_eval = False
+            self.in_mcts_search = False
+            # Cached data for current move
+            self.current_fen = None
+            self.current_obs_chw = None
+            self.current_mask = None
+            self.current_idx_to_move = {}
 
+    games = [GameState(i) for i in range(num_games)]
+    active_games = games.copy()
+
+    def prepare_move(g: GameState):
+        """Prepare a game for its next model move (encode position, build mask)."""
+        g.current_fen = g.board.fen()
+        obs = alphazero_cpp.encode_position(g.current_fen)
+        g.current_obs_chw = np.transpose(obs, (2, 0, 1))
+
+        legal_moves = list(g.board.legal_moves)
+        g.current_mask = np.zeros(POLICY_SIZE, dtype=np.float32)
+        g.current_idx_to_move = {}
+
+        for move in legal_moves:
+            idx = alphazero_cpp.move_to_index(move.uci(), g.current_fen)
+            if 0 <= idx < POLICY_SIZE:
+                g.current_mask[idx] = 1.0
+                g.current_idx_to_move[idx] = move
+
+        g.needs_root_eval = True
+        g.in_mcts_search = False
+
+    def finish_move(g: GameState):
+        """Select and play the best move after MCTS search completes."""
+        visit_counts = g.mcts.get_visit_counts()
+        policy = visit_counts * g.current_mask
+        if policy.sum() > 0:
+            action = np.argmax(policy)
+            if action in g.current_idx_to_move:
+                g.board.push(g.current_idx_to_move[action])
+            else:
+                g.board.push(random.choice(list(g.board.legal_moves)))
+        else:
+            legal = list(g.board.legal_moves)
+            if legal:
+                g.board.push(random.choice(legal))
+        g.mcts.reset()
+        g.move_count += 1
+        g.in_mcts_search = False
+        g.needs_root_eval = False
+
+    def check_game_over(g: GameState) -> bool:
+        """Check if game is over and set result."""
+        if g.board.is_game_over() or g.move_count >= 200:
+            result = g.board.result()
+            if result == "1-0":
+                g.result = "win" if g.model_plays_white else "loss"
+            elif result == "0-1":
+                g.result = "loss" if g.model_plays_white else "win"
+            else:
+                g.result = "draw"
+            return True
+        return False
+
+    # Initialize: advance to first model move for each game
+    for g in active_games:
+        # Play random moves until it's model's turn
+        while not check_game_over(g):
+            is_model_turn = (g.board.turn == chess.WHITE) == g.model_plays_white
             if is_model_turn:
-                # Model move using MCTS
-                fen = board.fen()
-                obs = alphazero_cpp.encode_position(fen)
-                obs_chw = np.transpose(obs, (2, 0, 1))
+                prepare_move(g)
+                break
+            else:
+                legal = list(g.board.legal_moves)
+                if legal:
+                    g.board.push(random.choice(legal))
+                g.move_count += 1
 
-                # Build legal mask
-                legal_moves = list(board.legal_moves)
-                mask = np.zeros(POLICY_SIZE, dtype=np.float32)
-                idx_to_move = {}
+    # Main loop: batch evaluations across all active games
+    while active_games:
+        # 1. Collect games needing root evaluation
+        root_eval_games = [g for g in active_games if g.needs_root_eval and g.result is None]
+        if root_eval_games:
+            obs_batch = np.stack([g.current_obs_chw for g in root_eval_games])
+            mask_batch = np.stack([g.current_mask for g in root_eval_games])
+            policies, values = evaluator.evaluate_batch(obs_batch, mask_batch)
 
-                for move in legal_moves:
-                    idx = alphazero_cpp.move_to_index(move.uci(), fen)
-                    if 0 <= idx < POLICY_SIZE:
-                        mask[idx] = 1.0
-                        idx_to_move[idx] = move
+            for i, g in enumerate(root_eval_games):
+                g.mcts.init_search(g.current_fen, policies[i].astype(np.float32), float(values[i]))
+                g.needs_root_eval = False
+                g.in_mcts_search = True
 
-                # Get root evaluation
-                root_policy, root_value = evaluator.evaluate(obs_chw, mask)
+        # 2. Collect leaves from all games in MCTS search
+        games_in_search = [g for g in active_games if g.in_mcts_search and g.result is None]
+        if not games_in_search:
+            # Remove finished games
+            active_games = [g for g in active_games if g.result is None]
+            continue
 
-                # Initialize and run MCTS
-                mcts.init_search(fen, root_policy.astype(np.float32), float(root_value))
+        all_obs = []
+        all_masks = []
+        leaf_counts = []  # Track how many leaves each game contributed
 
-                while not mcts.is_complete():
-                    num_leaves, obs_batch, mask_batch = mcts.collect_leaves()
-                    if num_leaves == 0:
+        for g in games_in_search:
+            if g.mcts.is_complete():
+                leaf_counts.append(0)
+                continue
+
+            num_leaves, obs_batch, mask_batch = g.mcts.collect_leaves()
+            if num_leaves == 0:
+                leaf_counts.append(0)
+                continue
+
+            obs_nchw = np.transpose(obs_batch[:num_leaves], (0, 3, 1, 2))
+            all_obs.append(obs_nchw)
+            all_masks.append(mask_batch[:num_leaves])
+            leaf_counts.append(num_leaves)
+
+        # 3. Batch evaluate all leaves together
+        if all_obs:
+            combined_obs = np.concatenate(all_obs, axis=0)
+            combined_masks = np.concatenate(all_masks, axis=0)
+            all_policies, all_values = evaluator.evaluate_batch(combined_obs, combined_masks)
+
+            # 4. Distribute results back to each game
+            offset = 0
+            leaf_idx = 0
+            for g in games_in_search:
+                count = leaf_counts[leaf_idx]
+                leaf_idx += 1
+                if count == 0:
+                    continue
+                game_policies = all_policies[offset:offset + count]
+                game_values = all_values[offset:offset + count]
+                g.mcts.update_leaves(game_policies.astype(np.float32), game_values.astype(np.float32))
+                offset += count
+
+        # 5. Check for completed searches and advance games
+        for g in games_in_search:
+            if g.mcts.is_complete():
+                finish_move(g)
+
+                # Check game over
+                if check_game_over(g):
+                    continue
+
+                # Play random opponent move(s) until model's turn again
+                while not check_game_over(g):
+                    is_model_turn = (g.board.turn == chess.WHITE) == g.model_plays_white
+                    if is_model_turn:
+                        prepare_move(g)
                         break
-
-                    obs_nchw = np.transpose(obs_batch[:num_leaves], (0, 3, 1, 2))
-                    masks = mask_batch[:num_leaves]
-                    leaf_policies, leaf_values = evaluator.evaluate_batch(obs_nchw, masks)
-                    mcts.update_leaves(leaf_policies.astype(np.float32), leaf_values.astype(np.float32))
-
-                # Select best move
-                visit_counts = mcts.get_visit_counts()
-                policy = visit_counts * mask
-                if policy.sum() > 0:
-                    action = np.argmax(policy)
-                    if action in idx_to_move:
-                        board.push(idx_to_move[action])
                     else:
-                        # Fallback
-                        board.push(random.choice(legal_moves))
-                else:
-                    board.push(random.choice(legal_moves))
+                        legal = list(g.board.legal_moves)
+                        if legal:
+                            g.board.push(random.choice(legal))
+                        g.move_count += 1
 
-                mcts.reset()
-            else:
-                # Random opponent move
-                legal_moves = list(board.legal_moves)
-                if legal_moves:
-                    board.push(random.choice(legal_moves))
+        # Remove finished games
+        active_games = [g for g in active_games if g.result is None]
 
-            move_count += 1
+    # Tally results
+    results = {"wins": 0, "losses": 0, "draws": 0}
+    result_chars = []
 
-        # Determine result
-        result = board.result()
-        if result == "1-0":
-            if model_plays_white:
-                results["wins"] += 1
-                print("win")
-            else:
-                results["losses"] += 1
-                print("loss")
-        elif result == "0-1":
-            if model_plays_white:
-                results["losses"] += 1
-                print("loss")
-            else:
-                results["wins"] += 1
-                print("win")
+    for g in sorted(games, key=lambda x: x.game_idx):
+        if g.result == "win":
+            results["wins"] += 1
+            result_chars.append("W")
+        elif g.result == "loss":
+            results["losses"] += 1
+            result_chars.append("L")
         else:
             results["draws"] += 1
-            print("draw")
+            result_chars.append("D")
+
+    elapsed = time.time() - start_time
+    print(f"{''.join(result_chars)} ({elapsed:.1f}s)")
 
     return results
 
@@ -1216,7 +1320,7 @@ def evaluate_checkpoint(network: 'AlphaZeroNet', device: str,
     Args:
         network: The neural network to evaluate
         device: CUDA or CPU device
-        simulations: MCTS simulations per move (should match training)
+        simulations: MCTS simulations per move (used for reference, capped for vs_random)
         search_batch: Leaf batch size for MCTS
         c_puct: MCTS exploration constant
 
@@ -1225,10 +1329,14 @@ def evaluate_checkpoint(network: 'AlphaZeroNet', device: str,
     """
     results = {}
 
-    # 1. vs Random Agent (5 games, same MCTS params as training)
+    # 1. vs Random Agent (5 games)
+    # Cap simulations at 400 for vs_random - if model can't beat random with 400 sims,
+    # 1600 sims won't help. This keeps evaluation fast (~15-30s instead of 2+ min).
+    eval_sims = min(simulations, 400)
+    eval_search_batch = min(search_batch, 32)  # Ensure enough MCTS rounds
     random_results = play_vs_random(network, device, num_games=5,
-                                    simulations=simulations,
-                                    search_batch=search_batch,
+                                    simulations=eval_sims,
+                                    search_batch=eval_search_batch,
                                     c_puct=c_puct)
     results["vs_random"] = {
         "wins": random_results["wins"],
@@ -1255,266 +1363,335 @@ def evaluate_checkpoint(network: 'AlphaZeroNet', device: str,
 # Summary HTML Generation
 # =============================================================================
 
-def generate_summary_html(
-    run_dir: str,
-    metrics_history: Dict[str, Any],
-    eval_history: Dict[str, Any],
-    config: Dict[str, Any]
-) -> str:
+def generate_summary_html(run_dir: str, config: Dict[str, Any]) -> str:
     """Generate a summary HTML file with training metrics and evaluation results.
+
+    The HTML uses fetch() to load data from training_metrics.json and
+    evaluation_results.json at view time, with embedded JSON fallback for
+    file:// protocol (where CORS blocks fetch).
 
     Args:
         run_dir: The run directory to save summary.html
-        metrics_history: Training metrics from training_metrics.json
-        eval_history: Evaluation results from evaluation_results.json
         config: Training configuration
 
     Returns:
         Path to the generated summary.html file
     """
-    iterations = metrics_history.get("iterations", [])
-    evaluations = eval_history.get("evaluations", [])
+    # Read JSON files from disk for the embedded fallback
+    metrics_history = load_metrics_history(run_dir)
+    eval_history = load_eval_history(run_dir)
 
-    # Calculate summary statistics
-    if iterations:
-        total_games = sum(m.get("games", 0) for m in iterations)
-        total_moves = sum(m.get("moves", 0) for m in iterations)
-        avg_loss = sum(m.get("loss", 0) for m in iterations) / len(iterations)
+    # Serialize full JSON objects for the fallback <script> block
+    metrics_json = json.dumps(metrics_history)
+    eval_json = json.dumps(eval_history)
 
-        # Loss improvement
-        if len(iterations) >= 2 and iterations[0].get("loss", 0) > 0:
-            first_loss = iterations[0]["loss"]
-            last_loss = iterations[-1]["loss"]
-            loss_improvement = (first_loss - last_loss) / first_loss * 100
-        else:
-            loss_improvement = 0
-    else:
-        total_games = total_moves = 0
-        avg_loss = loss_improvement = 0
+    # Config table rows (static, small — embedded directly by Python)
+    config_rows = (
+        f'<tr><td>Network</td><td>{config.get("filters", 192)} filters '
+        f'&times; {config.get("blocks", 15)} blocks</td></tr>\n'
+        f'                <tr><td>Simulations</td><td>{config.get("simulations", 800)} per move</td></tr>\n'
+        f'                <tr><td>Games/Iteration</td><td>{config.get("games_per_iter", 50)}</td></tr>\n'
+        f'                <tr><td>Buffer Size</td><td>{config.get("buffer_size", 100000):,}</td></tr>\n'
+        f'                <tr><td>Learning Rate</td><td>{config.get("lr", 0.001)}</td></tr>\n'
+        f'                <tr><td>Workers</td><td>{config.get("workers", 1)}</td></tr>'
+    )
 
-    # Build evaluation section
-    eval_section = ""
-    if evaluations:
-        latest_eval = evaluations[-1]
-        vs_random = latest_eval.get("vs_random", {})
-        endgame = latest_eval.get("endgame", {})
+    # Build the HTML with static shell + dynamic JS
+    # Note: The f-string only interpolates: run_dir basename, timestamp, config_rows,
+    # metrics_json, eval_json. All data extraction happens in JavaScript.
+    run_name = os.path.basename(run_dir)
+    generated_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        eval_section = f"""
-        <div class="card">
-            <h2>🎯 Latest Evaluation (Iteration {latest_eval.get('iteration', 'N/A')})</h2>
-            <div class="stat-grid">
-                <div class="stat">
-                    <div class="stat-value">{vs_random.get('win_rate', 0) * 100:.0f}%</div>
-                    <div class="stat-label">vs Random Win Rate ({vs_random.get('wins', 0)}/{5} games)</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value">{endgame.get('score', 0)}/{endgame.get('total', 5)}</div>
-                    <div class="stat-label">Endgame Puzzles Fully Correct</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value">{endgame.get('move_accuracy', 0) * 100:.0f}%</div>
-                    <div class="stat-label">Move Accuracy ({endgame.get('move_score', 0)}/{endgame.get('total_moves', 0)} moves)</div>
-                </div>
-            </div>
-        </div>
-        """
-
-        # Evaluation history chart data
-        eval_iters = [e.get("iteration", 0) for e in evaluations]
-        eval_win_rates = [e.get("vs_random", {}).get("win_rate", 0) * 100 for e in evaluations]
-        eval_endgame = [e.get("endgame", {}).get("move_accuracy", 0) * 100 for e in evaluations]
-
-    # Build loss chart data
-    loss_iters = [m.get("iteration", 0) for m in iterations]
-    losses = [m.get("loss", 0) for m in iterations]
-    policy_losses = [m.get("policy_loss", 0) for m in iterations]
-    value_losses = [m.get("value_loss", 0) for m in iterations]
-
-    html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-    <title>AlphaZero Training Summary</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        body {{ font-family: Arial, sans-serif; background: #f5f6fa; padding: 20px; margin: 0; }}
-        .container {{ max-width: 1200px; margin: 0 auto; }}
-        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; text-align: center; margin-bottom: 20px; }}
-        .card {{ background: white; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-        .card h2 {{ color: #2c3e50; margin-top: 0; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
-        .stat-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }}
-        .stat {{ background: #f8f9fa; padding: 15px; border-radius: 8px; text-align: center; }}
-        .stat-value {{ font-size: 24px; font-weight: bold; color: #3498db; }}
-        .stat-label {{ font-size: 12px; color: #7f8c8d; margin-top: 5px; }}
-        .chart-container {{ height: 300px; margin-top: 20px; }}
-        .config-table {{ width: 100%; border-collapse: collapse; }}
-        .config-table td {{ padding: 8px; border-bottom: 1px solid #eee; }}
-        .config-table td:first-child {{ font-weight: bold; color: #7f8c8d; width: 40%; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🎯 AlphaZero Training Summary</h1>
-            <p>Run: {os.path.basename(run_dir)}</p>
-            <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-        </div>
-
-        <div class="card">
-            <h2>📊 Overall Statistics</h2>
-            <div class="stat-grid">
-                <div class="stat">
-                    <div class="stat-value">{len(iterations)}</div>
-                    <div class="stat-label">Iterations Completed</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value">{total_games:,}</div>
-                    <div class="stat-label">Total Games Played</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value">{total_moves:,}</div>
-                    <div class="stat-label">Total Moves</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value">{loss_improvement:.1f}%</div>
-                    <div class="stat-label">Loss Improvement</div>
-                </div>
-            </div>
-        </div>
-
-        {eval_section}
-
-        <div class="card">
-            <h2>📉 Training Loss</h2>
-            <div class="chart-container">
-                <canvas id="lossChart"></canvas>
-            </div>
-        </div>
-
-        {"<div class='card'><h2>🎯 Evaluation Progress</h2><div class='chart-container'><canvas id='evalChart'></canvas></div></div>" if evaluations else ""}
-
-        <div class="card">
-            <h2>⚙️ Configuration</h2>
-            <table class="config-table">
-                <tr><td>Network</td><td>{config.get('filters', 192)} filters × {config.get('blocks', 15)} blocks</td></tr>
-                <tr><td>Simulations</td><td>{config.get('simulations', 800)} per move</td></tr>
-                <tr><td>Games/Iteration</td><td>{config.get('games_per_iter', 50)}</td></tr>
-                <tr><td>Buffer Size</td><td>{config.get('buffer_size', 100000):,}</td></tr>
-                <tr><td>Learning Rate</td><td>{config.get('lr', 0.001)}</td></tr>
-                <tr><td>Workers</td><td>{config.get('workers', 1)}</td></tr>
-            </table>
-        </div>
-
-        <p style="text-align: center; color: #7f8c8d; margin-top: 30px;">
-            Generated by AlphaZero Training Script
-        </p>
-    </div>
-
-    <script>
-        // Loss chart with dual Y-axis for policy/value loss
-        new Chart(document.getElementById('lossChart'), {{
-            type: 'line',
-            data: {{
-                labels: {loss_iters},
-                datasets: [
-                    {{
-                        label: 'Total Loss',
-                        data: {losses},
-                        borderColor: '#3498db',
-                        fill: false,
-                        tension: 0.1,
-                        yAxisID: 'y'
-                    }},
-                    {{
-                        label: 'Policy Loss',
-                        data: {policy_losses},
-                        borderColor: '#2ecc71',
-                        fill: false,
-                        tension: 0.1,
-                        yAxisID: 'y'
-                    }},
-                    {{
-                        label: 'Value Loss',
-                        data: {value_losses},
-                        borderColor: '#e74c3c',
-                        fill: false,
-                        tension: 0.1,
-                        yAxisID: 'y1'
-                    }}
-                ]
-            }},
-            options: {{
-                responsive: true,
-                maintainAspectRatio: false,
-                scales: {{
-                    y: {{
-                        type: 'linear',
-                        position: 'left',
-                        beginAtZero: false,
-                        title: {{ display: true, text: 'Total/Policy Loss' }}
-                    }},
-                    y1: {{
-                        type: 'linear',
-                        position: 'right',
-                        beginAtZero: false,
-                        title: {{ display: true, text: 'Value Loss' }},
-                        grid: {{ drawOnChartArea: false }}
-                    }}
-                }}
-            }}
-        }});
-
-        {"// Evaluation chart" if evaluations else ""}
-        {f'''
-        new Chart(document.getElementById('evalChart'), {{
-            type: 'line',
-            data: {{
-                labels: {eval_iters},
-                datasets: [
-                    {{
-                        label: 'vs Random Win Rate (%)',
-                        data: {eval_win_rates},
-                        borderColor: '#3498db',
-                        fill: false,
-                        tension: 0.1,
-                        yAxisID: 'y'
-                    }},
-                    {{
-                        label: 'Endgame Move Accuracy (%)',
-                        data: {eval_endgame},
-                        borderColor: '#2ecc71',
-                        fill: false,
-                        tension: 0.1,
-                        yAxisID: 'y1'
-                    }}
-                ]
-            }},
-            options: {{
-                responsive: true,
-                maintainAspectRatio: false,
-                scales: {{
-                    y: {{
-                        type: 'linear',
-                        position: 'left',
-                        min: 0,
-                        max: 100,
-                        title: {{ display: true, text: 'Win Rate (%)' }}
-                    }},
-                    y1: {{
-                        type: 'linear',
-                        position: 'right',
-                        min: 0,
-                        max: 100,
-                        title: {{ display: true, text: 'Endgame Move Accuracy (%)' }},
-                        grid: {{ drawOnChartArea: false }}
-                    }}
-                }}
-            }}
-        }});
-        ''' if evaluations else ""}
-    </script>
-</body>
-</html>
-"""
+    html_content = (
+        '<!DOCTYPE html>\n'
+        '<html>\n'
+        '<head>\n'
+        '    <title>AlphaZero Training Summary</title>\n'
+        '    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>\n'
+        '    <style>\n'
+        '        body { font-family: Arial, sans-serif; background: #f5f6fa; padding: 20px; margin: 0; }\n'
+        '        .container { max-width: 1200px; margin: 0 auto; }\n'
+        '        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; text-align: center; margin-bottom: 20px; }\n'
+        '        .card { background: white; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }\n'
+        '        .card h2 { color: #2c3e50; margin-top: 0; border-bottom: 2px solid #3498db; padding-bottom: 10px; }\n'
+        '        .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }\n'
+        '        .stat { background: #f8f9fa; padding: 15px; border-radius: 8px; text-align: center; }\n'
+        '        .stat-value { font-size: 24px; font-weight: bold; color: #3498db; }\n'
+        '        .stat-label { font-size: 12px; color: #7f8c8d; margin-top: 5px; }\n'
+        '        .chart-container { height: 300px; margin-top: 20px; }\n'
+        '        .config-table { width: 100%; border-collapse: collapse; }\n'
+        '        .config-table td { padding: 8px; border-bottom: 1px solid #eee; }\n'
+        '        .config-table td:first-child { font-weight: bold; color: #7f8c8d; width: 40%; }\n'
+        '        .hidden { display: none; }\n'
+        '    </style>\n'
+        '</head>\n'
+        '<body>\n'
+        '    <div class="container">\n'
+        '        <div class="header">\n'
+        '            <h1>&#127919; AlphaZero Training Summary</h1>\n'
+        f'            <p>Run: {run_name}</p>\n'
+        f'            <p id="generatedTime">Generated: {generated_time}</p>\n'
+        '        </div>\n'
+        '\n'
+        '        <div class="card">\n'
+        '            <h2>&#128202; Overall Statistics</h2>\n'
+        '            <div class="stat-grid">\n'
+        '                <div class="stat">\n'
+        '                    <div class="stat-value" id="statIterations">-</div>\n'
+        '                    <div class="stat-label">Iterations Completed</div>\n'
+        '                </div>\n'
+        '                <div class="stat">\n'
+        '                    <div class="stat-value" id="statGames">-</div>\n'
+        '                    <div class="stat-label">Total Games Played</div>\n'
+        '                </div>\n'
+        '                <div class="stat">\n'
+        '                    <div class="stat-value" id="statMoves">-</div>\n'
+        '                    <div class="stat-label">Total Moves</div>\n'
+        '                </div>\n'
+        '                <div class="stat">\n'
+        '                    <div class="stat-value" id="statImprovement">-</div>\n'
+        '                    <div class="stat-label">Loss Improvement</div>\n'
+        '                </div>\n'
+        '            </div>\n'
+        '        </div>\n'
+        '\n'
+        '        <div class="card hidden" id="evalCard">\n'
+        '            <h2>&#127919; Latest Evaluation (Iteration <span id="evalIter">-</span>)</h2>\n'
+        '            <div class="stat-grid">\n'
+        '                <div class="stat">\n'
+        '                    <div class="stat-value" id="evalWinRate">-</div>\n'
+        '                    <div class="stat-label" id="evalWinRateLabel">vs Random Win Rate</div>\n'
+        '                </div>\n'
+        '                <div class="stat">\n'
+        '                    <div class="stat-value" id="evalEndgame">-</div>\n'
+        '                    <div class="stat-label">Endgame Puzzles Fully Correct</div>\n'
+        '                </div>\n'
+        '                <div class="stat">\n'
+        '                    <div class="stat-value" id="evalMoveAcc">-</div>\n'
+        '                    <div class="stat-label" id="evalMoveAccLabel">Move Accuracy</div>\n'
+        '                </div>\n'
+        '            </div>\n'
+        '        </div>\n'
+        '\n'
+        '        <div class="card">\n'
+        '            <h2>&#128201; Training Loss</h2>\n'
+        '            <div class="chart-container">\n'
+        '                <canvas id="lossChart"></canvas>\n'
+        '            </div>\n'
+        '        </div>\n'
+        '\n'
+        '        <div class="card hidden" id="evalChartCard">\n'
+        '            <h2>&#127919; Evaluation Progress</h2>\n'
+        '            <div class="chart-container">\n'
+        '                <canvas id="evalChart"></canvas>\n'
+        '            </div>\n'
+        '        </div>\n'
+        '\n'
+        '        <div class="card">\n'
+        '            <h2>&#9881;&#65039; Configuration</h2>\n'
+        '            <table class="config-table">\n'
+        f'                {config_rows}\n'
+        '            </table>\n'
+        '        </div>\n'
+        '\n'
+        '        <p style="text-align: center; color: #7f8c8d; margin-top: 30px;">\n'
+        '            Generated by AlphaZero Training Script\n'
+        '        </p>\n'
+        '    </div>\n'
+        '\n'
+        '    <script>\n'
+        '        // Embedded fallback data (used when fetch() fails, e.g. file:// protocol)\n'
+        f'        const FALLBACK_METRICS = {metrics_json};\n'
+        f'        const FALLBACK_EVAL = {eval_json};\n'
+        '\n'
+        '        async function loadJSON(path, fallback) {\n'
+        '            try {\n'
+        '                const resp = await fetch(path);\n'
+        '                if (!resp.ok) throw new Error(resp.statusText);\n'
+        '                return await resp.json();\n'
+        '            } catch (e) {\n'
+        "                console.warn('fetch(' + path + ') failed, using embedded fallback:', e.message);\n"
+        '                return fallback;\n'
+        '            }\n'
+        '        }\n'
+        '\n'
+        '        function formatNumber(n) {\n'
+        '            return n.toLocaleString();\n'
+        '        }\n'
+        '\n'
+        '        function buildDashboard(metricsData, evalData) {\n'
+        '            const iterations = metricsData.iterations || [];\n'
+        '            const evaluations = evalData.evaluations || [];\n'
+        '\n'
+        '            // --- Overall statistics ---\n'
+        "            document.getElementById('statIterations').textContent = iterations.length;\n"
+        '\n'
+        '            if (iterations.length > 0) {\n'
+        '                const totalGames = iterations.reduce((s, m) => s + (m.games || 0), 0);\n'
+        '                const totalMoves = iterations.reduce((s, m) => s + (m.moves || 0), 0);\n'
+        "                document.getElementById('statGames').textContent = formatNumber(totalGames);\n"
+        "                document.getElementById('statMoves').textContent = formatNumber(totalMoves);\n"
+        '\n'
+        '                if (iterations.length >= 2 && iterations[0].loss > 0) {\n'
+        '                    const first = iterations[0].loss;\n'
+        '                    const last = iterations[iterations.length - 1].loss;\n'
+        '                    const improvement = (first - last) / first * 100;\n'
+        "                    document.getElementById('statImprovement').textContent = improvement.toFixed(1) + '%';\n"
+        '                } else {\n'
+        "                    document.getElementById('statImprovement').textContent = '0.0%';\n"
+        '                }\n'
+        '            } else {\n'
+        "                document.getElementById('statGames').textContent = '0';\n"
+        "                document.getElementById('statMoves').textContent = '0';\n"
+        "                document.getElementById('statImprovement').textContent = '0.0%';\n"
+        '            }\n'
+        '\n'
+        '            // --- Evaluation card ---\n'
+        '            if (evaluations.length > 0) {\n'
+        '                const latest = evaluations[evaluations.length - 1];\n'
+        '                const vsRandom = latest.vs_random || {};\n'
+        '                const endgame = latest.endgame || {};\n'
+        '\n'
+        "                document.getElementById('evalCard').classList.remove('hidden');\n"
+        "                document.getElementById('evalIter').textContent = latest.iteration || 'N/A';\n"
+        "                document.getElementById('evalWinRate').textContent =\n"
+        "                    ((vsRandom.win_rate || 0) * 100).toFixed(0) + '%';\n"
+        "                document.getElementById('evalWinRateLabel').textContent =\n"
+        "                    'vs Random Win Rate (' + (vsRandom.wins || 0) + '/5 games)';\n"
+        "                document.getElementById('evalEndgame').textContent =\n"
+        "                    (endgame.score || 0) + '/' + (endgame.total || 5);\n"
+        "                document.getElementById('evalMoveAcc').textContent =\n"
+        "                    ((endgame.move_accuracy || 0) * 100).toFixed(0) + '%';\n"
+        "                document.getElementById('evalMoveAccLabel').textContent =\n"
+        "                    'Move Accuracy (' + (endgame.move_score || 0) + '/' + (endgame.total_moves || 0) + ' moves)';\n"
+        '            }\n'
+        '\n'
+        '            // --- Loss chart ---\n'
+        '            const lossIters = iterations.map(m => m.iteration || 0);\n'
+        '            const losses = iterations.map(m => m.loss || 0);\n'
+        '            const policyLosses = iterations.map(m => m.policy_loss || 0);\n'
+        '            const valueLosses = iterations.map(m => m.value_loss || 0);\n'
+        '\n'
+        "            new Chart(document.getElementById('lossChart'), {\n"
+        "                type: 'line',\n"
+        '                data: {\n'
+        '                    labels: lossIters,\n'
+        '                    datasets: [\n'
+        '                        {\n'
+        "                            label: 'Total Loss',\n"
+        '                            data: losses,\n'
+        "                            borderColor: '#3498db',\n"
+        '                            fill: false,\n'
+        '                            tension: 0.1,\n'
+        "                            yAxisID: 'y'\n"
+        '                        },\n'
+        '                        {\n'
+        "                            label: 'Policy Loss',\n"
+        '                            data: policyLosses,\n'
+        "                            borderColor: '#2ecc71',\n"
+        '                            fill: false,\n'
+        '                            tension: 0.1,\n'
+        "                            yAxisID: 'y'\n"
+        '                        },\n'
+        '                        {\n'
+        "                            label: 'Value Loss',\n"
+        '                            data: valueLosses,\n'
+        "                            borderColor: '#e74c3c',\n"
+        '                            fill: false,\n'
+        '                            tension: 0.1,\n'
+        "                            yAxisID: 'y1'\n"
+        '                        }\n'
+        '                    ]\n'
+        '                },\n'
+        '                options: {\n'
+        '                    responsive: true,\n'
+        '                    maintainAspectRatio: false,\n'
+        '                    scales: {\n'
+        '                        y: {\n'
+        "                            type: 'linear',\n"
+        "                            position: 'left',\n"
+        '                            beginAtZero: false,\n'
+        "                            title: { display: true, text: 'Total/Policy Loss' }\n"
+        '                        },\n'
+        '                        y1: {\n'
+        "                            type: 'linear',\n"
+        "                            position: 'right',\n"
+        '                            beginAtZero: false,\n'
+        "                            title: { display: true, text: 'Value Loss' },\n"
+        '                            grid: { drawOnChartArea: false }\n'
+        '                        }\n'
+        '                    }\n'
+        '                }\n'
+        '            });\n'
+        '\n'
+        '            // --- Evaluation chart ---\n'
+        '            if (evaluations.length > 0) {\n'
+        "                document.getElementById('evalChartCard').classList.remove('hidden');\n"
+        '\n'
+        '                const evalIters = evaluations.map(e => e.iteration || 0);\n'
+        '                const winRates = evaluations.map(e => ((e.vs_random || {}).win_rate || 0) * 100);\n'
+        '                const moveAccs = evaluations.map(e => ((e.endgame || {}).move_accuracy || 0) * 100);\n'
+        '\n'
+        "                new Chart(document.getElementById('evalChart'), {\n"
+        "                    type: 'line',\n"
+        '                    data: {\n'
+        '                        labels: evalIters,\n'
+        '                        datasets: [\n'
+        '                            {\n'
+        "                                label: 'vs Random Win Rate (%)',\n"
+        '                                data: winRates,\n'
+        "                                borderColor: '#3498db',\n"
+        '                                fill: false,\n'
+        '                                tension: 0.1,\n'
+        "                                yAxisID: 'y'\n"
+        '                            },\n'
+        '                            {\n'
+        "                                label: 'Endgame Move Accuracy (%)',\n"
+        '                                data: moveAccs,\n'
+        "                                borderColor: '#2ecc71',\n"
+        '                                fill: false,\n'
+        '                                tension: 0.1,\n'
+        "                                yAxisID: 'y1'\n"
+        '                            }\n'
+        '                        ]\n'
+        '                    },\n'
+        '                    options: {\n'
+        '                        responsive: true,\n'
+        '                        maintainAspectRatio: false,\n'
+        '                        scales: {\n'
+        '                            y: {\n'
+        "                                type: 'linear',\n"
+        "                                position: 'left',\n"
+        '                                min: 0,\n'
+        '                                max: 100,\n'
+        "                                title: { display: true, text: 'Win Rate (%)' }\n"
+        '                            },\n'
+        '                            y1: {\n'
+        "                                type: 'linear',\n"
+        "                                position: 'right',\n"
+        '                                min: 0,\n'
+        '                                max: 100,\n'
+        "                                title: { display: true, text: 'Endgame Move Accuracy (%)' },\n"
+        '                                grid: { drawOnChartArea: false }\n'
+        '                            }\n'
+        '                        }\n'
+        '                    }\n'
+        '                });\n'
+        '            }\n'
+        '        }\n'
+        '\n'
+        '        // Load data and build dashboard\n'
+        '        (async function() {\n'
+        '            const [metricsData, evalData] = await Promise.all([\n'
+        "                loadJSON('./training_metrics.json', FALLBACK_METRICS),\n"
+        "                loadJSON('./evaluation_results.json', FALLBACK_EVAL)\n"
+        '            ]);\n'
+        '            buildDashboard(metricsData, evalData);\n'
+        '        })();\n'
+        '    </script>\n'
+        '</body>\n'
+        '</html>\n'
+    )
 
     summary_path = os.path.join(run_dir, "summary.html")
     with open(summary_path, "w", encoding="utf-8") as f:
@@ -1618,8 +1795,13 @@ def load_metrics_history(run_dir: str) -> Dict[str, Any]:
     """
     metrics_path = os.path.join(run_dir, "training_metrics.json")
     if os.path.exists(metrics_path):
-        with open(metrics_path, 'r') as f:
-            return json.load(f)
+        try:
+            with open(metrics_path, 'r') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except (json.JSONDecodeError, ValueError):
+            print(f"  Warning: Could not parse {metrics_path}, starting fresh")
     return {"iterations": [], "config": {}}
 
 
@@ -1646,8 +1828,13 @@ def load_eval_history(run_dir: str) -> Dict[str, Any]:
     """
     eval_path = os.path.join(run_dir, "evaluation_results.json")
     if os.path.exists(eval_path):
-        with open(eval_path, 'r') as f:
-            return json.load(f)
+        try:
+            with open(eval_path, 'r') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except (json.JSONDecodeError, ValueError):
+            print(f"  Warning: Could not parse {eval_path}, starting fresh")
     return {"evaluations": []}
 
 
@@ -1661,6 +1848,39 @@ def save_eval_history(run_dir: str, eval_history: Dict[str, Any]):
     eval_path = os.path.join(run_dir, "evaluation_results.json")
     with open(eval_path, 'w') as f:
         json.dump(eval_history, f, indent=2)
+
+
+def truncate_history_to_iteration(
+    metrics_history: Dict[str, Any],
+    eval_history: Dict[str, Any],
+    start_iter: int
+) -> tuple:
+    """Truncate metrics and eval history to discard records from reverted iterations.
+
+    When resuming from an earlier checkpoint (e.g., after model collapse),
+    records at or after start_iter are stale and should be removed so new
+    training data replaces them cleanly.
+
+    Args:
+        metrics_history: Training metrics dictionary (modified in-place)
+        eval_history: Evaluation history dictionary (modified in-place)
+        start_iter: First iteration that will be (re-)trained; records with
+                    iteration >= start_iter are discarded
+
+    Returns:
+        (metrics_removed_count, eval_removed_count)
+    """
+    old_metrics = metrics_history.get("iterations", [])
+    new_metrics = [r for r in old_metrics if r.get("iteration", 0) < start_iter]
+    metrics_removed = len(old_metrics) - len(new_metrics)
+    metrics_history["iterations"] = new_metrics
+
+    old_evals = eval_history.get("evaluations", [])
+    new_evals = [r for r in old_evals if r.get("iteration", 0) < start_iter]
+    eval_removed = len(old_evals) - len(new_evals)
+    eval_history["evaluations"] = new_evals
+
+    return metrics_removed, eval_removed
 
 
 # =============================================================================
@@ -2683,6 +2903,18 @@ Examples:
             print(f"Emergency checkpoint detected — will re-train iteration {start_iter + 1}")
         print(f"Resumed from iteration {start_iter}")
 
+        # Truncate metrics/eval history to discard records from reverted iterations
+        metrics_removed, eval_removed = truncate_history_to_iteration(
+            metrics_history, eval_history, start_iter
+        )
+        if metrics_removed > 0 or eval_removed > 0:
+            print(f"  Truncated metrics: kept {len(metrics_history['iterations'])} of "
+                  f"{len(metrics_history['iterations']) + metrics_removed} records")
+            print(f"  Truncated evals:   kept {len(eval_history['evaluations'])} of "
+                  f"{len(eval_history['evaluations']) + eval_removed} records")
+            save_metrics_history(run_dir, metrics_history)
+            save_eval_history(run_dir, eval_history)
+
     # Create evaluator and self-play (only needed for sequential mode)
     evaluator = None
     self_play = None
@@ -3049,7 +3281,7 @@ Examples:
 
             # 6. Generate summary.html (unless disabled)
             if not args.no_visualization:
-                summary_path = generate_summary_html(run_dir, metrics_history, eval_history, config)
+                summary_path = generate_summary_html(run_dir, config)
                 print(f"  Updated summary: {summary_path}")
 
             print()

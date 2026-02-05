@@ -233,11 +233,11 @@ DASHBOARD_HTML = """
             border-radius: 4px;
             background: rgba(255,255,255,0.1);
         }
-        .bottleneck-value.cpu-bound {
-            color: #e74c3c;
-            background: rgba(231, 76, 60, 0.2);
+        .bottleneck-value.underfilled {
+            color: #e67e22;
+            background: rgba(230, 126, 34, 0.2);
         }
-        .bottleneck-value.gpu-bound {
+        .bottleneck-value.gpu-saturated {
             color: #3498db;
             background: rgba(52, 152, 219, 0.2);
         }
@@ -778,17 +778,17 @@ DASHBOARD_HTML = """
                 document.getElementById('buffer-size').textContent = data.buffer_size.toLocaleString();
 
                 // Bottleneck indicator
-                // High fill ratio = batches full = GPU is the bottleneck (workers waiting)
-                // Low fill ratio = batches sparse = CPU is the bottleneck (GPU waiting)
+                // High fill ratio = batches full = GPU saturated (optimal utilization)
+                // Low fill ratio = batches sparse = eval_batch oversized for workers × search_batch
                 const bottleneckEl = document.getElementById('bottleneck-type');
                 const fillRatio = data.batch_fill_ratio || 0;
-                bottleneckEl.classList.remove('cpu-bound', 'gpu-bound', 'balanced');
+                bottleneckEl.classList.remove('underfilled', 'gpu-saturated', 'balanced');
                 if (fillRatio > 0.8) {
-                    bottleneckEl.textContent = 'GPU-bound (workers waiting)';
-                    bottleneckEl.classList.add('gpu-bound');
+                    bottleneckEl.textContent = 'GPU saturated (optimal utilization)';
+                    bottleneckEl.classList.add('gpu-saturated');
                 } else if (fillRatio < 0.3 && fillRatio > 0) {
-                    bottleneckEl.textContent = 'CPU-bound (GPU waiting)';
-                    bottleneckEl.classList.add('cpu-bound');
+                    bottleneckEl.textContent = 'Batch underfilled (reduce eval-batch or add workers)';
+                    bottleneckEl.classList.add('underfilled');
                 } else if (fillRatio > 0) {
                     bottleneckEl.textContent = 'Balanced';
                     bottleneckEl.classList.add('balanced');
@@ -1000,7 +1000,7 @@ class LiveDashboardServer:
             pool_resets: Times pool was reset
             pool_load: Drop rate (0.0 = healthy, >0 = drops occurring)
             avg_batch_size: Average GPU batch size
-            batch_fill_ratio: GPU batch fill ratio (>0.8 = GPU-bound, <0.3 = CPU-bound)
+            batch_fill_ratio: GPU batch fill ratio (>0.8 = GPU saturated, <0.3 = batch underfilled, 0.3-0.8 = balanced)
             root_retries: Times root eval was retried after timeout
             stale_flushed: Total stale results discarded via generation filtering
         """
