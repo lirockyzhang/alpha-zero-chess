@@ -2346,11 +2346,18 @@ def run_parallel_selfplay(
         )
 
     # =========================================================================
-    # CUDA Graph Optimization for Inference
+    # CUDA Graph Optimization for Inference (Multi-Bucket)
+    # =========================================================================
+    # CUDA Graph Optimization for Inference (Always Pad to Max)
     # =========================================================================
     # CUDA Graphs capture a sequence of GPU operations and replay them with
     # minimal CPU overhead. For fixed-batch-size inference, this eliminates
     # kernel launch overhead (~5-10ms savings per batch).
+    #
+    # Strategy: Single CUDA graph at eval_batch size. All incoming batches are
+    # padded to this size for consistent GPU utilization. Modern GPUs are so
+    # fast that the padding compute is negligible compared to the benefit of
+    # consistent large-batch GPU utilization and memory coalescing.
 
     gpu_batch_size = args.eval_batch
     use_cuda_graph = (device == "cuda")
@@ -2366,7 +2373,7 @@ def run_parallel_selfplay(
 
     if use_cuda_graph:
         try:
-            # Pre-allocate static GPU buffers for CUDA graph capture
+            # Pre-allocate static GPU buffers at full eval_batch size
             static_obs = torch.zeros(gpu_batch_size, INPUT_CHANNELS, 8, 8, device='cuda')
             static_mask = torch.zeros(gpu_batch_size, POLICY_SIZE, device='cuda')
 
@@ -2374,13 +2381,16 @@ def run_parallel_selfplay(
             with autocast('cuda'):
                 static_policy_out, static_value_out = network(static_obs, static_mask)
 
-            # Capture CUDA graph
+            # Capture CUDA graph at full batch size
             cuda_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(cuda_graph):
                 with autocast('cuda'):
                     static_policy_out, static_value_out = network(static_obs, static_mask)
 
-            print(f"  CUDA Graph captured for batch_size={gpu_batch_size}")
+            # Calculate buffer memory usage
+            bytes_per_pos = (INPUT_CHANNELS * 8 * 8 + POLICY_SIZE * 2 + 1) * 4  # obs + mask + policy + value
+            total_mem_mb = gpu_batch_size * bytes_per_pos / (1024 * 1024)
+            print(f"  CUDA Graph captured for batch_size={gpu_batch_size} (always-pad mode), buffer memory: {total_mem_mb:.1f} MB")
         except Exception as e:
             print(f"  CUDA Graph capture failed ({e}), falling back to eager mode")
             use_cuda_graph = False
@@ -2403,16 +2413,23 @@ def run_parallel_selfplay(
         """Neural network evaluator callback for C++ coordinator."""
         infer_start = time.perf_counter()
 
-        if use_cuda_graph and cuda_graph is not None and batch_size == gpu_batch_size:
-            # Fast path: replay CUDA graph (fixed batch size only)
+        if use_cuda_graph and cuda_graph is not None:
+            # Always use CUDA graph by padding to full batch size
             cuda_graph_stats['graph_fires'] += 1
-            static_obs.copy_(torch.from_numpy(obs_array[:batch_size]))
-            static_mask.copy_(torch.from_numpy(mask_array[:batch_size]))
+
+            # Copy actual data to beginning of static buffers
+            # Padding positions retain zeros (harmless - results ignored)
+            static_obs[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]))
+            static_mask[:batch_size].copy_(torch.from_numpy(mask_array[:batch_size]))
+
+            # Replay full-size graph (GPU efficiently processes entire batch)
             cuda_graph.replay()
-            policies = static_policy_out
-            values = static_value_out
+
+            # Extract only valid results (ignore padding)
+            policies = static_policy_out[:batch_size]
+            values = static_value_out[:batch_size]
         else:
-            # Standard path: variable batch size or no CUDA graph
+            # Fallback: eager inference (no CUDA graph)
             cuda_graph_stats['eager_fires'] += 1
             obs_tensor = torch.from_numpy(obs_array[:batch_size]).float().to(device)
             mask_tensor = torch.from_numpy(mask_array[:batch_size]).float().to(device)
@@ -3250,6 +3267,35 @@ Examples:
             "total_time": metrics.total_time,
         })
 
+        # Save checkpoint and training metrics BEFORE evaluation (at save_interval)
+        save_checkpoint_now = (iteration + 1) % args.save_interval == 0 or iteration == args.iterations - 1
+        if save_checkpoint_now:
+            # Save model checkpoint
+            checkpoint_name = f"model_iter_{iteration + 1:03d}.pt"
+            checkpoint_save_path = os.path.join(run_dir, checkpoint_name)
+            torch.save({
+                'iteration': iteration + 1,
+                'model_state_dict': network.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'config': {
+                    'input_channels': INPUT_CHANNELS,
+                    'num_filters': args.filters,
+                    'num_blocks': args.blocks,
+                    'num_actions': POLICY_SIZE,
+                    'policy_filters': 2,
+                    'value_filters': 1,
+                    'value_hidden': 256,
+                    'simulations': args.simulations,
+                },
+                'backend': 'cpp',
+                'version': '2.0'
+            }, checkpoint_save_path)
+            print(f"  Saved checkpoint: {checkpoint_save_path}")
+
+            # Save training metrics JSON
+            save_metrics_history(run_dir, metrics_history)
+            print(f"  Saved training metrics: {os.path.join(run_dir, 'training_metrics.json')}")
+
         # Run evaluation every iteration (unless disabled)
         if not args.no_eval:
             print(f"  Evaluating...")
@@ -3287,37 +3333,20 @@ Examples:
             # Save evaluation history
             save_eval_history(run_dir, eval_history)
 
+            # Generate summary.html after evaluation (at save_interval)
+            if save_checkpoint_now and not args.no_visualization:
+                summary_path = generate_summary_html(run_dir, config)
+                print(f"  Updated summary: {summary_path}")
+
         # Update live dashboard (WebSocket)
         if live_dashboard is not None:
             live_dashboard.push_metrics(metrics)
 
-        # Save checkpoint and replay buffer
-        if (iteration + 1) % args.save_interval == 0 or iteration == args.iterations - 1:
+        # Save final checkpoint and replay buffer (at save_interval)
+        if save_checkpoint_now:
             is_final = (iteration == args.iterations - 1)
 
-            # Save model checkpoint
-            checkpoint_name = f"model_iter_{iteration + 1:03d}.pt"
-            checkpoint_save_path = os.path.join(run_dir, checkpoint_name)
-            torch.save({
-                'iteration': iteration + 1,
-                'model_state_dict': network.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'config': {
-                    'input_channels': INPUT_CHANNELS,
-                    'num_filters': args.filters,
-                    'num_blocks': args.blocks,
-                    'num_actions': POLICY_SIZE,
-                    'policy_filters': 2,  # AlphaZero paper standard
-                    'value_filters': 1,
-                    'value_hidden': 256,  # AlphaZero paper standard
-                    'simulations': args.simulations,
-                },
-                'backend': 'cpp',
-                'version': '2.0'  # Updated version for new architecture
-            }, checkpoint_save_path)
-            print(f"  Saved checkpoint: {checkpoint_save_path}")
-
-            # 3. Save final checkpoint alias
+            # Save final checkpoint alias
             if is_final:
                 final_path = os.path.join(run_dir, "model_final.pt")
                 torch.save({
@@ -3339,18 +3368,10 @@ Examples:
                 }, final_path)
                 print(f"  Saved final checkpoint: {final_path}")
 
-            # 4. Save replay buffer (always save for potential resume)
+            # Save replay buffer (always save for potential resume)
             if replay_buffer.save(buffer_path):
                 stats = replay_buffer.get_stats()
                 print(f"  Saved replay buffer: {buffer_path} ({stats['size']:,} samples)")
-
-            # 5. Save metrics history
-            save_metrics_history(run_dir, metrics_history)
-
-            # 6. Generate summary.html (unless disabled)
-            if not args.no_visualization:
-                summary_path = generate_summary_html(run_dir, config)
-                print(f"  Updated summary: {summary_path}")
 
             print()
 

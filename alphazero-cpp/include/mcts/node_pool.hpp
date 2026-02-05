@@ -14,7 +14,7 @@ class NodePool {
 public:
     // Configuration
     static constexpr size_t NODES_PER_BLOCK = 16384;  // 16K nodes per block = 1MB
-    static constexpr size_t MAX_BLOCKS = 256;          // Max 256 blocks = 256MB
+    static constexpr size_t MAX_BLOCKS = 512;          // Max 512 blocks = 512MB per worker
 
     // Safety checks at compile time
     static_assert(NODES_PER_BLOCK * sizeof(Node) < (1ULL << 32),
