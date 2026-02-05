@@ -2269,6 +2269,7 @@ def run_parallel_selfplay(
     replay_buffer,
     device: str,
     args,
+    iteration: int,
     progress_callback=None,
     live_dashboard=None
 ) -> IterationMetrics:
@@ -2291,7 +2292,7 @@ def run_parallel_selfplay(
         IterationMetrics with self-play statistics
     """
     network.eval()
-    metrics = IterationMetrics(iteration=0)  # Will be set by caller
+    metrics = IterationMetrics(iteration=iteration)
     selfplay_start = time.time()
 
     # Calculate how many games per worker to match games_per_iter
@@ -2341,7 +2342,7 @@ def run_parallel_selfplay(
     # Push initial progress to live dashboard (show we're in self-play phase)
     if live_dashboard is not None:
         live_dashboard.push_progress(
-            iteration=metrics.iteration if metrics.iteration > 0 else 1,
+            iteration=metrics.iteration,
             games_completed=0,
             total_games=actual_total_games,
             moves=0, sims=0, evals=0,
@@ -2475,7 +2476,7 @@ def run_parallel_selfplay(
         # Live dashboard push (if enabled)
         if live_dashboard is not None:
             live_dashboard.push_progress(
-                iteration=metrics.iteration if metrics.iteration > 0 else 1,
+                iteration=metrics.iteration,
                 games_completed=live_stats.get('games_completed', 0),
                 total_games=actual_total_games,
                 moves=live_stats.get('total_moves', 0),
@@ -2751,6 +2752,8 @@ Examples:
                         help="Enable LIVE web dashboard with real-time updates (requires flask)")
     parser.add_argument("--dashboard-port", type=int, default=5000,
                         help="Port for live dashboard server (default: 5000)")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Disable torch.compile() optimization (enabled by default on CUDA)")
 
     args = parser.parse_args()
 
@@ -2778,6 +2781,11 @@ Examples:
         device = "cpu"
     else:
         device = args.device
+
+    # Enable cuDNN optimizations for faster convolutions
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
 
     # ==========================================================================
     # Run Directory Setup
@@ -2915,6 +2923,31 @@ Examples:
             save_metrics_history(run_dir, metrics_history)
             save_eval_history(run_dir, eval_history)
 
+    # Apply torch.compile() for faster inference (PyTorch 2.0+)
+    # Must be done AFTER checkpoint loading (compiled models have different state_dict keys)
+    # Note: torch.compile requires Triton which only works on Linux
+    compile_enabled = False
+    compile_status = None
+    if device == "cuda":
+        if args.no_compile:
+            compile_status = "disabled (--no-compile)"
+        elif not hasattr(torch, 'compile'):
+            compile_status = "disabled (PyTorch < 2.0)"
+        elif sys.platform == "win32":
+            compile_status = "disabled (Triton not available on Windows)"
+        else:
+            try:
+                network = torch.compile(network, mode="reduce-overhead")
+                compile_enabled = True
+                compile_status = "enabled (reduce-overhead mode)"
+            except Exception as e:
+                compile_status = f"disabled ({e})"
+
+    # Print GPU optimization status
+    if device == "cuda":
+        print(f"cuDNN benchmark:     enabled")
+        print(f"torch.compile:       {compile_status}")
+
     # Create evaluator and self-play (only needed for sequential mode)
     evaluator = None
     self_play = None
@@ -3028,6 +3061,7 @@ Examples:
                 replay_buffer=replay_buffer,
                 device=device,
                 args=args,
+                iteration=iteration + 1,  # 1-indexed for display
                 live_dashboard=live_dashboard
             )
             metrics.num_games = parallel_metrics.num_games
