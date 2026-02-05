@@ -2804,15 +2804,16 @@ Examples:
         if checkpoint_path is None:
             print(f"ERROR: No checkpoint found in run directory: {run_dir}")
             sys.exit(1)
-        print(f"Resuming from: {run_dir}")
+        print(f"Resuming from: {run_dir}", flush=True)
 
         # Load existing metrics and evaluation history
+        print("  Loading metrics history...", end=" ", flush=True)
         metrics_history = load_metrics_history(run_dir)
+        print(f"done ({len(metrics_history['iterations'])} iterations)", flush=True)
+
+        print("  Loading eval history...", end=" ", flush=True)
         eval_history = load_eval_history(run_dir)
-        if metrics_history["iterations"]:
-            print(f"  Loaded {len(metrics_history['iterations'])} previous iteration metrics")
-        if eval_history["evaluations"]:
-            print(f"  Loaded {len(eval_history['evaluations'])} previous evaluations")
+        print(f"done ({len(eval_history['evaluations'])} evaluations)", flush=True)
     else:
         # Create new run directory
         os.makedirs(args.save_dir, exist_ok=True)
@@ -2887,21 +2888,32 @@ Examples:
             load_path = args.load_buffer
 
         if os.path.exists(load_path):
-            print(f"\nLoading replay buffer: {load_path}")
+            file_size_mb = os.path.getsize(load_path) / (1024 * 1024)
+            print(f"\nLoading replay buffer: {load_path} ({file_size_mb:.1f} MB)...", flush=True)
+            import time as _time
+            _load_start = _time.time()
             if replay_buffer.load(load_path):
                 stats = replay_buffer.get_stats()
-                print(f"Loaded {stats['size']:,} samples from previous runs")
+                _load_elapsed = _time.time() - _load_start
+                print(f"  Loaded {stats['size']:,} samples in {_load_elapsed:.1f}s", flush=True)
             else:
-                print("Failed to load replay buffer, starting fresh")
+                print("  Failed to load replay buffer, starting fresh", flush=True)
         else:
-            print(f"\nWARNING: Replay buffer not found at {load_path}, starting fresh")
+            print(f"\nWARNING: Replay buffer not found at {load_path}, starting fresh", flush=True)
 
     # Resume from checkpoint (load model weights)
     if checkpoint_path and os.path.exists(checkpoint_path):
-        print(f"\nLoading checkpoint: {checkpoint_path}")
+        ckpt_size_mb = os.path.getsize(checkpoint_path) / (1024 * 1024)
+        print(f"\nLoading checkpoint: {checkpoint_path} ({ckpt_size_mb:.1f} MB)...", flush=True)
+        print("  Reading checkpoint file...", end=" ", flush=True)
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        print("done", flush=True)
+        print("  Loading model weights...", end=" ", flush=True)
         network.load_state_dict(checkpoint['model_state_dict'])
+        print("done", flush=True)
+        print("  Loading optimizer state...", end=" ", flush=True)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        print("done", flush=True)
         start_iter = checkpoint.get('iteration', 0)
 
         # Emergency checkpoints saved mid-iteration — re-run that iteration
@@ -2937,16 +2949,33 @@ Examples:
             compile_status = "disabled (Triton not available on Windows)"
         else:
             try:
+                print("Applying torch.compile()...", end=" ", flush=True)
                 network = torch.compile(network, mode="reduce-overhead")
                 compile_enabled = True
                 compile_status = "enabled (reduce-overhead mode)"
+                print("done", flush=True)
             except Exception as e:
                 compile_status = f"disabled ({e})"
+                print(f"skipped ({e})", flush=True)
 
     # Print GPU optimization status
     if device == "cuda":
-        print(f"cuDNN benchmark:     enabled")
-        print(f"torch.compile:       {compile_status}")
+        print(f"cuDNN benchmark:     enabled", flush=True)
+        print(f"torch.compile:       {compile_status}", flush=True)
+
+    # Warmup forward pass to trigger JIT compilation (if torch.compile enabled)
+    if device == "cuda" and compile_enabled:
+        print("Warming up compiled model (first forward pass triggers JIT)...", flush=True)
+        import time as _time
+        _warmup_start = _time.time()
+        with torch.no_grad():
+            # Use eval_batch size for warmup since that's the main inference path
+            _warmup_batch = min(args.eval_batch, 64)  # At least 64 for meaningful compile
+            _dummy_input = torch.randn(_warmup_batch, INPUT_CHANNELS, 8, 8, device=device)
+            _ = network(_dummy_input)
+            torch.cuda.synchronize()
+        _warmup_elapsed = _time.time() - _warmup_start
+        print(f"  Warmup complete in {_warmup_elapsed:.1f}s", flush=True)
 
     # Create evaluator and self-play (only needed for sequential mode)
     evaluator = None
@@ -2963,32 +2992,38 @@ Examples:
         )
 
     # Metrics tracker (for console output)
+    print("Initializing metrics tracker...", end=" ", flush=True)
     metrics_tracker = MetricsTracker()
+    print("done", flush=True)
 
     # Visual dashboard (optional - saves to HTML files in run_dir)
     # Note: The old dashboard is deprecated; we now generate summary.html directly
+    print("Initializing dashboard...", end=" ", flush=True)
     dashboard = TrainingDashboard(
         output_dir=run_dir,  # Dashboard files go in run directory
         update_interval=1
     )
+    print("done", flush=True)
 
     # Live dashboard (optional - real-time web server)
     live_dashboard = None
     if args.live:
-        print("\nInitializing LIVE dashboard server...")
+        print("\nInitializing LIVE dashboard server...", flush=True)
         try:
             from live_dashboard import LiveDashboardServer
             live_dashboard = LiveDashboardServer(port=args.dashboard_port)
             if live_dashboard.start(total_iterations=args.iterations, open_browser=True):
-                print(f"  Real-time updates via WebSocket")
+                print(f"  Real-time updates via WebSocket", flush=True)
             else:
                 live_dashboard = None
         except ImportError as e:
-            print(f"  WARNING: Could not import live dashboard: {e}")
-            print(f"  Install requirements: pip install flask flask-socketio")
+            print(f"  WARNING: Could not import live dashboard: {e}", flush=True)
+            print(f"  Install requirements: pip install flask flask-socketio", flush=True)
             live_dashboard = None
 
-    print("\nStarting training...\n")
+    print("\n" + "=" * 60, flush=True)
+    print("INITIALIZATION COMPLETE - Starting training...", flush=True)
+    print("=" * 60 + "\n", flush=True)
 
     # Install graceful shutdown handler
     shutdown_handler.install_handler()
