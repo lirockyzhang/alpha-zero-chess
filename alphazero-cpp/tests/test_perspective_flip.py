@@ -39,7 +39,6 @@ def test_white_queen_move():
     assert index < 56 * 64, f"e2e4 should be a queen move, got index={index}"
 
     print(f"[PASS] White queen move e2e4 encoded as index {index}")
-    return index
 
 def test_black_queen_move():
     """Test queen move encoding from Black's perspective."""
@@ -56,7 +55,6 @@ def test_black_queen_move():
     assert index < 56 * 64, f"e7e5 should be a queen move, got index={index}"
 
     print(f"[PASS] Black queen move e7e5 encoded as index {index}")
-    return index
 
 def test_white_knight_move():
     """Test knight move encoding from White's perspective."""
@@ -74,7 +72,6 @@ def test_white_knight_move():
         f"g1f3 should be a knight move, got index={index}"
 
     print(f"[PASS] White knight move g1f3 encoded as index {index}")
-    return index
 
 def test_black_knight_move():
     """Test knight move encoding from Black's perspective."""
@@ -92,7 +89,6 @@ def test_black_knight_move():
         f"g8f6 should be a knight move, got index={index}"
 
     print(f"[PASS] Black knight move g8f6 encoded as index {index}")
-    return index
 
 def test_white_underpromotion():
     """Test underpromotion encoding from White's perspective."""
@@ -110,7 +106,6 @@ def test_white_underpromotion():
         f"a7a8n should be an underpromotion, got index={index}"
 
     print(f"[PASS] White underpromotion a7a8n encoded as index {index}")
-    return index
 
 def test_black_underpromotion():
     """Test underpromotion encoding from Black's perspective."""
@@ -128,7 +123,6 @@ def test_black_underpromotion():
         f"a2a1n should be an underpromotion, got index={index}"
 
     print(f"[PASS] Black underpromotion a2a1n encoded as index {index}")
-    return index
 
 def test_symmetry():
     """Test that symmetric moves from White and Black perspectives have consistent encoding.

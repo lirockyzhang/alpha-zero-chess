@@ -1,5 +1,6 @@
 #include "../../include/selfplay/parallel_coordinator.hpp"
 #include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <random>
 
@@ -48,9 +49,15 @@ void ParallelSelfPlayCoordinator::start(NeuralEvaluatorFn evaluator) {
         return; // Already running
     }
 
-    // Reset state
+    // Reset state — allocate per-worker move tracking before reset() zeroes it
+    stats_.worker_current_moves = std::make_unique<std::atomic<int>[]>(config_.num_workers);
+    stats_.num_workers_allocated = config_.num_workers;
     stats_.reset();
     eval_queue_.reset();
+    {
+        std::lock_guard<std::mutex> lock(sample_game_mutex_);
+        has_sample_game_ = false;
+    }
     shutdown_.store(false, std::memory_order_release);
     running_.store(true, std::memory_order_release);
     workers_active_.store(0, std::memory_order_release);
@@ -118,13 +125,57 @@ void ParallelSelfPlayCoordinator::worker_thread_func(int worker_id) {
             // Play one game
             GameTrajectory trajectory = play_single_game(worker_id, node_pool);
 
+            // Store sample game (prefer decisive games over draws)
+            {
+                std::lock_guard<std::mutex> lock(sample_game_mutex_);
+                bool is_decisive = (trajectory.result == chess::GameResult::WIN ||
+                                    trajectory.result == chess::GameResult::LOSE);
+                bool current_is_draw = has_sample_game_ &&
+                    sample_game_.result == chess::GameResult::DRAW;
+                if (!has_sample_game_ || (current_is_draw && is_decisive)) {
+                    sample_game_.moves_uci = trajectory.moves_uci;
+                    sample_game_.result = trajectory.result;
+                    sample_game_.result_reason = trajectory.result_reason;
+                    sample_game_.num_moves = trajectory.num_moves;
+                    has_sample_game_ = true;
+                }
+            }
+
             // Add to replay buffer or completed queue
             if (replay_buffer_ != nullptr) {
-                for (const auto& state : trajectory.states) {
+                // Compute game-level metadata fields
+                uint8_t game_res = (trajectory.result == chess::GameResult::WIN) ? 0
+                                 : (trajectory.result == chess::GameResult::LOSE) ? 2 : 1;
+                uint8_t term;
+                switch (trajectory.result_reason) {
+                    case chess::GameResultReason::CHECKMATE:              term = 0; break;
+                    case chess::GameResultReason::STALEMATE:              term = 1; break;
+                    case chess::GameResultReason::THREEFOLD_REPETITION:   term = 2; break;
+                    case chess::GameResultReason::FIFTY_MOVE_RULE:        term = 3; break;
+                    case chess::GameResultReason::INSUFFICIENT_MATERIAL:  term = 4; break;
+                    default:                                             term = 255; break;
+                }
+                // NONE reason with draw result means max_moves reached
+                if (trajectory.result_reason == chess::GameResultReason::NONE &&
+                    trajectory.result == chess::GameResult::DRAW) {
+                    term = 5; // MAX_MOVES
+                }
+                uint16_t game_len = static_cast<uint16_t>(trajectory.states.size());
+
+                for (size_t i = 0; i < trajectory.states.size(); ++i) {
+                    const auto& state = trajectory.states[i];
+                    training::SampleMeta meta{
+                        replay_buffer_->current_iteration(),
+                        game_res, term,
+                        static_cast<uint16_t>(i), game_len
+                    };
                     replay_buffer_->add_sample(
                         state.observation,
                         state.policy,
-                        state.value
+                        state.value,
+                        state.mcts_wdl.data(),
+                        &state.soft_value,
+                        &meta
                     );
                 }
             } else {
@@ -168,7 +219,8 @@ void ParallelSelfPlayCoordinator::gpu_thread_func() {
     try {
         // Pre-allocate output buffers (reused across batches to avoid heap allocs)
         std::vector<float> policies(config_.gpu_batch_size * POLICY_SIZE);
-        std::vector<float> values(config_.gpu_batch_size);
+        std::vector<float> wdl(config_.gpu_batch_size * 3);    // WDL probabilities from NN
+        std::vector<float> values(config_.gpu_batch_size);      // Scalar values after WDL→value conversion
 
         while (!shutdown_.load(std::memory_order_acquire)) {
             float* obs_ptr = nullptr;
@@ -189,12 +241,21 @@ void ParallelSelfPlayCoordinator::gpu_thread_func() {
             }
 
             try {
-                // Call neural network evaluator (writes to pre-allocated buffers)
+                // Call neural network evaluator (writes WDL probs to wdl buffer)
                 evaluator_(obs_ptr, mask_ptr, batch_size,
-                           policies.data(), values.data());
+                           policies.data(), wdl.data());
 
-                // Distribute results to workers
-                eval_queue_.submit_results(policies.data(), values.data(), batch_size);
+                // Convert WDL probabilities to scalar values
+                // Risk adjustment happens at node level (q_value_risk), not here
+                for (int i = 0; i < batch_size; ++i) {
+                    float pw = wdl[i * 3 + 0];  // P(win)
+                    float pd = wdl[i * 3 + 1];  // P(draw)
+                    float pl = wdl[i * 3 + 2];  // P(loss)
+                    values[i] = mcts::wdl_to_value(pw, pd, pl);
+                }
+
+                // Distribute scalar results + WDL probs to workers
+                eval_queue_.submit_results(policies.data(), values.data(), batch_size, wdl.data());
             } catch (const std::exception& e) {
                 // Track error for debugging GPU thread issues
                 stats_.gpu_errors.fetch_add(1, std::memory_order_relaxed);
@@ -253,9 +314,34 @@ GameTrajectory ParallelSelfPlayCoordinator::play_single_game(
     std::vector<float> mask_buffer(config_.mcts_batch_size * encoding::MoveEncoder::POLICY_SIZE);
     std::vector<float> policy_buffer(config_.mcts_batch_size * encoding::MoveEncoder::POLICY_SIZE);
     std::vector<float> value_buffer(config_.mcts_batch_size);
+    std::vector<float> wdl_buffer(config_.mcts_batch_size * 3);  // WDL probs from eval queue
 
     // Random number generator for move selection
     std::mt19937 rng(std::random_device{}());
+
+    // Per-game asymmetric risk:
+    // One side plays with fixed config_.risk_beta, other samples from [min, max].
+    // Which side is "opponent" is chosen per-game (50/50) to avoid color bias.
+    float risk_white, risk_black;
+    bool is_asymmetric = false;
+    bool white_is_standard = true; // only meaningful when is_asymmetric=true
+    if (config_.opponent_risk_min < config_.opponent_risk_max) {
+        is_asymmetric = true;
+        std::uniform_real_distribution<float> risk_dist(config_.opponent_risk_min, config_.opponent_risk_max);
+        float opponent_risk = risk_dist(rng);
+        if (std::uniform_int_distribution<int>(0, 1)(rng)) {
+            risk_white = opponent_risk;
+            risk_black = config_.risk_beta;
+            white_is_standard = false;  // white plays as opponent
+        } else {
+            risk_white = config_.risk_beta;
+            risk_black = opponent_risk;
+            white_is_standard = true;   // white plays as standard
+        }
+    } else {
+        risk_white = config_.risk_beta;
+        risk_black = config_.risk_beta;
+    }
 
     // Check game over: isGameOver() returns pair<GameResultReason, GameResult>
     // Game is ongoing when reason is NONE
@@ -274,13 +360,23 @@ GameTrajectory ParallelSelfPlayCoordinator::play_single_game(
         search_config.c_puct = config_.c_puct;
         search_config.dirichlet_alpha = config_.dirichlet_alpha;
         search_config.dirichlet_epsilon = config_.dirichlet_epsilon;
-        search_config.draw_score = config_.draw_score;
+        search_config.risk_beta = (board.sideToMove() == chess::Color::WHITE)
+                                  ? risk_white : risk_black;
+        search_config.fpu_base = config_.fpu_base;
+        search_config.use_virtual_loss = (config_.mcts_batch_size > 1);
+
+        // Gumbel Top-k Sequential Halving config
+        search_config.use_gumbel = config_.use_gumbel;
+        search_config.gumbel_top_k = config_.gumbel_top_k;
+        search_config.gumbel_c_visit = config_.gumbel_c_visit;
+        search_config.gumbel_c_scale = config_.gumbel_c_scale;
 
         mcts::MCTSSearch search(pool, search_config);
 
         // Run MCTS
         run_mcts_search(worker_id, search, board, position_history,
-                        obs_buffer, mask_buffer, policy_buffer, value_buffer);
+                        obs_buffer, mask_buffer, policy_buffer, value_buffer,
+                        wdl_buffer);
 
         auto mcts_end = std::chrono::steady_clock::now();
         auto mcts_time = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -289,45 +385,159 @@ GameTrajectory ParallelSelfPlayCoordinator::play_single_game(
         stats_.total_simulations.fetch_add(search.get_simulations_completed(),
                                             std::memory_order_relaxed);
 
-        // Get visit counts as policy
-        std::vector<int32_t> visit_counts = search.get_visit_counts();
+        // Track tree depth from this move's search
+        {
+            int64_t depth_max = static_cast<int64_t>(search.get_max_depth());
+            int64_t depth_min = static_cast<int64_t>(search.get_min_depth());
 
-        // Convert to policy distribution
-        std::vector<float> policy(encoding::MoveEncoder::POLICY_SIZE, 0.0f);
-        int total_visits = 0;
-        for (int i = 0; i < encoding::MoveEncoder::POLICY_SIZE; ++i) {
-            total_visits += visit_counts[i];
+            if (depth_max > 0) {
+                // Atomic max (CAS strong, explicit int64_t)
+                int64_t cur = stats_.max_search_depth.load(std::memory_order_relaxed);
+                while (depth_max > cur &&
+                       !stats_.max_search_depth.compare_exchange_strong(
+                           cur, depth_max, std::memory_order_relaxed));
+
+                // Atomic min (CAS) — only if depth_min is valid (> 0)
+                if (depth_min > 0) {
+                    int64_t cur_min = stats_.min_search_depth.load(std::memory_order_relaxed);
+                    while (depth_min < cur_min &&
+                           !stats_.min_search_depth.compare_exchange_strong(
+                               cur_min, depth_min, std::memory_order_relaxed));
+                }
+
+                // Accumulate for average
+                stats_.total_max_depth.fetch_add(depth_max, std::memory_order_relaxed);
+                stats_.depth_sample_count.fetch_add(1, std::memory_order_relaxed);
+            }
         }
 
-        if (total_visits > 0) {
-            // Apply temperature
-            float temperature = (move_count < config_.temperature_moves) ? 1.0f : 0.0f;
+        // Get legal moves (needed for both paths)
+        chess::Movelist legal_moves;
+        chess::movegen::legalmoves(legal_moves, board);
 
-            if (temperature > 0.0f) {
-                // Softmax with temperature
-                float sum = 0.0f;
-                for (int i = 0; i < encoding::MoveEncoder::POLICY_SIZE; ++i) {
-                    if (visit_counts[i] > 0) {
-                        policy[i] = std::pow(static_cast<float>(visit_counts[i]), 1.0f / temperature);
-                        sum += policy[i];
+        // Policy extraction and move selection — Gumbel vs PUCT paths
+        std::vector<float> policy(encoding::MoveEncoder::POLICY_SIZE, 0.0f);
+        chess::Move selected_move;
+
+        if (config_.use_gumbel) {
+            // =========================================================
+            // Gumbel path: improved policy + SH winner / argmax
+            // =========================================================
+            policy = search.get_improved_policy();
+
+            // Check if policy is valid (non-zero sum)
+            float policy_sum = 0.0f;
+            for (float p : policy) policy_sum += p;
+
+            if (policy_sum < 1e-8f) {
+                // Gumbel search failed — fallback to random
+                stats_.mcts_failures.fetch_add(1, std::memory_order_relaxed);
+                if (!legal_moves.empty()) {
+                    std::uniform_int_distribution<size_t> dist(0, legal_moves.size() - 1);
+                    selected_move = legal_moves[dist(rng)];
+                }
+            } else if (move_count < config_.temperature_moves) {
+                // Stochastic: SH winner (valid sample from improved policy via Gumbel-Max)
+                selected_move = search.get_gumbel_action();
+            } else {
+                // Deterministic: argmax of improved policy
+                int best_idx = static_cast<int>(
+                    std::max_element(policy.begin(), policy.end()) - policy.begin());
+                bool found = false;
+                for (const auto& move : legal_moves) {
+                    int idx = encoding::MoveEncoder::move_to_index(move, board);
+                    if (idx == best_idx) {
+                        selected_move = move;
+                        found = true;
+                        break;
                     }
                 }
-                if (sum > 0) {
+                if (!found && !legal_moves.empty()) {
+                    selected_move = legal_moves[0];
+                }
+            }
+        } else {
+            // =========================================================
+            // PUCT path: visit-count policy + temperature sampling
+            // =========================================================
+            std::vector<int32_t> visit_counts = search.get_visit_counts();
+            int total_visits = 0;
+            for (int i = 0; i < encoding::MoveEncoder::POLICY_SIZE; ++i) {
+                total_visits += visit_counts[i];
+            }
+
+            if (total_visits > 0) {
+                float temperature = (move_count < config_.temperature_moves) ? 1.0f : 0.0f;
+
+                if (temperature > 0.0f) {
+                    float sum = 0.0f;
                     for (int i = 0; i < encoding::MoveEncoder::POLICY_SIZE; ++i) {
-                        policy[i] /= sum;
+                        if (visit_counts[i] > 0) {
+                            policy[i] = std::pow(static_cast<float>(visit_counts[i]), 1.0f / temperature);
+                            sum += policy[i];
+                        }
+                    }
+                    if (sum > 0) {
+                        for (int i = 0; i < encoding::MoveEncoder::POLICY_SIZE; ++i) {
+                            policy[i] /= sum;
+                        }
+                    }
+                } else {
+                    int best_idx = 0;
+                    int best_visits = 0;
+                    for (int i = 0; i < encoding::MoveEncoder::POLICY_SIZE; ++i) {
+                        if (visit_counts[i] > best_visits) {
+                            best_visits = visit_counts[i];
+                            best_idx = i;
+                        }
+                    }
+                    policy[best_idx] = 1.0f;
+                }
+            }
+
+            if (total_visits == 0) {
+                stats_.mcts_failures.fetch_add(1, std::memory_order_relaxed);
+                if (!legal_moves.empty()) {
+                    std::uniform_int_distribution<size_t> dist(0, legal_moves.size() - 1);
+                    selected_move = legal_moves[dist(rng)];
+                }
+            } else if (move_count < config_.temperature_moves) {
+                std::discrete_distribution<int> dist(policy.begin(), policy.end());
+                int move_idx = dist(rng);
+                bool found = false;
+                for (const auto& move : legal_moves) {
+                    int idx = encoding::MoveEncoder::move_to_index(move, board);
+                    if (idx == move_idx) {
+                        selected_move = move;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found && !legal_moves.empty()) {
+                    int best_visits = -1;
+                    for (const auto& move : legal_moves) {
+                        int idx = encoding::MoveEncoder::move_to_index(move, board);
+                        if (idx >= 0 && visit_counts[idx] > best_visits) {
+                            best_visits = visit_counts[idx];
+                            selected_move = move;
+                        }
+                    }
+                    if (best_visits < 0) {
+                        selected_move = legal_moves[0];
                     }
                 }
             } else {
-                // Greedy (argmax)
-                int best_idx = 0;
-                int best_visits = 0;
-                for (int i = 0; i < encoding::MoveEncoder::POLICY_SIZE; ++i) {
-                    if (visit_counts[i] > best_visits) {
-                        best_visits = visit_counts[i];
-                        best_idx = i;
+                int best_visits = -1;
+                for (const auto& move : legal_moves) {
+                    int idx = encoding::MoveEncoder::move_to_index(move, board);
+                    if (idx >= 0 && visit_counts[idx] > best_visits) {
+                        best_visits = visit_counts[idx];
+                        selected_move = move;
                     }
                 }
-                policy[best_idx] = 1.0f;
+                if (best_visits < 0 && !legal_moves.empty()) {
+                    selected_move = legal_moves[0];
+                }
             }
         }
 
@@ -336,69 +546,14 @@ GameTrajectory ParallelSelfPlayCoordinator::play_single_game(
         std::vector<chess::Board> history_vec(position_history.begin(), position_history.end());
         encoding::PositionEncoder::encode_to_buffer(board, state_obs.data(), history_vec);
 
-        // Add to trajectory
-        trajectory.add_state(state_obs, policy);
+        // Compute risk-adjusted root value (LogSumExp diagnostic) if risk_beta != 0
+        float move_risk_beta = (board.sideToMove() == chess::Color::WHITE)
+                               ? risk_white : risk_black;
+        float soft_val = (move_risk_beta != 0.0f)
+            ? search.get_root_risk_value(move_risk_beta) : 0.0f;
 
-        // Select move
-        chess::Move selected_move;
-        // Get legal moves
-        chess::Movelist legal_moves;
-        chess::movegen::legalmoves(legal_moves, board);
-
-        // Handle case where MCTS failed or returned no visits
-        if (total_visits == 0) {
-            // MCTS failed - track and select a random legal move
-            stats_.mcts_failures.fetch_add(1, std::memory_order_relaxed);
-            if (!legal_moves.empty()) {
-                std::uniform_int_distribution<size_t> dist(0, legal_moves.size() - 1);
-                selected_move = legal_moves[dist(rng)];
-            }
-        } else if (move_count < config_.temperature_moves) {
-            // Sample from policy using temperature
-            std::discrete_distribution<int> dist(policy.begin(), policy.end());
-            int move_idx = dist(rng);
-
-            // Convert index to move
-            bool found = false;
-            for (const auto& move : legal_moves) {
-                int idx = encoding::MoveEncoder::move_to_index(move, board);
-                if (idx == move_idx) {
-                    selected_move = move;
-                    found = true;
-                    break;
-                }
-            }
-
-            if (!found && !legal_moves.empty()) {
-                // Fallback to best move by visit count
-                int best_visits = -1;  // Start at -1 so we always select something
-                for (const auto& move : legal_moves) {
-                    int idx = encoding::MoveEncoder::move_to_index(move, board);
-                    if (idx >= 0 && visit_counts[idx] > best_visits) {
-                        best_visits = visit_counts[idx];
-                        selected_move = move;
-                    }
-                }
-                // If still not found, pick first legal move
-                if (best_visits < 0) {
-                    selected_move = legal_moves[0];
-                }
-            }
-        } else {
-            // Greedy selection - pick move with most visits
-            int best_visits = -1;  // Start at -1 so we always select something
-            for (const auto& move : legal_moves) {
-                int idx = encoding::MoveEncoder::move_to_index(move, board);
-                if (idx >= 0 && visit_counts[idx] > best_visits) {
-                    best_visits = visit_counts[idx];
-                    selected_move = move;
-                }
-            }
-            // If no visits found, pick first legal move
-            if (best_visits < 0 && !legal_moves.empty()) {
-                selected_move = legal_moves[0];
-            }
-        }
+        // Add to trajectory (with MCTS root WDL distribution and soft value)
+        trajectory.add_state(state_obs, policy, search.get_root_wdl(), soft_val);
 
         // Safety check: if no move was selected (shouldn't happen), break
         if (legal_moves.empty()) {
@@ -411,27 +566,33 @@ GameTrajectory ParallelSelfPlayCoordinator::play_single_game(
             position_history.pop_front();
         }
 
+        // Record move for PGN export
+        trajectory.moves_uci.push_back(chess::uci::moveToUci(selected_move));
+
         // Make move
         board.makeMove(selected_move);
         move_count++;
+        stats_.worker_current_moves[worker_id].store(move_count, std::memory_order_relaxed);
     }
 
-    // Determine game result
+    // Determine game result and reason
     chess::GameResult result;
     auto game_result = board.isGameOver();
+    chess::GameResultReason reason = game_result.first;
 
-    if (game_result.first == chess::GameResultReason::CHECKMATE) {
+    if (reason == chess::GameResultReason::CHECKMATE) {
         // Side to move is checkmated, so they lost
         result = (board.sideToMove() == chess::Color::WHITE) ?
                  chess::GameResult::LOSE : chess::GameResult::WIN;
-    } else if (game_result.first != chess::GameResultReason::NONE) {
+    } else if (reason != chess::GameResultReason::NONE) {
         result = chess::GameResult::DRAW;
     } else {
-        // Max moves reached
+        // Max moves reached — reason stays NONE to distinguish from library-detected draws
         result = chess::GameResult::DRAW;
     }
 
-    trajectory.set_outcomes(result, config_.draw_score);
+    trajectory.set_outcomes(result);
+    trajectory.result_reason = reason;
 
     // Update statistics
     auto game_end = std::chrono::steady_clock::now();
@@ -448,7 +609,42 @@ GameTrajectory ParallelSelfPlayCoordinator::play_single_game(
         stats_.black_wins.fetch_add(1, std::memory_order_relaxed);
     } else {
         stats_.draws.fetch_add(1, std::memory_order_relaxed);
+        // Draw reason breakdown
+        if (reason == chess::GameResultReason::THREEFOLD_REPETITION) {
+            stats_.draws_repetition.fetch_add(1, std::memory_order_relaxed);
+            if (move_count < 60) {  // 60 plies = 30 full moves
+                stats_.draws_early_repetition.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else if (reason == chess::GameResultReason::STALEMATE) {
+            stats_.draws_stalemate.fetch_add(1, std::memory_order_relaxed);
+        } else if (reason == chess::GameResultReason::FIFTY_MOVE_RULE) {
+            stats_.draws_fifty_move.fetch_add(1, std::memory_order_relaxed);
+        } else if (reason == chess::GameResultReason::INSUFFICIENT_MATERIAL) {
+            stats_.draws_insufficient.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            // reason == NONE means max_moves_per_game reached (loop exit condition)
+            stats_.draws_max_moves.fetch_add(1, std::memory_order_relaxed);
+        }
     }
+
+    // Track per-persona outcomes (only for asymmetric games)
+    if (is_asymmetric) {
+        if (result == chess::GameResult::DRAW) {
+            stats_.asymmetric_draws.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            // WIN = white won, LOSE = black won
+            // standard_won when (white won AND white is standard) OR (black won AND black is standard)
+            bool standard_won = (result == chess::GameResult::WIN) == white_is_standard;
+            if (standard_won) {
+                stats_.standard_wins.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                stats_.opponent_wins.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    // Reset move counter (game finished)
+    stats_.worker_current_moves[worker_id].store(0, std::memory_order_relaxed);
 
     return trajectory;
 }
@@ -461,7 +657,8 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
     std::vector<float>& obs_buffer,
     std::vector<float>& mask_buffer,
     std::vector<float>& policy_buffer,
-    std::vector<float>& value_buffer)
+    std::vector<float>& value_buffer,
+    std::vector<float>& wdl_buffer)
 {
     // Convert position history
     std::vector<chess::Board> history_vec(position_history.begin(), position_history.end());
@@ -508,7 +705,8 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
             policy_buffer.data(),
             value_buffer.data(),
             1,
-            config_.worker_timeout_ms
+            config_.worker_timeout_ms,
+            wdl_buffer.data()
         );
 
         if (got > 0 || shutdown_.load(std::memory_order_acquire)) {
@@ -578,7 +776,8 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
 
             got = eval_queue_.get_results(
                 worker_id, policy_buffer.data(), value_buffer.data(),
-                queued, config_.worker_timeout_ms
+                queued, config_.worker_timeout_ms,
+                wdl_buffer.data()
             );
 
             if (got == 0) {
@@ -601,7 +800,7 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
                 );
                 values[i] = value_buffer[i];
             }
-            search.update_leaves(policies, values);
+            search.update_leaves(policies, values, wdl_buffer.data());
         }
     } else {
         // =====================================================================
@@ -644,7 +843,8 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
             if (prev_queued > 0) {
                 got = eval_queue_.get_results(
                     worker_id, policy_buffer.data(), value_buffer.data(),
-                    prev_queued, config_.worker_timeout_ms
+                    prev_queued, config_.worker_timeout_ms,
+                    wdl_buffer.data()
                 );
 
                 if (got > 0) {
@@ -659,7 +859,7 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
                         );
                         values[i] = value_buffer[i];
                     }
-                    search.update_prev_leaves(policies, values);
+                    search.update_prev_leaves(policies, values, wdl_buffer.data());
                 } else {
                     search.cancel_prev_pending();
                     int flushed = eval_queue_.flush_worker_results(worker_id);
@@ -693,7 +893,8 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
         if (prev_queued > 0) {
             got = eval_queue_.get_results(
                 worker_id, policy_buffer.data(), value_buffer.data(),
-                prev_queued, config_.worker_timeout_ms
+                prev_queued, config_.worker_timeout_ms,
+                wdl_buffer.data()
             );
 
             if (got > 0) {
@@ -708,7 +909,7 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
                     );
                     values[i] = value_buffer[i];
                 }
-                search.update_prev_leaves(policies, values);
+                search.update_prev_leaves(policies, values, wdl_buffer.data());
             } else {
                 search.cancel_prev_pending();
                 eval_queue_.flush_worker_results(worker_id);
@@ -738,6 +939,26 @@ ParallelSelfPlayCoordinator::get_detailed_metrics() const {
     m.sims_per_sec = stats_.sims_per_second();
     m.nn_evals_per_sec = stats_.nn_evals_per_second();
 
+    // Tree depth
+    m.max_search_depth = stats_.max_search_depth.load(std::memory_order_relaxed);
+    int64_t raw_min = stats_.min_search_depth.load(std::memory_order_relaxed);
+    m.min_search_depth = (raw_min == INT64_MAX) ? 0 : raw_min;
+    int64_t depth_samples = stats_.depth_sample_count.load(std::memory_order_relaxed);
+    int64_t total_depth = stats_.total_max_depth.load(std::memory_order_relaxed);
+    m.avg_search_depth = depth_samples > 0 ? static_cast<double>(total_depth) / depth_samples : 0.0;
+
+    // Active game move counts (scan non-zero entries for min/max)
+    int min_moves = INT_MAX, max_moves = 0;
+    for (int i = 0; i < stats_.num_workers_allocated; ++i) {
+        int mc = stats_.worker_current_moves[i].load(std::memory_order_relaxed);
+        if (mc > 0) {
+            if (mc < min_moves) min_moves = mc;
+            if (mc > max_moves) max_moves = mc;
+        }
+    }
+    m.min_current_moves = (min_moves == INT_MAX) ? 0 : min_moves;
+    m.max_current_moves = max_moves;
+
     // From queue
     const auto& qm = eval_queue_.get_metrics();
     m.batch_fill_ratio = qm.batch_fill_ratio(config_.gpu_batch_size);
@@ -747,6 +968,16 @@ ParallelSelfPlayCoordinator::get_detailed_metrics() const {
     m.pending_requests = eval_queue_.pending_count();
 
     return m;
+}
+
+SampleGame ParallelSelfPlayCoordinator::get_sample_game() const {
+    std::lock_guard<std::mutex> lock(sample_game_mutex_);
+    return sample_game_;
+}
+
+bool ParallelSelfPlayCoordinator::has_sample_game() const {
+    std::lock_guard<std::mutex> lock(sample_game_mutex_);
+    return has_sample_game_;
 }
 
 std::vector<GameTrajectory> ParallelSelfPlayCoordinator::get_completed_games() {

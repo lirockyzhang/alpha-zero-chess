@@ -4,7 +4,6 @@
 import sys
 import os
 import numpy as np
-import tempfile
 from pathlib import Path
 
 # Add build directory to path
@@ -60,26 +59,36 @@ def test_replay_buffer_basic():
     assert stats['total_games'] == 1
 
     print("[PASS] Basic operations test")
-    return buffer
 
-def test_replay_buffer_sampling(buffer):
+def test_replay_buffer_sampling():
     """Test ReplayBuffer sampling."""
     print("\n" + "="*80)
     print("Test 2: ReplayBuffer Sampling")
     print("="*80)
 
+    # Create and populate a buffer for sampling
+    buffer = alphazero_cpp.ReplayBuffer(capacity=1000)
+    for _ in range(20):
+        obs = np.random.rand(7808).astype(np.float32)
+        pol = np.random.rand(4672).astype(np.float32)
+        buffer.add_sample(obs, pol, 0.5)
+
     # Sample a batch
     batch_size = 5
-    obs, pol, val = buffer.sample(batch_size)
+    obs, pol, val, wdl, sv = buffer.sample(batch_size)
 
     print(f"OK Sampled batch of {batch_size}")
     print(f"  Observations shape: {obs.shape}")
     print(f"  Policies shape: {pol.shape}")
     print(f"  Values shape: {val.shape}")
+    print(f"  WDL targets shape: {wdl.shape}")
+    print(f"  Soft values shape: {sv.shape}")
 
     assert obs.shape == (batch_size, 7808)
     assert pol.shape == (batch_size, 4672)
     assert val.shape == (batch_size,)
+    assert wdl.shape == (batch_size, 3)
+    assert sv.shape == (batch_size,)
 
     print("[PASS] Sampling test")
 
@@ -107,56 +116,6 @@ def test_replay_buffer_overflow():
     print(f"  Total added: {buffer.total_added()}")
 
     print("[PASS] Overflow test")
-
-def test_replay_buffer_persistence():
-    """Test ReplayBuffer save/load."""
-    print("\n" + "="*80)
-    print("Test 4: ReplayBuffer Persistence (Save/Load)")
-    print("="*80)
-
-    # Create buffer and add samples
-    buffer1 = alphazero_cpp.ReplayBuffer(capacity=100)
-
-    for i in range(20):
-        obs = np.random.rand(7808).astype(np.float32)
-        pol = np.random.rand(4672).astype(np.float32)
-        buffer1.add_sample(obs, pol, float(i))
-
-    stats1 = buffer1.get_stats()
-    print(f"OK Created buffer with {stats1['size']} samples")
-
-    # Save to disk
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".rpbf") as f:
-        temp_path = f.name
-
-    try:
-        success = buffer1.save(temp_path)
-        assert success, "Save failed"
-        print(f"OK Saved buffer to {temp_path}")
-
-        # Load into new buffer
-        buffer2 = alphazero_cpp.ReplayBuffer(capacity=100)
-        success = buffer2.load(temp_path)
-        assert success, "Load failed"
-        print(f"OK Loaded buffer from disk")
-
-        # Verify stats match
-        stats2 = buffer2.get_stats()
-        assert stats2['size'] == stats1['size']
-        assert stats2['total_added'] == stats1['total_added']
-        print(f"OK Stats match after load: size={stats2['size']}, total_added={stats2['total_added']}")
-
-        # Verify can sample from loaded buffer
-        obs, pol, val = buffer2.sample(5)
-        assert obs.shape == (5, 7808)
-        print(f"OK Can sample from loaded buffer")
-
-        print("[PASS] Persistence test")
-
-    finally:
-        # Clean up
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
 
 def test_trainer():
     """Test Trainer coordinator."""
@@ -219,10 +178,9 @@ def main():
 
     try:
         # Run tests
-        buffer = test_replay_buffer_basic()
-        test_replay_buffer_sampling(buffer)
+        test_replay_buffer_basic()
+        test_replay_buffer_sampling()
         test_replay_buffer_overflow()
-        test_replay_buffer_persistence()
         test_trainer()
 
         # Summary
@@ -232,7 +190,6 @@ def main():
         print("\nC++ training components are working correctly:")
         print("  OK ReplayBuffer - create, add, sample")
         print("  OK ReplayBuffer - circular overflow")
-        print("  OK ReplayBuffer - save/load persistence")
         print("  OK Trainer - configuration and statistics")
         print("\nReady for integration with training loop!")
         print("="*80)

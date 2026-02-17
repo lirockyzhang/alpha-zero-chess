@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 #include <cmath>
+#include <algorithm>
 #include "../third_party/chess-library/include/chess.hpp"
 
 namespace mcts {
@@ -14,6 +15,19 @@ class NodePool;
 // Node structure for MCTS tree
 // CRITICAL: 64-byte aligned to prevent false sharing between CPU cores
 // Each node fits exactly in one cache line for optimal performance
+//
+// Layout (53 data bytes + 11 explicit padding = 64):
+//   [0-7]   parent (8)
+//   [8-15]  first_child (8)
+//   [16-23] next_sibling (8)
+//   [24-31] value_sum_fixed (8)        8-byte aligned, no gap
+//   [32-39] value_sum_sq_fixed (8)     8-byte aligned (variance tracking)
+//   [40-43] visit_count (4)            4-byte aligned
+//   [44-45] virtual_loss (2)           2-byte aligned
+//   [46-49] move (4)                   chess::Move = uint16_t move_ + int16_t score_
+//   [50-51] prior_fixed (2)
+//   [52]    flags (1)
+//   [53-63] padding[11] (11)
 struct alignas(64) Node {
     // Parent node (nullptr for root)
     Node* parent;
@@ -24,8 +38,14 @@ struct alignas(64) Node {
     // Next sibling in parent's child list (nullptr if last child)
     Node* next_sibling;
 
-    // Move that led to this node (from parent's perspective)
-    chess::Move move;
+    // Value sum in fixed-point (multiply by 10000 for precision)
+    // Using int64_t to prevent overflow: max value = 2^31 visits * 10000 * 1.0 = ~2^45
+    std::atomic<int64_t> value_sum_fixed;
+
+    // Sum of squared values in fixed-point (v^2 * 10000)
+    // Used for variance computation: Var(v) = E[v^2] - E[v]^2
+    // Max value = 2^31 visits * 10000 * 1.0^2 = ~2^45 (well within int64_t)
+    std::atomic<int64_t> value_sum_sq_fixed;
 
     // Visit count (atomic for thread-safe MCTS)
     std::atomic<uint32_t> visit_count;
@@ -33,9 +53,8 @@ struct alignas(64) Node {
     // Virtual loss for parallel MCTS (prevents multiple threads from exploring same path)
     std::atomic<int16_t> virtual_loss;
 
-    // Value sum in fixed-point (multiply by 10000 for precision)
-    // Using int64_t to prevent overflow: max value = 2^31 visits * 10000 * 1.0 = ~2^45
-    std::atomic<int64_t> value_sum_fixed;
+    // Move that led to this node (from parent's perspective)
+    chess::Move move;
 
     // Policy prior from neural network (stored as uint16_t to save space)
     // Actual value = prior_fixed / 10000.0f
@@ -45,32 +64,36 @@ struct alignas(64) Node {
     uint8_t flags;
 
     // Padding to reach exactly 64 bytes
-    uint8_t padding[5];
+    uint8_t padding[11];
 
     // Constructor
     Node()
         : parent(nullptr)
         , first_child(nullptr)
         , next_sibling(nullptr)
+        , value_sum_fixed(0)
+        , value_sum_sq_fixed(0)
         , move()
         , visit_count(0)
         , virtual_loss(0)
-        , value_sum_fixed(0)
         , prior_fixed(0)
         , flags(0)
     {
         static_assert(sizeof(Node) == 64, "Node must be exactly 64 bytes for cache-line alignment");
     }
 
-    // Q-value calculation with virtual loss and FPU (First Play Urgency)
-    // Uses Leela Chess Zero approach: unvisited nodes use parent Q-value as placeholder
-    float q_value(float parent_q) const {
+    // Q-value calculation with virtual loss and dynamic FPU (First Play Urgency)
+    // Dynamic FPU: penalty = fpu_base * sqrt(1 - prior)
+    //   high-prior moves (prior=0.9) get small penalty: sqrt(0.1) ≈ 0.32
+    //   low-prior moves (prior=0.03) get harsh penalty: sqrt(0.97) ≈ 0.98
+    // sqrt compression makes medium-prior moves more explorable than linear (1-prior).
+    float q_value(float parent_q, float fpu_base = 0.3f) const {
         uint32_t n = visit_count.load(std::memory_order_relaxed);
         int16_t v = virtual_loss.load(std::memory_order_relaxed);
 
-        // Unvisited node with no virtual loss: use FPU (First Play Urgency)
+        // Unvisited node with no virtual loss: use dynamic FPU
         if (n == 0 && v == 0) {
-            return parent_q - 0.2f;  // Slight penalty to encourage exploration
+            return parent_q - fpu_base * std::sqrt(1.0f - prior());
         }
 
         // Unvisited node with virtual loss: use parent Q-value (Leela approach)
@@ -83,6 +106,50 @@ struct alignas(64) Node {
         float real_value = sum / 10000.0f;
         float total_value = real_value + v * parent_q;
         return total_value / (n + v);
+    }
+
+    // Risk-adjusted Q-value using Entropic Risk Measure (ERM) approximation:
+    //   Q_beta = E[v] + (beta/2) * Var(v)
+    // beta > 0: risk-seeking (prefers high-variance positions)
+    // beta < 0: risk-averse (prefers low-variance positions)
+    // beta = 0: delegates to q_value() (zero overhead fast path)
+    float q_value_risk(float parent_q, float fpu_base, float beta) const {
+        // Fast path: standard AlphaZero when beta = 0
+        if (beta == 0.0f) {
+            return q_value(parent_q, fpu_base);
+        }
+
+        uint32_t n = visit_count.load(std::memory_order_relaxed);
+        int16_t vl = virtual_loss.load(std::memory_order_relaxed);
+
+        // Unvisited node with no virtual loss: FPU unchanged (no variance data)
+        if (n == 0 && vl == 0) {
+            return parent_q - fpu_base * std::sqrt(1.0f - prior());
+        }
+
+        // Unvisited node with virtual loss: VL anchor at parent_q
+        if (n == 0) {
+            return parent_q;
+        }
+
+        // Visited node: compute risk-adjusted Q
+        int64_t sum = value_sum_fixed.load(std::memory_order_relaxed);
+        int64_t sum_sq = value_sum_sq_fixed.load(std::memory_order_relaxed);
+
+        float mean = sum / (10000.0f * n);
+        float mean_sq = sum_sq / (10000.0f * n);
+        // Guard against tiny negative residuals from fixed-point rounding
+        float var = std::max(0.0f, mean_sq - mean * mean);
+
+        float q_risk = mean + (beta / 2.0f) * var;
+
+        // Blend with virtual loss (VL contributes parent_q only, no variance)
+        if (vl > 0) {
+            q_risk = (n * q_risk + vl * parent_q) / (n + vl);
+        }
+
+        // Clamp to valid range (extreme beta may saturate)
+        return std::clamp(q_risk, -1.0f, 1.0f);
     }
 
     // Prior probability from neural network
@@ -136,6 +203,9 @@ struct alignas(64) Node {
         // Use std::round() to avoid systematic bias in fixed-point conversion
         int64_t value_fixed = static_cast<int64_t>(std::round(value * 10000.0f));
         value_sum_fixed.fetch_add(value_fixed, std::memory_order_relaxed);
+        // Accumulate v^2 for variance tracking (v^2 * 10000, not v^2 * 10000^2)
+        int64_t value_sq_fixed = static_cast<int64_t>(std::round(value * value * 10000.0f));
+        value_sum_sq_fixed.fetch_add(value_sq_fixed, std::memory_order_relaxed);
         visit_count.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -143,6 +213,8 @@ struct alignas(64) Node {
     void update_root(float value) {
         int64_t value_fixed = static_cast<int64_t>(std::round(value * 10000.0f));
         value_sum_fixed.fetch_add(value_fixed, std::memory_order_relaxed);
+        int64_t value_sq_fixed = static_cast<int64_t>(std::round(value * value * 10000.0f));
+        value_sum_sq_fixed.fetch_add(value_sq_fixed, std::memory_order_relaxed);
         // Use release semantics on root to ensure all updates are visible
         visit_count.fetch_add(1, std::memory_order_release);
     }

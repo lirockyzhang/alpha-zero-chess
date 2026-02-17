@@ -66,11 +66,19 @@ private:
 
 // Position encoding for neural network input
 // NHWC layout: (height, width, channels) = (8, 8, 122)
-py::array_t<float> encode_position(const std::string& fen) {
+py::array_t<float> encode_position(const std::string& fen,
+                                    const std::vector<std::string>& history_fens = {}) {
     chess::Board board(fen);
 
-    // Use the real position encoder
-    std::vector<float> encoding = encoding::PositionEncoder::encode(board);
+    // Convert history FENs to Board objects
+    std::vector<chess::Board> position_history;
+    position_history.reserve(history_fens.size());
+    for (const auto& h_fen : history_fens) {
+        position_history.emplace_back(h_fen);
+    }
+
+    // Use the real position encoder with history
+    std::vector<float> encoding = encoding::PositionEncoder::encode(board, position_history);
 
     // Return as numpy array with NHWC shape (8, 8, 122) - channels last
     return py::array_t<float>(
@@ -135,16 +143,17 @@ std::string index_to_move(int index, const std::string& fen) {
 // This implements proper AlphaZero where every leaf gets NN evaluation
 class PyBatchedMCTSSearch {
 public:
-    PyBatchedMCTSSearch(int num_simulations = 800, int batch_size = 256, float c_puct = 1.5f)
+    PyBatchedMCTSSearch(int num_simulations = 800, int batch_size = 256, float c_puct = 1.5f, float risk_beta = 0.0f)
         : pool_()
-        , search_(pool_, create_config(num_simulations, batch_size, c_puct))
+        , search_(pool_, create_config(num_simulations, batch_size, c_puct, risk_beta))
         , batch_size_(batch_size)
     {}
 
     // Initialize search with root position and initial NN evaluation
     void init_search(const std::string& fen,
                      py::array_t<float> root_policy,
-                     float root_value) {
+                     float root_value,
+                     const std::vector<std::string>& history_fens = {}) {
         chess::Board board(fen);
         root_fen_ = fen;
 
@@ -156,7 +165,14 @@ public:
         std::vector<float> policy_vec(static_cast<float*>(policy_buf.ptr),
                                       static_cast<float*>(policy_buf.ptr) + encoding::MoveEncoder::POLICY_SIZE);
 
-        search_.init_search(board, policy_vec, root_value);
+        // Convert history FENs to Board objects
+        std::vector<chess::Board> position_history;
+        position_history.reserve(history_fens.size());
+        for (const auto& h_fen : history_fens) {
+            position_history.emplace_back(h_fen);
+        }
+
+        search_.init_search(board, policy_vec, root_value, position_history);
     }
 
     // Collect leaves that need NN evaluation
@@ -245,11 +261,12 @@ public:
     }
 
 private:
-    static mcts::BatchSearchConfig create_config(int num_simulations, int batch_size, float c_puct) {
+    static mcts::BatchSearchConfig create_config(int num_simulations, int batch_size, float c_puct, float risk_beta) {
         mcts::BatchSearchConfig config;
         config.num_simulations = num_simulations;
         config.batch_size = batch_size;
         config.c_puct = c_puct;
+        config.risk_beta = risk_beta;
         config.dirichlet_alpha = 0.3f;
         config.dirichlet_epsilon = 0.25f;
         return config;
@@ -403,7 +420,14 @@ public:
         int worker_timeout_ms = 2000,
         int queue_capacity = 8192,
         int root_eval_retries = 3,
-        float draw_score = 0.0f)
+        float fpu_base = 1.0f,
+        float risk_beta = 0.0f,
+        float opponent_risk_min = 0.0f,
+        float opponent_risk_max = 0.0f,
+        bool use_gumbel = false,
+        int gumbel_top_k = 16,
+        float gumbel_c_visit = 50.0f,
+        float gumbel_c_scale = 1.0f)
         : replay_buffer_(nullptr)
         , active_coordinator_(nullptr)
     {
@@ -420,7 +444,14 @@ public:
         config_.worker_timeout_ms = worker_timeout_ms;
         config_.queue_capacity = queue_capacity;
         config_.root_eval_retries = root_eval_retries;
-        config_.draw_score = draw_score;
+        config_.fpu_base = fpu_base;
+        config_.risk_beta = risk_beta;
+        config_.opponent_risk_min = opponent_risk_min;
+        config_.opponent_risk_max = opponent_risk_max;
+        config_.use_gumbel = use_gumbel;
+        config_.gumbel_top_k = gumbel_top_k;
+        config_.gumbel_c_visit = gumbel_c_visit;
+        config_.gumbel_c_scale = gumbel_c_scale;
     }
 
     // Set replay buffer (optional - if not set, games are returned instead)
@@ -459,6 +490,15 @@ public:
         result["white_wins"] = m.white_wins;
         result["black_wins"] = m.black_wins;
         result["draws"] = m.draws;
+        result["draws_repetition"] = stats.draws_repetition.load(std::memory_order_relaxed);
+        result["draws_stalemate"] = stats.draws_stalemate.load(std::memory_order_relaxed);
+        result["draws_fifty_move"] = stats.draws_fifty_move.load(std::memory_order_relaxed);
+        result["draws_insufficient"] = stats.draws_insufficient.load(std::memory_order_relaxed);
+        result["draws_max_moves"] = stats.draws_max_moves.load(std::memory_order_relaxed);
+        result["draws_early_repetition"] = stats.draws_early_repetition.load(std::memory_order_relaxed);
+        result["standard_wins"] = stats.standard_wins.load(std::memory_order_relaxed);
+        result["opponent_wins"] = stats.opponent_wins.load(std::memory_order_relaxed);
+        result["asymmetric_draws"] = stats.asymmetric_draws.load(std::memory_order_relaxed);
         result["avg_game_length"] = m.avg_game_length;
 
         // Throughput rates
@@ -514,6 +554,15 @@ public:
             : 0.0;
         result["buffer_swaps"] = total_batches;
 
+        // Tree depth metrics
+        result["max_search_depth"] = m.max_search_depth;
+        result["min_search_depth"] = m.min_search_depth;
+        result["avg_search_depth"] = m.avg_search_depth;
+
+        // Active game move counts
+        result["min_current_moves"] = m.min_current_moves;
+        result["max_current_moves"] = m.max_current_moves;
+
         result["is_running"] = active_coordinator_->is_running();
         return result;
     }
@@ -565,8 +614,8 @@ public:
                 py::capsule(out_policies, [](void*) {})
             );
             py::array_t<float> out_value_array(
-                {batch_size},
-                {(int)sizeof(float)},
+                {batch_size, 3},
+                {3 * (int)sizeof(float), (int)sizeof(float)},
                 out_values,
                 py::capsule(out_values, [](void*) {})
             );
@@ -590,7 +639,7 @@ public:
                     std::memcpy(out_policies, policies_buf.ptr,
                                batch_size * 4672 * sizeof(float));
                     std::memcpy(out_values, values_buf.ptr,
-                               batch_size * sizeof(float));
+                               batch_size * 3 * sizeof(float));
                 }
             } catch (py::error_already_set& e) {
                 // If the new 5-arg signature fails, fall back to 3-arg legacy
@@ -609,7 +658,7 @@ public:
                 std::memcpy(out_policies, policies_buf.ptr,
                            batch_size * 4672 * sizeof(float));
                 std::memcpy(out_values, values_buf.ptr,
-                           batch_size * sizeof(float));
+                           batch_size * 3 * sizeof(float));
             }
         };
 
@@ -672,12 +721,23 @@ public:
         result["white_wins"] = stats.white_wins.load();
         result["black_wins"] = stats.black_wins.load();
         result["draws"] = stats.draws.load();
+        result["standard_wins"] = stats.standard_wins.load();
+        result["opponent_wins"] = stats.opponent_wins.load();
+        result["asymmetric_draws"] = stats.asymmetric_draws.load();
         result["mcts_failures"] = stats.mcts_failures.load();  // Track evaluation failures
         result["gpu_errors"] = stats.gpu_errors.load();  // Track GPU thread exceptions
         result["total_simulations"] = stats.total_simulations.load();
         result["total_nn_evals"] = stats.total_nn_evals.load();
         result["root_retries"] = stats.root_retries.load();
         result["stale_results_flushed"] = stats.stale_results_flushed.load();
+
+        // Draw reason breakdown
+        result["draws_repetition"] = stats.draws_repetition.load();
+        result["draws_stalemate"] = stats.draws_stalemate.load();
+        result["draws_fifty_move"] = stats.draws_fifty_move.load();
+        result["draws_insufficient"] = stats.draws_insufficient.load();
+        result["draws_max_moves"] = stats.draws_max_moves.load();
+        result["draws_early_repetition"] = stats.draws_early_repetition.load();
 
         // Surface C++ thread errors to Python
         result["cpp_error"] = coordinator->get_last_error();
@@ -690,6 +750,15 @@ public:
         result["avg_batch_size"] = queue_metrics.avg_batch_size();
         result["total_batches"] = queue_metrics.total_batches.load();
         result["total_leaves"] = queue_metrics.total_leaves.load();
+
+        // Tree depth metrics
+        result["max_search_depth"] = stats.max_search_depth.load();
+        result["min_search_depth"] = stats.min_search_depth.load() == INT64_MAX
+            ? 0 : stats.min_search_depth.load();
+        int64_t total_depth = stats.total_max_depth.load();
+        int64_t depth_samples = stats.depth_sample_count.load();
+        result["avg_search_depth"] = depth_samples > 0 ? static_cast<double>(total_depth) / depth_samples : 0.0;
+
         return result;
     }
 
@@ -706,8 +775,52 @@ public:
         d["dirichlet_epsilon"] = config_.dirichlet_epsilon;
         d["temperature_moves"] = config_.temperature_moves;
         d["gpu_timeout_ms"] = config_.gpu_timeout_ms;
-        d["draw_score"] = config_.draw_score;
+        d["fpu_base"] = config_.fpu_base;
+        d["risk_beta"] = config_.risk_beta;
+        d["opponent_risk_min"] = config_.opponent_risk_min;
+        d["opponent_risk_max"] = config_.opponent_risk_max;
+        d["use_gumbel"] = config_.use_gumbel;
+        d["gumbel_top_k"] = config_.gumbel_top_k;
+        d["gumbel_c_visit"] = config_.gumbel_c_visit;
+        d["gumbel_c_scale"] = config_.gumbel_c_scale;
         return d;
+    }
+
+    // Get a sample game from the last generation run (prefers decisive games)
+    py::dict get_sample_game() const {
+        py::dict result;
+        if (!active_coordinator_ || !active_coordinator_->has_sample_game()) {
+            result["has_game"] = false;
+            return result;
+        }
+
+        auto sample = active_coordinator_->get_sample_game();
+        result["has_game"] = true;
+        result["moves"] = sample.moves_uci;
+        result["num_moves"] = sample.num_moves;
+
+        // Convert GameResult to PGN result string
+        if (sample.result == chess::GameResult::WIN) {
+            result["result"] = "1-0";
+        } else if (sample.result == chess::GameResult::LOSE) {
+            result["result"] = "0-1";
+        } else {
+            result["result"] = "1/2-1/2";
+        }
+
+        // Convert GameResultReason to string
+        const char* reason_str = "unknown";
+        switch (sample.result_reason) {
+            case chess::GameResultReason::CHECKMATE: reason_str = "checkmate"; break;
+            case chess::GameResultReason::STALEMATE: reason_str = "stalemate"; break;
+            case chess::GameResultReason::INSUFFICIENT_MATERIAL: reason_str = "insufficient_material"; break;
+            case chess::GameResultReason::FIFTY_MOVE_RULE: reason_str = "fifty_move"; break;
+            case chess::GameResultReason::THREEFOLD_REPETITION: reason_str = "repetition"; break;
+            case chess::GameResultReason::NONE: reason_str = "max_moves"; break;
+        }
+        result["result_reason"] = reason_str;
+
+        return result;
     }
 
     // Total games that will be generated
@@ -726,15 +839,19 @@ PYBIND11_MODULE(alphazero_cpp, m) {
 
     // MCTS Search class (batched leaf evaluation - proper AlphaZero)
     py::class_<PyBatchedMCTSSearch>(m, "BatchedMCTSSearch")
-        .def(py::init<int, int, float>(),
+        .def(py::init<int, int, float, float>(),
              py::arg("num_simulations") = 800,
              py::arg("batch_size") = 256,
              py::arg("c_puct") = 1.5f,
-             "Create MCTS search engine with batched leaf evaluation (proper AlphaZero)")
+             py::arg("risk_beta") = 0.0f,
+             "Create MCTS search engine with batched leaf evaluation (proper AlphaZero)\n"
+             "\nParameters:\n"
+             "  risk_beta: ERM risk sensitivity (default 0.0). >0 risk-seeking, <0 risk-averse")
         .def("init_search", &PyBatchedMCTSSearch::init_search,
              py::arg("fen"),
              py::arg("root_policy"),
              py::arg("root_value"),
+             py::arg("history_fens") = std::vector<std::string>{},
              "Initialize search with root position and initial NN evaluation")
         .def("collect_leaves", &PyBatchedMCTSSearch::collect_leaves,
              "Collect leaves that need NN evaluation. Returns (num_leaves, observations, legal_masks)")
@@ -756,7 +873,9 @@ PYBIND11_MODULE(alphazero_cpp, m) {
     // Utility functions
     m.def("encode_position", &encode_position,
           py::arg("fen"),
-          "Encode chess position for neural network input");
+          py::arg("history_fens") = std::vector<std::string>{},
+          "Encode chess position for neural network input.\n"
+          "history_fens: Optional list of FEN strings for position history (up to 8)");
 
     m.def("encode_position_to_buffer", &encode_position_to_buffer,
           py::arg("fen"),
@@ -768,6 +887,12 @@ PYBIND11_MODULE(alphazero_cpp, m) {
           py::arg("buffer"),
           py::arg("use_parallel") = true,
           "Encode multiple positions in parallel (batch encoding with OpenMP)");
+
+    m.def("wdl_to_value", &mcts::wdl_to_value,
+          py::arg("pw"), py::arg("pd"), py::arg("pl"),
+          "Convert WDL probabilities to scalar value.\n"
+          "value = pw - pl\n"
+          "pw: P(win), pd: P(draw), pl: P(loss)");
 
     m.def("move_to_index", &move_to_index,
           py::arg("uci_move"),
@@ -796,7 +921,7 @@ PYBIND11_MODULE(alphazero_cpp, m) {
 
     // Parallel self-play coordinator (cross-game batching for high GPU utilization)
     py::class_<PyParallelSelfPlayCoordinator>(m, "ParallelSelfPlayCoordinator")
-        .def(py::init<int, int, int, int, int, float, float, float, int, int, int, int, int, float>(),
+        .def(py::init<int, int, int, int, int, float, float, float, int, int, int, int, int, float, float, float, float, bool, int, float, float>(),
              py::arg("num_workers") = 16,
              py::arg("games_per_worker") = 4,
              py::arg("num_simulations") = 800,
@@ -810,14 +935,21 @@ PYBIND11_MODULE(alphazero_cpp, m) {
              py::arg("worker_timeout_ms") = 2000,
              py::arg("queue_capacity") = 8192,
              py::arg("root_eval_retries") = 3,
-             py::arg("draw_score") = 0.0f,
+             py::arg("fpu_base") = 1.0f,
+             py::arg("risk_beta") = 0.0f,
+             py::arg("opponent_risk_min") = 0.0f,
+             py::arg("opponent_risk_max") = 0.0f,
+             py::arg("use_gumbel") = true,
+             py::arg("gumbel_top_k") = 16,
+             py::arg("gumbel_c_visit") = 50.0f,
+             py::arg("gumbel_c_scale") = 1.0f,
              "Create parallel self-play coordinator with cross-game batching.\n"
              "This achieves high GPU utilization by batching NN evaluations across multiple games.\n"
              "\nParameters:\n"
              "  num_workers: Number of worker threads (default 16)\n"
              "  games_per_worker: Games each worker plays (default 4)\n"
              "  num_simulations: MCTS simulations per move (default 800)\n"
-             "  mcts_batch_size: Leaves collected per MCTS iteration (default 64)\n"
+             "  mcts_batch_size: Leaves collected per MCTS iteration (default 1)\n"
              "  gpu_batch_size: Maximum GPU batch size (default 512)\n"
              "  c_puct: PUCT exploration constant (default 1.5)\n"
              "  dirichlet_alpha: Dirichlet noise alpha (default 0.3)\n"
@@ -827,7 +959,14 @@ PYBIND11_MODULE(alphazero_cpp, m) {
              "  worker_timeout_ms: Worker wait time for NN results (default 2000)\n"
              "  queue_capacity: Evaluation queue capacity (default 8192)\n"
              "  root_eval_retries: Max retries for root NN evaluation (default 3)\n"
-             "  draw_score: Draw value from White's perspective (default 0.0, try -0.5 for decisive play)")
+             "  fpu_base: Dynamic FPU base penalty (default 1.0). penalty = fpu_base * (1 - prior)\n"
+             "  risk_beta: ERM risk sensitivity (default 0.0). >0 risk-seeking, <0 risk-averse. Range [-3, 3]\n"
+             "  opponent_risk_min: Min opponent risk beta for asymmetric games (default 0.0)\n"
+             "  opponent_risk_max: Max opponent risk beta for asymmetric games (default 0.0)\n"
+             "  use_gumbel: Use Gumbel Top-k Sequential Halving at root (default true)\n"
+             "  gumbel_top_k: Initial m for Sequential Halving (default 16)\n"
+             "  gumbel_c_visit: sigma() visit constant (default 50.0)\n"
+             "  gumbel_c_scale: sigma() scale factor (default 1.0)")
         .def("set_replay_buffer", &PyParallelSelfPlayCoordinator::set_replay_buffer,
              py::arg("buffer"),
              "Set replay buffer for direct data storage (optional).\n"
@@ -854,6 +993,10 @@ PYBIND11_MODULE(alphazero_cpp, m) {
              "Get live statistics while self-play is running.\n"
              "Thread-safe: reads atomic counters without blocking.\n"
              "Returns empty dict if no coordinator is active.")
+        .def("get_sample_game", &PyParallelSelfPlayCoordinator::get_sample_game,
+             "Get a sample game from the last generation run.\n"
+             "Returns dict with keys: has_game (bool), moves (list[str]), result (str), num_moves (int).\n"
+             "Prefers decisive games (1-0 or 0-1) over draws.")
         .def("get_last_error", [](PyParallelSelfPlayCoordinator& self) -> std::string {
             // Error is primarily surfaced via cpp_error key in generate_games() result dict
             return "";
@@ -868,7 +1011,9 @@ PYBIND11_MODULE(alphazero_cpp, m) {
         .def("add_sample", [](training::ReplayBuffer& self,
                              py::array_t<float> observation,
                              py::array_t<float> policy,
-                             float value) {
+                             float value,
+                             py::object wdl,
+                             py::object soft_value) {
             auto obs_buf = observation.request();
             auto pol_buf = policy.request();
 
@@ -877,16 +1022,30 @@ PYBIND11_MODULE(alphazero_cpp, m) {
             std::vector<float> pol_vec(static_cast<float*>(pol_buf.ptr),
                                        static_cast<float*>(pol_buf.ptr) + pol_buf.size);
 
-            self.add_sample(obs_vec, pol_vec, value);
+            const float* wdl_ptr = nullptr;
+            if (!wdl.is_none()) {
+                auto wdl_arr = wdl.cast<py::array_t<float>>();
+                wdl_ptr = static_cast<const float*>(wdl_arr.request().ptr);
+            }
+            const float* sv_ptr = nullptr;
+            float sv_val = 0.0f;
+            if (!soft_value.is_none()) {
+                sv_val = soft_value.cast<float>();
+                sv_ptr = &sv_val;
+            }
+            self.add_sample(obs_vec, pol_vec, value, wdl_ptr, sv_ptr);
         },
         py::arg("observation"),
         py::arg("policy"),
         py::arg("value"),
-        "Add a single training sample to buffer")
+        py::arg("wdl") = py::none(),
+        py::arg("soft_value") = py::none(),
+        "Add a single training sample to buffer (optional WDL target and ERM risk value)")
         .def("add_batch", [](training::ReplayBuffer& self,
                             py::array_t<float> observations,
                             py::array_t<float> policies,
-                            py::array_t<float> values) {
+                            py::array_t<float> values,
+                            py::object wdl_targets) {
             // Zero-copy implementation: direct pointer access
             auto obs_buf = observations.request();
             auto pol_buf = policies.request();
@@ -899,17 +1058,25 @@ PYBIND11_MODULE(alphazero_cpp, m) {
             float* pol_ptr = static_cast<float*>(pol_buf.ptr);
             float* val_ptr = static_cast<float*>(val_buf.ptr);
 
+            const float* wdl_ptr = nullptr;
+            if (!wdl_targets.is_none()) {
+                auto wdl_arr = wdl_targets.cast<py::array_t<float>>();
+                wdl_ptr = static_cast<const float*>(wdl_arr.request().ptr);
+            }
+
             // Call zero-copy add_batch_raw
-            self.add_batch_raw(batch_size, obs_ptr, pol_ptr, val_ptr);
+            self.add_batch_raw(batch_size, obs_ptr, pol_ptr, val_ptr, wdl_ptr);
         },
         py::arg("observations"),
         py::arg("policies"),
         py::arg("values"),
-        "Add a batch of training samples to buffer")
+        py::arg("wdl_targets") = py::none(),
+        "Add a batch of training samples to buffer (optional WDL targets)")
         .def("sample", [](training::ReplayBuffer& self, size_t batch_size) {
-            std::vector<float> observations, policies, values;
+            std::vector<float> observations, policies, values, wdl_targets, soft_values;
 
-            bool success = self.sample(batch_size, observations, policies, values);
+            bool success = self.sample(batch_size, observations, policies, values,
+                                       &wdl_targets, &soft_values);
             if (!success) {
                 throw std::runtime_error("Not enough samples in buffer");
             }
@@ -918,6 +1085,8 @@ PYBIND11_MODULE(alphazero_cpp, m) {
             py::array_t<float> obs_array(std::vector<size_t>{batch_size, 7808UL});
             py::array_t<float> pol_array(std::vector<size_t>{batch_size, 4672UL});
             py::array_t<float> val_array(std::vector<size_t>{batch_size});
+            py::array_t<float> wdl_array(std::vector<size_t>{batch_size, 3UL});
+            py::array_t<float> sv_array(std::vector<size_t>{batch_size});
 
             std::memcpy(obs_array.mutable_data(), observations.data(),
                        batch_size * 7808 * sizeof(float));
@@ -925,18 +1094,16 @@ PYBIND11_MODULE(alphazero_cpp, m) {
                        batch_size * 4672 * sizeof(float));
             std::memcpy(val_array.mutable_data(), values.data(),
                        batch_size * sizeof(float));
+            std::memcpy(wdl_array.mutable_data(), wdl_targets.data(),
+                       batch_size * 3 * sizeof(float));
+            std::memcpy(sv_array.mutable_data(), soft_values.data(),
+                       batch_size * sizeof(float));
 
-            return py::make_tuple(obs_array, pol_array, val_array);
+            return py::make_tuple(obs_array, pol_array, val_array, wdl_array, sv_array);
         },
         py::arg("batch_size"),
         "Sample a random batch of training data.\n"
-        "Returns: (observations, policies, values)")
-        .def("save", &training::ReplayBuffer::save,
-             py::arg("path"),
-             "Save replay buffer to disk")
-        .def("load", &training::ReplayBuffer::load,
-             py::arg("path"),
-             "Load replay buffer from disk")
+        "Returns: (observations, policies, values, wdl_targets, soft_values)")
         .def("size", &training::ReplayBuffer::size,
              "Get current number of samples in buffer")
         .def("capacity", &training::ReplayBuffer::capacity,
@@ -958,9 +1125,36 @@ PYBIND11_MODULE(alphazero_cpp, m) {
             d["total_added"] = stats.total_added;
             d["total_games"] = stats.total_games;
             d["utilization"] = stats.utilization;
+            d["wins"] = stats.wins;
+            d["draws"] = stats.draws;
+            d["losses"] = stats.losses;
             return d;
         },
-        "Get buffer statistics");
+        "Get buffer statistics (includes W/D/L composition)")
+        .def("save", &training::ReplayBuffer::save,
+             py::arg("path"),
+             "Save buffer contents to binary file (.rpbf format).\n"
+             "Returns True if successful.")
+        .def("load", &training::ReplayBuffer::load,
+             py::arg("path"),
+             "Load buffer contents from binary file (.rpbf format).\n"
+             "Returns True if successful. Truncates to buffer capacity if needed.")
+        .def("set_iteration", &training::ReplayBuffer::set_iteration,
+             py::arg("iteration"),
+             "Set the current training iteration.\n"
+             "Called before self-play so metadata tracks which iteration generated each sample.")
+        .def("current_iteration", &training::ReplayBuffer::current_iteration,
+             "Get the current training iteration.")
+        .def("get_composition", [](const training::ReplayBuffer& self) {
+            auto comp = self.get_composition();
+            py::dict d;
+            d["wins"] = comp.wins;
+            d["draws"] = comp.draws;
+            d["losses"] = comp.losses;
+            return d;
+        },
+        "Get W/D/L composition of buffer contents.\n"
+        "Returns dict with keys: wins, draws, losses.");
 
     // Trainer
     py::class_<training::Trainer::Config>(m, "TrainerConfig")

@@ -14,7 +14,10 @@
       "Bash(where:*)",
       "Bash(git ls-tree:*)",
       "Bash(git submodule:*)",
-      "Bash(cmake --build:*)"
+      "Bash(cmake --build:*)",
+      "Bash(tasklist:*)",
+      "Bash(findstr:*)",
+      "Bash(powershell -Command:*)"
     ]
   },
   "outputStyle": "Explanatory"

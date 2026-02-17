@@ -16,10 +16,10 @@ import numpy as np
 import threading
 from pathlib import Path
 
-# Windows console encoding fix
+# Windows console encoding fix (reconfigure avoids closing the underlying
+# buffer, which breaks pytest's capture mechanism)
 if sys.platform == 'win32':
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stdout.reconfigure(encoding='utf-8')
 
 # Add build directory to path
 script_dir = Path(__file__).parent.parent
@@ -80,20 +80,23 @@ class T:
 
 
 def fast_eval(delay_ms=0):
-    """Random evaluator, optional delay."""
+    """Random evaluator (5-arg zero-copy API), optional delay."""
     count = [0]
-    def fn(obs, masks, bs):
+    def fn(obs, masks, bs, out_pol, out_val):
         count[0] += 1
         if delay_ms > 0:
             time.sleep(delay_ms / 1000.0)
         p = np.random.rand(bs, 4672).astype(np.float32)
-        m = np.array(masks, dtype=np.float32)
+        m = np.array(masks[:bs], dtype=np.float32)
         p *= m
         s = p.sum(axis=1, keepdims=True)
         s[s == 0] = 1.0
         p /= s
-        v = np.zeros(bs, dtype=np.float32)
-        return p, v
+        out_pol[:bs] = p
+        # Write WDL probs: neutral [0.33, 0.34, 0.33]
+        out_val[:bs, 0] = 0.33
+        out_val[:bs, 1] = 0.34
+        out_val[:bs, 2] = 0.33
     return fn, count
 
 
@@ -246,7 +249,7 @@ def test_game_integrity():
     sz = buf.size()
     T.ok(sz > 0, f"buffer has {sz} samples")
     if sz >= 2:
-        obs, pol, val = buf.sample(2)
+        obs, pol, val, wdl, sv = buf.sample(2)
         T.ok(not np.any(np.isnan(obs)), "no NaN in obs")
         T.ok(not np.any(np.isinf(obs)), "no Inf in obs")
         T.ok(not np.any(np.isnan(pol)), "no NaN in policy")

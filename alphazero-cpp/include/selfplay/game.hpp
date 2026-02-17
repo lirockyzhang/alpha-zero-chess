@@ -4,6 +4,7 @@
 #include "../mcts/search.hpp"
 #include "../mcts/node_pool.hpp"
 #include "../encoding/move_encoder.hpp"
+#include <array>
 #include <vector>
 #include <string>
 #include <random>
@@ -16,14 +17,20 @@ struct GameState {
     std::vector<float> observation;     // Position encoding (8 x 8 x 119)
     std::vector<float> policy;          // MCTS visit counts as policy (4672)
     float value;                        // Game outcome from this player's perspective
+    std::array<float, 3> mcts_wdl;     // MCTS root WDL distribution {P(win), P(draw), P(loss)} from side-to-move
+    float soft_value;                   // ERM risk-adjusted root value; 0 if disabled
 
-    GameState() : observation(encoding::PositionEncoder::TOTAL_SIZE, 0.0f), policy(encoding::MoveEncoder::POLICY_SIZE, 0.0f), value(0.0f) {}
+    GameState() : observation(encoding::PositionEncoder::TOTAL_SIZE, 0.0f),
+                  policy(encoding::MoveEncoder::POLICY_SIZE, 0.0f),
+                  value(0.0f), mcts_wdl{0.0f, 0.0f, 0.0f}, soft_value(0.0f) {}
 };
 
 // Complete self-play game trajectory
 struct GameTrajectory {
     std::vector<GameState> states;      // All states in the game
+    std::vector<std::string> moves_uci; // UCI move strings (e.g. "e2e4", "g8f6")
     chess::GameResult result;           // Final game result
+    chess::GameResultReason result_reason{chess::GameResultReason::NONE}; // Draw/end reason
     int num_moves;                      // Total number of moves
 
     GameTrajectory() : result(chess::GameResult::NONE), num_moves(0) {}
@@ -31,21 +38,25 @@ struct GameTrajectory {
     // Reserve capacity for typical game length
     void reserve(int capacity = 80) {
         states.reserve(capacity);
+        moves_uci.reserve(capacity);
     }
 
     // Add a state to the trajectory
-    void add_state(const std::vector<float>& obs, const std::vector<float>& pol) {
+    void add_state(const std::vector<float>& obs, const std::vector<float>& pol,
+                   const std::array<float, 3>& wdl = {0.0f, 0.0f, 0.0f},
+                   float sv = 0.0f) {
         states.emplace_back();
         states.back().observation = obs;
         states.back().policy = pol;
+        states.back().mcts_wdl = wdl;
+        states.back().soft_value = sv;
         num_moves++;
     }
 
     // Set game outcome for all states (from each player's perspective)
     // result should be WIN/LOSE/DRAW from White's perspective
-    // draw_score: value assigned to draws from White's perspective (default 0.0)
-    //   e.g. -0.5 means White gets -0.5 and Black gets +0.5 for draws
-    void set_outcomes(chess::GameResult game_result, float draw_score = 0.0f) {
+    // Training labels are always pure: draws = 0.0 (risk_beta is search-time only)
+    void set_outcomes(chess::GameResult game_result) {
         result = game_result;
 
         // Convert game result to values from each player's perspective
@@ -59,8 +70,8 @@ struct GameTrajectory {
                 // White lost (Black won)
                 states[i].value = white_to_move ? -1.0f : 1.0f;
             } else {
-                // Draw — asymmetric draw score from White's perspective
-                states[i].value = white_to_move ? draw_score : -draw_score;
+                // Draw — pure training label (risk_beta not baked into labels)
+                states[i].value = 0.0f;
             }
         }
     }
@@ -77,7 +88,6 @@ struct SelfPlayConfig {
     bool add_dirichlet_noise = true;    // Add Dirichlet noise to root
     float dirichlet_alpha = 0.3f;       // Dirichlet noise alpha
     float dirichlet_epsilon = 0.25f;    // Dirichlet noise weight
-    float draw_score = 0.0f;            // Draw value from White's perspective
 };
 
 // Self-play game executor
@@ -193,6 +203,9 @@ GameTrajectory SelfPlayGame::play_game(NeuralEvaluator& neural_evaluator) {
         // Select and make move
         chess::Move move = select_move(visit_counts, move_count_);
 
+        // Record move for PGN export
+        trajectory.moves_uci.push_back(chess::uci::moveToUci(move));
+
         // Add current position to history before making move
         position_history_.push_back(board_);
         if (position_history_.size() > 8) {
@@ -205,7 +218,7 @@ GameTrajectory SelfPlayGame::play_game(NeuralEvaluator& neural_evaluator) {
 
     // Set game outcomes
     chess::GameResult result = get_game_result();
-    trajectory.set_outcomes(result, config_.draw_score);
+    trajectory.set_outcomes(result);
 
     return trajectory;
 }

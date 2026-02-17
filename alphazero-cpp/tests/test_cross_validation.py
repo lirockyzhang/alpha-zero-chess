@@ -53,7 +53,7 @@ def verify_position_encoding(fen):
     """Verify position can be encoded without errors."""
     try:
         encoding = alphazero_cpp.encode_position(fen)
-        assert encoding.shape == (8, 8, 119), f"Wrong shape: {encoding.shape}"
+        assert encoding.shape == (8, 8, 122), f"Wrong shape: {encoding.shape}"
         return True
     except Exception as e:
         print(f"[ERROR] Failed to encode position {fen}: {e}")
@@ -174,13 +174,13 @@ def test_cross_validation(num_games=10000, report_interval=1000):
         print()
         print("The C++ chess engine is consistent with python-chess across")
         print(f"{num_games} random games and {total_moves} moves.")
-        return True
     else:
         print(f"[FAIL] Found {total_errors} errors in {games_with_errors} games")
         print()
         print("The C++ chess engine has inconsistencies with python-chess.")
         print("Review the errors above and fix the encoding bugs.")
-        return False
+
+    assert total_errors == 0, f"Found {total_errors} errors in {games_with_errors} games"
 
 def test_specific_positions():
     """Test specific edge cases that are known to be tricky."""
@@ -219,7 +219,7 @@ def test_specific_positions():
         try:
             # Test position encoding
             encoding = alphazero_cpp.encode_position(fen)
-            assert encoding.shape == (8, 8, 119)
+            assert encoding.shape == (8, 8, 122)
 
             # Test move encoding for all legal moves
             board = chess.Board(fen)
@@ -238,7 +238,7 @@ def test_specific_positions():
     print()
     print(f"Results: {passed} passed, {failed} failed")
     print()
-    return failed == 0
+    assert failed == 0, f"{failed} specific position tests failed"
 
 def main():
     """Run all cross-validation tests."""

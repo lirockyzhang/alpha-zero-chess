@@ -38,9 +38,10 @@ struct EvalResult {
     int32_t batch_index;      // Index into batch_policy_buffers_[buffer_id] (zero-copy reference)
     int8_t buffer_id;         // Which of the 2 double-buffers this result references
     float value;
+    float wdl[3];             // WDL probabilities (win, draw, loss) from NN evaluation
 
     EvalResult() : worker_id(-1), request_id(-1), generation(0),
-                   batch_index(-1), buffer_id(0), value(0.0f) {}
+                   batch_index(-1), buffer_id(0), value(0.0f), wdl{0.0f, 0.0f, 0.0f} {}
 };
 
 // ============================================================================
@@ -153,7 +154,8 @@ public:
         float* out_policies,            // max_results x POLICY_SIZE
         float* out_values,              // max_results
         int max_results,
-        int timeout_ms = 100
+        int timeout_ms = 100,
+        float* out_wdl = nullptr        // max_results x 3 (WDL probs, optional for Phase 2)
     );
 
     // Non-blocking result retrieval: returns immediately with whatever results are available
@@ -162,7 +164,8 @@ public:
         int worker_id,
         float* out_policies,            // max_results x POLICY_SIZE
         float* out_values,              // max_results
-        int max_results
+        int max_results,
+        float* out_wdl = nullptr        // max_results x 3 (WDL probs, optional for Phase 2)
     );
 
     // =========================================================================
@@ -182,8 +185,9 @@ public:
     // Must be called after collect_batch with matching batch size
     void submit_results(
         const float* policies,          // batch_size x POLICY_SIZE
-        const float* values,            // batch_size
-        int batch_size
+        const float* values,            // batch_size (scalar values after WDL→value conversion)
+        int batch_size,
+        const float* wdl_probs = nullptr // batch_size x 3 (WDL probs, optional for Phase 2)
     );
 
     // =========================================================================

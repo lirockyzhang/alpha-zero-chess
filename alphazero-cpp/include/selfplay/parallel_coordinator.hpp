@@ -17,6 +17,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <cstdint>
 
 namespace selfplay {
 
@@ -51,8 +52,24 @@ struct ParallelSelfPlayConfig {
     // Retry configuration
     int root_eval_retries = 3;          // Max retries for root NN evaluation before giving up
 
-    // Draw score
-    float draw_score = 0.0f;            // Draw value from White's perspective
+    // Dynamic FPU
+    float fpu_base = 0.3f;              // Dynamic FPU: penalty = fpu_base * sqrt(1 - prior)
+
+    // Entropic Risk Measure (ERM) beta for risk-sensitive MCTS
+    // 0.0 = risk-neutral (standard AlphaZero), >0 = risk-seeking, <0 = risk-averse
+    // Recommended range: [-3, 3]. Search-time only, not baked into training labels.
+    float risk_beta = 0.0f;
+
+    // Per-game asymmetric risk: one side uses risk_beta, other samples from [min, max]
+    // If min >= max, disabled (both sides use risk_beta)
+    float opponent_risk_min = 0.0f;
+    float opponent_risk_max = 0.0f;
+
+    // Gumbel Top-k Sequential Halving (Danihelka et al. 2022)
+    bool use_gumbel = false;        // Use Gumbel SH at root instead of PUCT+Dirichlet
+    int gumbel_top_k = 16;         // Initial m for Sequential Halving
+    float gumbel_c_visit = 50.0f;  // sigma() constant
+    float gumbel_c_scale = 1.0f;   // sigma() scale
 };
 
 // ============================================================================
@@ -71,6 +88,19 @@ struct ParallelSelfPlayStats {
     std::atomic<int64_t> black_wins{0};
     std::atomic<int64_t> draws{0};
 
+    // Draw reason breakdown
+    std::atomic<int64_t> draws_repetition{0};       // THREEFOLD_REPETITION
+    std::atomic<int64_t> draws_stalemate{0};         // STALEMATE
+    std::atomic<int64_t> draws_fifty_move{0};        // FIFTY_MOVE_RULE
+    std::atomic<int64_t> draws_insufficient{0};      // INSUFFICIENT_MATERIAL
+    std::atomic<int64_t> draws_max_moves{0};         // Hit move limit (max_moves_per_game)
+    std::atomic<int64_t> draws_early_repetition{0};  // Repetition AND move_count < 60 plies
+
+    // Per-persona outcome tracking (only incremented when asymmetric risk is active)
+    std::atomic<int64_t> standard_wins{0};   // "Standard" persona (risk_beta) won
+    std::atomic<int64_t> opponent_wins{0};   // "Opponent" persona (sampled risk) won
+    std::atomic<int64_t> asymmetric_draws{0}; // Asymmetric game ended in draw
+
     // Timing
     std::atomic<int64_t> total_game_time_ms{0};
     std::atomic<int64_t> total_mcts_time_ms{0};
@@ -83,6 +113,16 @@ struct ParallelSelfPlayStats {
     std::atomic<int64_t> root_retries{0};           // Times root eval was retried (timeout recovery)
     std::atomic<int64_t> stale_results_flushed{0};  // Total stale results discarded
 
+    // Tree depth tracking (across all moves in this generation)
+    std::atomic<int64_t> max_search_depth{0};        // Deepest simulation across all moves
+    std::atomic<int64_t> min_search_depth{INT64_MAX}; // Shallowest simulation (sentinel: CAS naturally reduces)
+    std::atomic<int64_t> total_max_depth{0};         // Sum of per-move max depths (for avg)
+    std::atomic<int64_t> depth_sample_count{0};      // Number of moves contributing to total_max_depth
+
+    // Active game move tracking (per-worker current move count)
+    std::unique_ptr<std::atomic<int>[]> worker_current_moves;  // Per-worker move count
+    int num_workers_allocated{0};  // Size of the array
+
     void reset() {
         games_completed = 0;
         total_moves = 0;
@@ -91,12 +131,28 @@ struct ParallelSelfPlayStats {
         white_wins = 0;
         black_wins = 0;
         draws = 0;
+        draws_repetition = 0;
+        draws_stalemate = 0;
+        draws_fifty_move = 0;
+        draws_insufficient = 0;
+        draws_max_moves = 0;
+        draws_early_repetition = 0;
+        standard_wins = 0;
+        opponent_wins = 0;
+        asymmetric_draws = 0;
         total_game_time_ms = 0;
         total_mcts_time_ms = 0;
         mcts_failures = 0;
         gpu_errors = 0;
         root_retries = 0;
         stale_results_flushed = 0;
+        max_search_depth = 0;
+        min_search_depth = INT64_MAX;
+        total_max_depth = 0;
+        depth_sample_count = 0;
+        for (int i = 0; i < num_workers_allocated; ++i) {
+            worker_current_moves[i].store(0, std::memory_order_relaxed);
+        }
     }
 
     double avg_game_length() const {
@@ -137,13 +193,13 @@ struct ParallelSelfPlayStats {
 // Callback signature for neural network evaluation
 // Called by GPU thread with batched observations
 // Observations are in NCHW format (batch_size x 122 x 8 x 8) — C++ handles transpose
-// Should perform forward pass and write results to policies/values
+// Should perform forward pass and write results to policies and WDL probabilities
 using NeuralEvaluatorFn = std::function<void(
     const float* observations,      // batch_size x 122 x 8 x 8 (NCHW)
     const float* legal_masks,       // batch_size x 4672
     int batch_size,
     float* out_policies,            // batch_size x 4672
-    float* out_values               // batch_size
+    float* out_values               // batch_size x 3 (WDL probabilities: win, draw, loss)
 )>;
 
 // ============================================================================
@@ -161,6 +217,14 @@ using NeuralEvaluatorFn = std::function<void(
 // 2. Batching NN evaluations across all games
 // 3. Overlapping CPU (MCTS) and GPU (NN) work
 //
+// A lightweight record of a completed game's moves and result (for PGN export)
+struct SampleGame {
+    std::vector<std::string> moves_uci;   // UCI move strings
+    chess::GameResult result;              // WIN/LOSE/DRAW from White's perspective
+    chess::GameResultReason result_reason{chess::GameResultReason::NONE}; // CHECKMATE, STALEMATE, etc.
+    int num_moves;                         // Total number of moves
+};
+
 class ParallelSelfPlayCoordinator {
 public:
     explicit ParallelSelfPlayCoordinator(
@@ -225,6 +289,15 @@ public:
         double sims_per_sec;
         double nn_evals_per_sec;
 
+        // Tree depth
+        int64_t max_search_depth;
+        int64_t min_search_depth;
+        double avg_search_depth;
+
+        // Active game move counts
+        int min_current_moves;
+        int max_current_moves;
+
         // From queue
         double batch_fill_ratio;
         double avg_batch_size;
@@ -236,11 +309,21 @@ public:
     DetailedMetrics get_detailed_metrics() const;
 
     // =========================================================================
+    // Sample Game (for PGN export)
+    // =========================================================================
+
+    // Get a sample game from this generation run (prefers decisive games)
+    // Returns {moves_uci, result, num_moves} or empty if no games completed yet
+    SampleGame get_sample_game() const;
+    bool has_sample_game() const;
+
+    // =========================================================================
     // Collected Games (if no replay buffer provided)
     // =========================================================================
 
     // Get completed game trajectories (drains the queue)
     std::vector<GameTrajectory> get_completed_games();
+
 
 private:
     // Worker thread function
@@ -261,7 +344,8 @@ private:
         std::vector<float>& obs_buffer,
         std::vector<float>& mask_buffer,
         std::vector<float>& policy_buffer,
-        std::vector<float>& value_buffer
+        std::vector<float>& value_buffer,
+        std::vector<float>& wdl_buffer
     );
 
     // Configuration
@@ -295,6 +379,11 @@ private:
     // Error tracking (thread-safe, first-error-wins)
     mutable std::mutex error_mutex_;
     std::string last_error_;
+
+    // Sample game storage (thread-safe, prefers decisive games)
+    mutable std::mutex sample_game_mutex_;
+    SampleGame sample_game_;
+    bool has_sample_game_ = false;
 };
 
 } // namespace selfplay

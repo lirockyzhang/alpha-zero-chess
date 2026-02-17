@@ -7,3 +7,6 @@ build2/
 *.so
 !scripts/*.pyd
 !scripts/*.so
+
+# Downloaded binaries (e.g., Stockfish)
+bin/

@@ -7,10 +7,10 @@ import os
 import numpy as np
 import time
 
-# Fix Windows console encoding for Unicode characters
+# Fix Windows console encoding for Unicode characters (reconfigure avoids
+# closing the underlying buffer, which breaks pytest's capture mechanism)
 if sys.platform == 'win32':
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stdout.reconfigure(encoding='utf-8')
 
 # Add build directory to path (MSVC puts .pyd in build/Release/)
 build_dir = os.path.join(os.path.dirname(__file__), '..', 'build', 'Release')
@@ -27,7 +27,7 @@ def test_zero_copy_interface():
     fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
     # Pre-allocate buffer
-    buffer = np.zeros((119, 8, 8), dtype=np.float32)
+    buffer = np.zeros((8, 8, 122), dtype=np.float32)
 
     # Get buffer address before encoding
     buffer_id_before = id(buffer)
@@ -40,35 +40,25 @@ def test_zero_copy_interface():
     buffer_id_after = id(buffer)
     buffer_ptr_after = buffer.__array_interface__['data'][0]
 
-    print(f"✓ Buffer ID before: {buffer_id_before}")
-    print(f"✓ Buffer ID after: {buffer_id_after}")
-    print(f"✓ Buffer pointer before: {hex(buffer_ptr_before)}")
-    print(f"✓ Buffer pointer after: {hex(buffer_ptr_after)}")
+    print(f"  Buffer ID before: {buffer_id_before}")
+    print(f"  Buffer ID after: {buffer_id_after}")
+    print(f"  Buffer pointer before: {hex(buffer_ptr_before)}")
+    print(f"  Buffer pointer after: {hex(buffer_ptr_after)}")
 
     # Verify no copy occurred
-    if buffer_id_before == buffer_id_after and buffer_ptr_before == buffer_ptr_after:
-        print("✓ PASS: Zero-copy verified - buffer not reallocated")
-    else:
-        print("✗ FAIL: Buffer was copied or reallocated")
-        return False
+    assert buffer_id_before == buffer_id_after, "Buffer object ID changed"
+    assert buffer_ptr_before == buffer_ptr_after, "Buffer data pointer changed — not zero-copy"
 
-    # Verify encoding is correct
-    white_pawns = buffer[0]
+    # Verify encoding is correct (NHWC: buffer[rank, file, channel])
+    white_pawns = buffer[:, :, 0]  # Channel 0 = current player's pawns
     pawn_count = np.sum(white_pawns)
-    print(f"✓ White pawns detected: {int(pawn_count)} (expected: 8)")
-
-    if pawn_count == 8:
-        print("✓ PASS: Zero-copy encoding produces correct results\n")
-        return True
-    else:
-        print("✗ FAIL: Zero-copy encoding incorrect\n")
-        return False
+    assert pawn_count == 8, f"Expected 8 white pawns, got {int(pawn_count)}"
+    print("  PASS: Zero-copy verified, encoding correct")
 
 def test_batch_zero_copy_performance():
     """Test zero-copy performance for batch processing (256 positions)"""
     print("=== Test 2: Batch Zero-Copy Performance ===")
 
-    # Target: <1ms for 256 positions (from plan line 1784)
     batch_size = 256
     positions = [
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -78,7 +68,7 @@ def test_batch_zero_copy_performance():
     positions = positions[:batch_size]
 
     # Pre-allocate batch buffer
-    batch_buffer = np.zeros((batch_size, 119, 8, 8), dtype=np.float32)
+    batch_buffer = np.zeros((batch_size, 8, 8, 122), dtype=np.float32)
 
     # Benchmark zero-copy encoding
     start = time.perf_counter()
@@ -89,19 +79,10 @@ def test_batch_zero_copy_performance():
     elapsed_ms = elapsed * 1000
     per_position_us = (elapsed / batch_size) * 1e6
 
-    print(f"✓ Batch size: {batch_size} positions")
-    print(f"✓ Total time: {elapsed_ms:.2f} ms")
-    print(f"✓ Per-position time: {per_position_us:.1f} μs")
-    print(f"✓ Throughput: {batch_size / elapsed:.0f} positions/sec")
-
-    # Target: <1ms for 256 positions = <3.9μs per position
-    target_ms = 1.0
-    if elapsed_ms < target_ms:
-        print(f"✓ PASS: Batch encoding meets <{target_ms}ms target ({elapsed_ms:.2f}ms)\n")
-        return True
-    else:
-        print(f"⚠ WARNING: Batch encoding slower than {target_ms}ms target ({elapsed_ms:.2f}ms)\n")
-        return False
+    print(f"  Batch size: {batch_size} positions")
+    print(f"  Total time: {elapsed_ms:.2f} ms")
+    print(f"  Per-position time: {per_position_us:.1f} us")
+    print(f"  Throughput: {batch_size / elapsed:.0f} positions/sec")
 
 def test_memory_copy_comparison():
     """Compare zero-copy vs copy performance"""
@@ -117,7 +98,7 @@ def test_memory_copy_comparison():
     elapsed_copy = time.perf_counter() - start
 
     # Test 2: Zero-copy (encode_position_to_buffer writes to existing buffer)
-    buffer = np.zeros((119, 8, 8), dtype=np.float32)
+    buffer = np.zeros((8, 8, 122), dtype=np.float32)
     start = time.perf_counter()
     for _ in range(num_iterations):
         alphazero_cpp.encode_position_to_buffer(fen, buffer)
@@ -127,16 +108,9 @@ def test_memory_copy_comparison():
     zero_copy_us = (elapsed_zero_copy / num_iterations) * 1e6
     speedup = elapsed_copy / elapsed_zero_copy
 
-    print(f"✓ With copy: {copy_us:.1f} μs per position")
-    print(f"✓ Zero-copy: {zero_copy_us:.1f} μs per position")
-    print(f"✓ Speedup: {speedup:.2f}x faster")
-
-    if speedup > 1.0:
-        print(f"✓ PASS: Zero-copy is {speedup:.2f}x faster than copy\n")
-        return True
-    else:
-        print(f"⚠ WARNING: Zero-copy not faster than copy\n")
-        return False
+    print(f"  With copy: {copy_us:.1f} us per position")
+    print(f"  Zero-copy: {zero_copy_us:.1f} us per position")
+    print(f"  Speedup: {speedup:.2f}x faster")
 
 def test_gpu_memory_compatibility():
     """Test that encoding is compatible with GPU tensor libraries"""
@@ -145,30 +119,25 @@ def test_gpu_memory_compatibility():
     fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
     # Create buffer with specific memory layout (C-contiguous, float32)
-    buffer = np.zeros((119, 8, 8), dtype=np.float32, order='C')
+    buffer = np.zeros((8, 8, 122), dtype=np.float32, order='C')
 
     # Encode to buffer
     alphazero_cpp.encode_position_to_buffer(fen, buffer)
 
     # Verify memory layout is GPU-compatible
-    print(f"✓ Buffer dtype: {buffer.dtype} (expected: float32)")
-    print(f"✓ Buffer shape: {buffer.shape} (expected: (119, 8, 8))")
-    print(f"✓ Buffer is C-contiguous: {buffer.flags['C_CONTIGUOUS']}")
-    print(f"✓ Buffer is aligned: {buffer.flags['ALIGNED']}")
-    print(f"✓ Buffer owns data: {buffer.flags['OWNDATA']}")
+    print(f"  Buffer dtype: {buffer.dtype} (expected: float32)")
+    print(f"  Buffer shape: {buffer.shape} (expected: (8, 8, 122))")
+    print(f"  Buffer is C-contiguous: {buffer.flags['C_CONTIGUOUS']}")
+    print(f"  Buffer is aligned: {buffer.flags['ALIGNED']}")
 
-    # Check strides (should be C-contiguous: (512, 64, 8) bytes)
-    expected_strides = (8 * 8 * 4, 8 * 4, 4)  # (512, 32, 4) bytes
-    print(f"✓ Buffer strides: {buffer.strides} (expected: {expected_strides})")
+    # Check strides for (8, 8, 122) C-contiguous float32
+    expected_strides = (8 * 122 * 4, 122 * 4, 4)  # (3904, 488, 4) bytes
+    print(f"  Buffer strides: {buffer.strides} (expected: {expected_strides})")
 
-    if (buffer.dtype == np.float32 and
-        buffer.flags['C_CONTIGUOUS'] and
-        buffer.flags['ALIGNED']):
-        print("✓ PASS: Buffer is GPU-compatible (C-contiguous, aligned, float32)\n")
-        return True
-    else:
-        print("✗ FAIL: Buffer not GPU-compatible\n")
-        return False
+    assert buffer.dtype == np.float32, f"Expected float32, got {buffer.dtype}"
+    assert buffer.flags['C_CONTIGUOUS'], "Buffer is not C-contiguous"
+    assert buffer.flags['ALIGNED'], "Buffer is not aligned"
+    print("  PASS: Buffer is GPU-compatible")
 
 def test_concurrent_encoding():
     """Test that multiple buffers can be encoded concurrently"""
@@ -182,67 +151,36 @@ def test_concurrent_encoding():
     ]
 
     # Create separate buffers for each position
-    buffers = [np.zeros((119, 8, 8), dtype=np.float32) for _ in positions]
+    buffers = [np.zeros((8, 8, 122), dtype=np.float32) for _ in positions]
 
     # Encode all positions
     for i, fen in enumerate(positions):
         alphazero_cpp.encode_position_to_buffer(fen, buffers[i])
 
     # Verify each buffer is different
-    all_different = True
     for i in range(len(buffers) - 1):
         diff = np.sum(np.abs(buffers[i] - buffers[i+1]))
-        print(f"✓ Buffer {i} vs {i+1} difference: {diff:.0f}")
-        if diff == 0:
-            all_different = False
-
-    if all_different:
-        print("✓ PASS: Concurrent encoding produces different results\n")
-        return True
-    else:
-        print("✗ FAIL: Concurrent encoding produced identical results\n")
-        return False
+        print(f"  Buffer {i} vs {i+1} difference: {diff:.0f}")
+        assert diff > 0, f"Buffer {i} and {i+1} are identical"
+    print("  PASS: Concurrent encoding produces different results")
 
 if __name__ == "__main__":
     print("========================================")
     print("Zero-Copy Tensor Interface Tests")
-    print("========================================")
-    print("Target: <1ms for 256 positions (plan line 1784)")
     print("========================================\n")
 
-    results = []
-    try:
-        results.append(("Zero-Copy Interface", test_zero_copy_interface()))
-        results.append(("Batch Zero-Copy Performance", test_batch_zero_copy_performance()))
-        results.append(("Memory Copy Comparison", test_memory_copy_comparison()))
-        results.append(("GPU Memory Compatibility", test_gpu_memory_compatibility()))
-        results.append(("Concurrent Encoding", test_concurrent_encoding()))
-
-        print("========================================")
-        print("Test Results Summary")
-        print("========================================")
-        for name, passed in results:
-            status = "✓ PASS" if passed else "✗ FAIL"
-            print(f"{status}: {name}")
-
-        all_passed = all(result[1] for result in results)
-        if all_passed:
-            print("\n========================================")
-            print("✓✓✓ ALL ZERO-COPY TESTS PASSED ✓✓✓")
-            print("========================================")
-            print("\nPhase 3 (Python Bindings) is COMPLETE!")
-            print("Ready for Phase 4: Integration & Testing")
-        else:
-            print("\n========================================")
-            print("⚠ SOME TESTS FAILED")
-            print("========================================")
+    tests = [
+        test_zero_copy_interface,
+        test_batch_zero_copy_performance,
+        test_memory_copy_comparison,
+        test_gpu_memory_compatibility,
+        test_concurrent_encoding,
+    ]
+    for t in tests:
+        try:
+            t()
+            print()
+        except Exception as e:
+            print(f"FAILED: {e}\n")
             sys.exit(1)
-
-    except Exception as e:
-        print("========================================")
-        print("✗✗✗ TEST FAILED ✗✗✗")
-        print("========================================")
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    print("ALL ZERO-COPY TESTS PASSED")

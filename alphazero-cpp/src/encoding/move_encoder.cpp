@@ -9,7 +9,6 @@ namespace encoding {
 // - Planes 56-63: Knight moves (8 possible knight moves)
 // - Planes 64-72: Underpromotions (3 directions × 3 piece types)
 // Total: 73 planes × 64 squares = 4672 possible moves
-// But AlphaZero uses only 1858 moves (exact mapping varies by implementation)
 
 int MoveEncoder::move_to_index(const chess::Move& move, const chess::Board& board) {
     MoveType type = classify_move(move, board);
@@ -183,18 +182,13 @@ int MoveEncoder::encode_underpromotion(const chess::Move& move, const chess::Boa
 
 chess::Move MoveEncoder::decode_queen_move(int index, const chess::Board& board) {
     // Extract from_square and move parameters from index
+    // Index was encoded in white's perspective, so decode in white's perspective first
     int from = index / 56;
     int remainder = index % 56;
     int direction = remainder / 7;
     int distance = (remainder % 7) + 1;
 
-    // Flip for black's perspective
-    bool flip = (board.sideToMove() == chess::Color::BLACK);
-    if (flip) {
-        from = 63 - from;
-    }
-
-    // Calculate to_square based on direction and distance
+    // Calculate to_square in white's perspective (matching encoding)
     int from_rank = from / 8;
     int from_file = from % 8;
 
@@ -212,7 +206,8 @@ chess::Move MoveEncoder::decode_queen_move(int index, const chess::Board& board)
 
     int to = to_rank * 8 + to_file;
 
-    // Flip back if needed
+    // Flip both squares for black's perspective
+    bool flip = (board.sideToMove() == chess::Color::BLACK);
     if (flip) {
         from = 63 - from;
         to = 63 - to;
@@ -237,11 +232,12 @@ chess::Move MoveEncoder::decode_queen_move(int index, const chess::Board& board)
 
 chess::Move MoveEncoder::decode_knight_move(int index, const chess::Board& board) {
     // Extract from_square and knight move index
+    // Index was encoded in white's perspective, so decode in white's perspective first
     int offset = index - 56 * 64;
     int from = offset / 8;
     int knight_index = offset % 8;
 
-    // Knight move offsets
+    // Knight move offsets (in white's perspective)
     const int rank_offsets[] = {2, 1, -1, -2, -2, -1, 1, 2};
     const int file_offsets[] = {1, 2, 2, 1, -1, -2, -2, -1};
 
@@ -258,6 +254,13 @@ chess::Move MoveEncoder::decode_knight_move(int index, const chess::Board& board
 
     int to = to_rank * 8 + to_file;
 
+    // Flip both squares for black's perspective
+    bool flip = (board.sideToMove() == chess::Color::BLACK);
+    if (flip) {
+        from = 63 - from;
+        to = 63 - to;
+    }
+
     chess::Square from_sq = static_cast<chess::Square>(from);
     chess::Square to_sq = static_cast<chess::Square>(to);
 
@@ -266,6 +269,7 @@ chess::Move MoveEncoder::decode_knight_move(int index, const chess::Board& board
 
 chess::Move MoveEncoder::decode_underpromotion(int index, const chess::Board& board) {
     // Extract from_square and promotion parameters
+    // Index was encoded in white's perspective, so decode in white's perspective first
     int offset = index - 56 * 64 - 8 * 64;
     int from = offset / 9;
     int remainder = offset % 9;
@@ -280,16 +284,16 @@ chess::Move MoveEncoder::decode_underpromotion(int index, const chess::Board& bo
         return chess::Move::NO_MOVE;
     }
 
-    // Determine to_rank based on color
-    int from_rank = from / 8;
-    int to_rank;
-    if (board.sideToMove() == chess::Color::WHITE) {
-        to_rank = 7;  // White promotes to rank 7
-    } else {
-        to_rank = 0;  // Black promotes to rank 0
-    }
-
+    // Always compute in white's perspective: promotion to rank 7
+    int to_rank = 7;
     int to = to_rank * 8 + to_file;
+
+    // Flip both squares for black's perspective
+    bool flip = (board.sideToMove() == chess::Color::BLACK);
+    if (flip) {
+        from = 63 - from;
+        to = 63 - to;
+    }
 
     chess::Square from_sq = static_cast<chess::Square>(from);
     chess::Square to_sq = static_cast<chess::Square>(to);

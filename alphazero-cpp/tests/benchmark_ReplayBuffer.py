@@ -5,7 +5,6 @@ import sys
 import os
 import time
 import numpy as np
-import tempfile
 from pathlib import Path
 from typing import Tuple
 import threading
@@ -113,7 +112,7 @@ def benchmark_sample(buffer_size: int = 100000, batch_size: int = 256, num_sampl
     start = time.perf_counter()
 
     for _ in range(num_samples):
-        obs, pol, val = buffer.sample(batch_size)
+        obs, pol, val, wdl, sv = buffer.sample(batch_size)
 
     elapsed = time.perf_counter() - start
     total_sampled = batch_size * num_samples
@@ -131,61 +130,6 @@ def benchmark_sample(buffer_size: int = 100000, batch_size: int = 256, num_sampl
     print(f"  Data throughput: {throughput_mbps:,.1f} MB/s")
 
     return num_samples / elapsed
-
-def benchmark_persistence(buffer_size: int = 50000):
-    """Benchmark save/load performance."""
-    print(f"\n{'='*80}")
-    print(f"Benchmark 4: Persistence (Save/Load, size={buffer_size:,})")
-    print(f"{'='*80}")
-
-    # Create and fill buffer
-    buffer = alphazero_cpp.ReplayBuffer(capacity=buffer_size)
-
-    print("  Filling buffer...")
-    for i in range(buffer_size):
-        obs = np.random.rand(7808).astype(np.float32)
-        pol = np.random.rand(4672).astype(np.float32)
-        buffer.add_sample(obs, pol, float(i % 100) / 100)
-
-    # Save benchmark
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".rpbf") as f:
-        temp_path = f.name
-
-    try:
-        # Warmup
-        buffer.save(temp_path)
-
-        # Benchmark save
-        start = time.perf_counter()
-        buffer.save(temp_path)
-        save_time = time.perf_counter() - start
-
-        # File size
-        file_size_mb = os.path.getsize(temp_path) / (1024**2)
-
-        print(f"  Save time: {save_time:.3f}s")
-        print(f"  File size: {file_size_mb:.1f} MB")
-        print(f"  Save speed: {file_size_mb/save_time:.1f} MB/s")
-
-        # Load benchmark
-        buffer2 = alphazero_cpp.ReplayBuffer(capacity=buffer_size)
-
-        # Warmup
-        buffer2.load(temp_path)
-
-        # Benchmark load
-        start = time.perf_counter()
-        buffer2.load(temp_path)
-        load_time = time.perf_counter() - start
-
-        print(f"  Load time: {load_time:.3f}s")
-        print(f"  Load speed: {file_size_mb/load_time:.1f} MB/s")
-
-        return save_time, load_time
-
-    finally:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
 
 def benchmark_threading(buffer_size: int = 100000, num_threads: int = 4, ops_per_thread: int = 1000):
     """Benchmark multi-threaded performance."""
@@ -316,7 +260,6 @@ def main():
         results['add_sample'] = benchmark_add_sample(buffer_size=10000, num_samples=10000)
         results['add_batch'] = benchmark_add_batch(buffer_size=100000, batch_size=256, num_batches=100)
         results['sample'] = benchmark_sample(buffer_size=100000, batch_size=256, num_samples=1000)
-        results['save'], results['load'] = benchmark_persistence(buffer_size=50000)
         benchmark_threading(buffer_size=100000, num_threads=4, ops_per_thread=1000)
         benchmark_memory_usage(buffer_size=100000)
 
@@ -327,8 +270,6 @@ def main():
         print(f"  Add (single): {results['add_sample']:,.0f} samples/sec")
         print(f"  Add (batch):  {results['add_batch']:,.0f} samples/sec")
         print(f"  Sample:       {results['sample']:,.0f} batches/sec")
-        print(f"  Save time:    {results['save']:.3f}s (50K samples)")
-        print(f"  Load time:    {results['load']:.3f}s (50K samples)")
 
         print("\n" + "="*80)
         print("BOTTLENECK ANALYSIS")
@@ -340,9 +281,6 @@ def main():
 
         if results['sample'] < 500:
             print("  [SLOW] Sampling: Consider pre-allocation or caching")
-
-        if results['save'] > 1.0:
-            print("  [SLOW] Save operation: Consider compression or async I/O")
 
         print("\n  See TRAINING_OPTIMIZATION_PROPOSALS.md for detailed optimizations")
 

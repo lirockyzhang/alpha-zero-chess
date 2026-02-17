@@ -43,13 +43,22 @@ uv run python alphazero-cpp/scripts/train.py \
     --filters 64 \
     --blocks 5
 
-# Production training (~12-24 hours)
+# Production training (~12-24 hours, Gumbel SH is default)
 uv run python alphazero-cpp/scripts/train.py \
     --iterations 100 \
     --games-per-iter 50 \
     --simulations 800 \
     --filters 192 \
     --blocks 15
+
+# Same but with classic AlphaZero PUCT (for comparison)
+uv run python alphazero-cpp/scripts/train.py \
+    --iterations 100 \
+    --games-per-iter 50 \
+    --simulations 800 \
+    --filters 192 \
+    --blocks 15 \
+    --search-algorithm puct
 ```
 
 ### Evaluation
@@ -94,15 +103,18 @@ Parameters are grouped by which phase of training they affect:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--simulations` | 800 | MCTS simulations per move |
-| `--search-batch` | 64 | Leaves to evaluate per MCTS iteration |
-| `--c-puct` | 1.5 | MCTS exploration constant |
+| `--c-explore` | 1.5 | MCTS exploration constant |
+| `--search-algorithm` | gumbel | Root search: `gumbel` (Sequential Halving) or `puct` (Dirichlet) |
+| `--gumbel-top-k` | 16 | Initial candidate actions for Sequential Halving |
+| `--gumbel-c-visit` | 50.0 | Gumbel sigma() visit constant |
+| `--gumbel-c-scale` | 1.0 | Gumbel sigma() scale factor |
 
 #### Neural Network Parameters
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--filters` | 192 | Network filter count |
 | `--blocks` | 15 | Residual block count |
-| `--eval-batch` | 512 | Max positions per GPU call in parallel mode |
+| `--eval-batch` | auto | Auto-computed as workers x search_batch rounded to 32; user value is raised to this floor if too low |
 | `--batch-timeout-ms` | 5 | Max wait time to fill GPU batch in ms |
 
 #### Training Parameters
@@ -119,7 +131,7 @@ Parameters are grouped by which phase of training they affect:
 | `--device` | cuda | Device (cuda or cpu) |
 | `--save-dir` | checkpoints | Base checkpoint directory |
 | `--resume` | - | Resume from checkpoint path (.pt file) or run directory |
-| `--save-interval` | 5 | Save every N iterations |
+| `--save-interval` | 1 | Save every N iterations |
 | `--progress-interval` | 30 | Print performance stats every N seconds |
 
 #### Buffer Persistence
@@ -273,13 +285,12 @@ Each training iteration follows this flow:
 │     For each move:                                                       │
 │     ┌────────────────────────────────────────────────────────────────┐  │
 │     │  2. MCTS SEARCH                                                 │  │
-│     │     --simulations, --c-puct                                     │  │
+│     │     --simulations, --c-explore                                  │  │
 │     │                                                                 │  │
 │     │     Repeat until simulations complete:                          │  │
 │     │     ┌──────────────────────────────────────────────────────┐   │  │
 │     │     │  3. NEURAL NETWORK EVALUATION                        │   │  │
-│     │     │     --search-batch (leaves per iteration)            │   │  │
-│     │     │     --eval-batch (GPU batch in parallel mode)        │   │  │
+│     │     │     --eval-batch (auto-computed GPU batch)            │   │  │
 │     │     │     --filters, --blocks (network architecture)       │   │  │
 │     │     └──────────────────────────────────────────────────────┘   │  │
 │     └────────────────────────────────────────────────────────────────┘  │
@@ -303,7 +314,7 @@ Each training iteration follows this flow:
 | Large | 192 | 15 | ~11M | 10GB | Production |
 | Paper | 256 | 19 | ~20M | 16GB+ | Research |
 
-### MCTS Settings (`--simulations`, `--search-batch`)
+### MCTS Settings (`--simulations`)
 
 | Simulations | Speed | Strength | Recommended For |
 |-------------|-------|----------|-----------------|
@@ -312,25 +323,7 @@ Each training iteration follows this flow:
 | 800 | Slow | Strong | Production (paper default) |
 | 1600 | Very slow | Strongest | Evaluation only |
 
-**Search batch (`--search-batch`)**: Controls how many leaf positions are collected before sending to GPU for evaluation.
-
-```
-MCTS with --simulations 800 and --search-batch 64:
-
-Iteration 1: Collect 64 leaves → GPU eval → Backprop → 64 sims done
-Iteration 2: Collect 64 leaves → GPU eval → Backprop → 128 sims done
-...
-Iteration 12-13: → 800 simulations complete
-
-GPU calls per move: ~13 (800 ÷ 64)
-```
-
-| search-batch | GPU Calls/Move | GPU Utilization | Best For |
-|--------------|----------------|-----------------|----------|
-| 16 | Many (~50) | Low (~30%) | Very low VRAM |
-| 32 | Moderate (~25) | Medium (~50%) | 4GB GPUs |
-| **64** | Few (~13) | Good (~70%) | **Default** (8GB) |
-| 128 | Very few (~7) | High (~85%) | 12GB+ GPUs |
+**Note:** The number of leaves evaluated per MCTS iteration (`search_batch`) is now auto-derived from the search algorithm: Gumbel mode uses `gumbel_top_k`, PUCT mode uses 1 (with virtual loss). This is no longer a user-facing parameter.
 
 ### Parallel Self-Play (`--workers`, `--eval-batch`)
 
@@ -352,7 +345,7 @@ Parallel (--workers 16):
 | Parameter | Effect |
 |-----------|--------|
 | `--workers 16` | 16 games run concurrently |
-| `--eval-batch 512` | Collect up to 512 leaves from ALL games before GPU call |
+| `--eval-batch` | Auto-computed as workers x search_batch (rounded to 32); can override with a higher value |
 | `--batch-timeout-ms 5` | Don't wait longer than 5ms for batch to fill |
 | `--queue-capacity 8192` | Evaluation queue capacity (increase for many workers) |
 | `--root-eval-retries 3` | Max retries for root NN eval timeout before giving up |
@@ -362,24 +355,23 @@ Parallel (--workers 16):
 
 This section explains how the parallel self-play parameters interact and how to size them for your hardware.
 
-#### The Golden Formula: `eval_batch = workers × search_batch`
+#### Auto-Computed `eval_batch`
 
-The three parameters `--eval-batch`, `--workers`, and `--search-batch` are fundamentally linked. Each worker submits `search_batch` leaves per MCTS round, so the maximum leaves arriving per round is `workers × search_batch`. Setting `eval_batch` equal to this product gives optimal GPU utilization:
+`eval_batch` is now **automatically computed** as `workers x search_batch`, rounded up to the nearest multiple of 32. The `search_batch` value is itself auto-derived from the search algorithm (Gumbel uses `gumbel_top_k`, PUCT uses 1). You only need to set `--workers` and optionally `--eval-batch` (which acts as a floor -- the auto-computed value is raised to your override if it would be lower).
 
 ```
-eval_batch = workers × search_batch
+Auto formula: eval_batch = ceil(workers × search_batch / 32) × 32
 
-Too large  → batches never fill → GPU fires on timeout with wasted padding (underfilled)
-Too small  → excess leaves queue up → workers stall waiting for queue space
-Just right → batches fill quickly → GPU stays busy
+Example (Gumbel, 16 workers, top_k=16):
+  search_batch = 16 (auto from gumbel_top_k)
+  eval_batch   = ceil(16 × 16 / 32) × 32 = 256
+
+Example (Gumbel, 64 workers, top_k=16):
+  search_batch = 16
+  eval_batch   = ceil(64 × 16 / 32) × 32 = 1024
 ```
 
-| workers | search_batch | eval_batch | Fill ratio | Status |
-|---------|-------------|------------|------------|--------|
-| 16 | 16 | 256 | ~1.0 | Optimal |
-| 64 | 32 | 2048 | ~1.0 | Optimal |
-| 64 | 16 | 4096 | ~0.25 | Underfilled — reduce eval_batch to 1024 |
-| 128 | 32 | 2048 | ~2.0 | Queuing — increase eval_batch to 4096 |
+If you pass `--eval-batch 2048` but the auto-computed value is 1024, the system uses 2048 (your value is a floor). If you pass `--eval-batch 512` and the auto-computed value is 1024, the system uses 1024 (auto floor wins).
 
 #### Sizing `eval-batch` by GPU Memory
 
@@ -401,52 +393,35 @@ Just right → batches fill quickly → GPU stays busy
 
 **Key insight for early training:** An untrained network benefits more from game quantity than move quality. Random weights produce random evaluations regardless of search depth, so more games (with fewer sims each) cover more of the state space faster. As the network improves, increase simulations to generate higher-quality training data.
 
-**Interaction with the parallel pipeline:** Higher simulations means each move takes longer, so workers submit leaves at a steadier rate (less bursty). Lower simulations means moves finish quickly and workers cycle rapidly, increasing queue pressure. If you lower simulations significantly, you may need to reduce `eval_batch` to maintain a good fill ratio.
+**Interaction with the parallel pipeline:** Higher simulations means each move takes longer, so workers submit leaves at a steadier rate (less bursty). Lower simulations means moves finish quickly and workers cycle rapidly. Since `eval_batch` is now auto-computed from workers and search_batch, it adjusts automatically.
 
 Typical progression: start with 400 sims, increase to 800–1600 as the network matures.
 
-#### Sizing `search-batch`: Simulations Matter
+#### Note on `search_batch` (Auto-Derived)
 
-`search_batch` controls how many leaves a single game's MCTS selects per GPU call. The key constraint is:
+`search_batch` (the number of leaves evaluated per MCTS iteration within a single game) is now automatically derived:
+- **Gumbel mode**: `search_batch = gumbel_top_k` (default 16). Sequential Halving uses round-robin allocation, so the batch size matches the number of candidate actions.
+- **PUCT mode**: `search_batch = 1`. Classic PUCT selects one leaf at a time with virtual loss.
 
-> **`search_batch ≤ simulations / 4`** — the tree needs at least 4 rounds of expansion for convergence.
-
-Each batch applies virtual loss to all selected leaves. With too few rounds, the first batch greedily expands shallow nodes, then virtual loss forces the second batch onto suboptimal branches — and there aren't enough remaining rounds to recover.
-
-| simulations | Max search_batch | Recommended |
-|-------------|-----------------|-------------|
-| 100 | 25 | 16 |
-| 400 | 100 | 16–32 |
-| 800 | 200 | 16–32 |
-| 1600 | 400 | 16–32 |
-
-**Parallel mode (`workers > 1`):** Use 16–32. Cross-game batching via `eval_batch` handles GPU utilization, so `search_batch` primarily affects search quality.
-
-**Sequential mode (`workers = 1`):** Use 64–128. `search_batch` is the only batching mechanism, so it must be larger to keep the GPU busy. The constraint `sims ≥ 4 × search_batch` still applies.
-
-**Does changing simulations require changing search_batch?** Usually not in parallel mode — 16–32 is safe across the 400–1600 range. Only at very low sims (≤100) should you use 16 instead of 32.
+This is no longer a user-facing parameter. GPU utilization in parallel mode comes from cross-game batching via `eval_batch`, not from within-game batching.
 
 #### Sizing `workers`
 
-The optimal number of workers follows from the golden formula:
+`--workers` controls how many self-play games run concurrently. Since `eval_batch` is now auto-computed from workers, you only need to choose workers based on:
 
-```
-workers = eval_batch / search_batch
-```
-
-Additional considerations:
 - **Must not exceed `--games-per-iter`** — excess workers sit idle
-- **Diminishing returns** beyond `eval_batch / search_batch` — extra workers just queue up
-- **Memory:** each worker holds an MCTS tree in RAM (~50–200 MB depending on simulations and tree reuse), so 128 workers may need 10–25 GB of system RAM
+- **More workers = better GPU utilization** — more leaves available for batching
+- **Memory:** each worker holds an MCTS tree in RAM (~50-200 MB depending on simulations), so 128 workers may need 10-25 GB of system RAM
+- **Typical values**: 16 for 8GB GPUs, 64 for 12-24GB GPUs, 128 for 40GB+ GPUs
 
 #### Quick Reference: Parallel Configurations
 
-| GPU | eval_batch | workers | search_batch | Notes |
-|-----|-----------|---------|-------------|-------|
-| 8 GB | 1024 | 64 | 16 | `64 × 16 = 1024` ✓ |
-| 12 GB | 2048 | 64 | 32 | `64 × 32 = 2048` ✓ |
-| 24 GB | 2048 | 64 | 32 | Room to increase eval_batch |
-| 40 GB (A100) | 4096 | 128 | 32 | `128 × 32 = 4096` ✓ |
+| GPU | workers | eval_batch (auto) | Notes |
+|-----|---------|-------------------|-------|
+| 8 GB | 16 | 256 | Gumbel default (16 x 16 = 256) |
+| 12 GB | 64 | 1024 | Gumbel default (64 x 16 = 1024) |
+| 24 GB | 64 | 1024 | Room to override `--eval-batch 2048` |
+| 40 GB (A100) | 128 | 2048 | Gumbel default (128 x 16 = 2048) |
 
 ### Training Settings
 
@@ -466,10 +441,43 @@ Additional considerations:
   - **More stable**: `--lr 0.0003 --epochs 10` (slower convergence)
 - The AlphaZero paper uses SGD with lr=0.2→0.02→0.002, but requires millions of samples
 
-### Exploration (`--temperature-moves`, `--c-puct`)
+### Root Search Algorithm (`--search-algorithm`)
+
+Two root-level search algorithms are available. Non-root tree traversal always uses PUCT regardless.
+
+**Gumbel Top-k Sequential Halving** (default: `--search-algorithm gumbel`):
+- Replaces Dirichlet noise with **Gumbel noise** for theoretically principled exploration
+- Uses **Sequential Halving** to efficiently allocate the simulation budget across candidate moves
+- Produces **improved policy** training targets: `softmax(logit + sigma(Q_completed))` — contains search knowledge for all legal moves, not just visited ones
+- Move selection during temperature phase uses the SH winner (a valid sample from the improved policy via the Gumbel-Max trick)
+
+**Standard PUCT + Dirichlet** (`--search-algorithm puct`):
+- Classic AlphaZero approach: Dirichlet noise on root priors, PUCT selection, visit-count policy targets
+- Use for comparison/ablation or if you want the traditional algorithm
+
+```
+Gumbel (default):
+  Root:  Gumbel noise + Sequential Halving → improved policy target
+  Tree:  Standard PUCT (unchanged)
+  Target: softmax(logit + sigma(Q_completed)) for ALL children
+
+PUCT:
+  Root:  Dirichlet noise + PUCT selection
+  Tree:  Standard PUCT (unchanged)
+  Target: visit_count / total_visits (temperature-applied)
+```
+
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `--gumbel-top-k` | 16 | How many candidate moves enter Sequential Halving. Higher = wider exploration, more sims needed |
+| `--gumbel-c-visit` | 50.0 | Controls how much search Q-values influence the improved policy. Higher = search results matter more |
+| `--gumbel-c-scale` | 1.0 | Scales the sigma() value transform. Usually left at 1.0 |
+
+### Exploration (`--temperature-moves`, `--c-explore`)
 
 - `--temperature-moves 30`: First 30 moves use temperature=1 (exploration), then greedy
-- `--c-puct 1.5`: PUCT exploration constant (higher = more exploration)
+- `--c-explore 1.5`: Exploration constant for PUCT tree traversal (higher = more exploration)
+- In Gumbel mode, temperature phase uses the SH winner (stochastic); post-temperature uses argmax of improved policy (deterministic)
 
 ---
 
@@ -477,47 +485,13 @@ Additional considerations:
 
 This section explains how each parameter affects training and how to tune them for your hardware and goals.
 
-### Understanding `--search-batch` (Critical for Performance)
+### Note: `search_batch` is Auto-Derived
 
-The `--search-batch` parameter controls **how many leaf nodes are evaluated in a single GPU batch** during MCTS search. This is one of the most important parameters for performance.
+The `search_batch` value (leaves per MCTS iteration) is no longer a user parameter. It is automatically set based on the search algorithm:
+- **Gumbel mode** (default): `search_batch = gumbel_top_k` (default 16)
+- **PUCT mode**: `search_batch = 1`
 
-```
-MCTS Search Flow:
-┌─────────────────────────────────────────────────────────────────┐
-│  1. Select leaves (C++ tree traversal)                          │
-│  2. Collect up to search-batch leaves                           │
-│  3. Send batch to GPU for neural network evaluation             │
-│  4. Backpropagate results (C++ tree update)                     │
-│  5. Repeat until simulations complete                           │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**How it affects performance:**
-
-| search-batch | GPU Calls per Move | GPU Utilization | Latency | Best For |
-|--------------|-------------------|-----------------|---------|----------|
-| 8 | Many (100+) | Low (~20%) | High | Not recommended |
-| 32 | Moderate (25-50) | Medium (~50%) | Medium | Low VRAM GPUs (4GB) |
-| 64 | Few (12-25) | Good (~70%) | Low | **Default** (8GB GPUs) |
-| 128 | Very few (6-12) | High (~85%) | Very low | High-end GPUs (12GB+) |
-| 256 | Minimal (3-6) | Highest (~90%) | Minimal | Multi-GPU / A100 |
-
-**Tuning strategy:**
-```bash
-# Start with default
---search-batch 64
-
-# If you see "CUDA out of memory", reduce:
---search-batch 32
-
-# If GPU utilization is low (check with nvidia-smi), increase:
---search-batch 128
-```
-
-**Relationship with `--simulations`:**
-- `search-batch` should be ≤ `simulations / 4` for efficiency
-- Example: 800 simulations → use search-batch 32-128
-- Example: 200 simulations → use search-batch 16-64
+GPU utilization in parallel mode is driven by `--workers` and the auto-computed `eval_batch`, not by within-game batching. To improve GPU utilization, increase `--workers`.
 
 ### Understanding `--simulations`
 
@@ -617,18 +591,18 @@ Smaller buffer = Focuses on recent games
 | 32 GB | 500,000 |
 | 64 GB+ | 1,000,000 |
 
-### Understanding `--c-puct`
+### Understanding `--c-explore`
 
-Controls exploration vs exploitation in MCTS:
+Controls exploration vs exploitation in MCTS tree traversal (PUCT formula):
 
 ```
-Higher c-puct = More exploration (try new moves)
-              = Better for early training
-              = May waste simulations on bad moves
+Higher c_explore = More exploration (try new moves)
+                 = Better for early training
+                 = May waste simulations on bad moves
 
-Lower c-puct = More exploitation (trust the network)
-             = Better for late training / evaluation
-             = May miss good moves the network undervalues
+Lower c_explore  = More exploitation (trust the network)
+                 = Better for late training / evaluation
+                 = May miss good moves the network undervalues
 ```
 
 | Value | Behavior | When to Use |
@@ -658,12 +632,56 @@ Move temperature_moves+1 onwards: Greedy selection (best move)
 | 30 | **Default** - Good balance for chess |
 | 50 | Long exploration (very diverse but less realistic endgames) |
 
+### Understanding `--search-algorithm` (Gumbel vs PUCT)
+
+The root search algorithm determines how exploration noise is added, how the simulation budget is allocated across root children, and what policy targets are produced for training.
+
+**Gumbel Top-k Sequential Halving** (default) implements the algorithm from "Policy improvement by planning with Gumbel" (Danihelka et al., 2022). It works in three stages:
+
+```
+1. INIT:    Sample Gumbel(0,1) noise g(a) for each legal action a
+            Compute logit(a) = log(prior(a))
+            Select top-m actions by logit(a) + g(a)
+
+2. HALVING: For ceil(log2(m)) phases:
+              Allocate sims evenly across active actions (round-robin)
+              Score: logit(a) + g(a) + sigma(Q_completed(a))
+              Prune bottom half
+
+3. OUTPUT:  Training target: softmax(logit(a) + sigma(Q_completed(a))) for ALL children
+            Move selection: SH winner (temperature phase) or argmax improved policy
+```
+
+Key concepts:
+- **Completed Q**: `Q_hat(a) = N/(1+N) * Q(a) + 1/(1+N) * V(root)` — smoothly interpolates between the NN value prior (unvisited) and MCTS Q-value (visited)
+- **sigma()**: `(c_visit + max_visits) * c_scale * q_normalized` — transforms Q-values to the same scale as logits
+- **Round-robin**: Instead of PUCT selection at the root, Gumbel mode cycles through active actions. This eliminates root collisions without virtual loss (which would bias Q-values)
+
+**When to use which:**
+
+| Scenario | Recommendation |
+|----------|---------------|
+| New training run | Gumbel (default) — better policy targets, principled exploration |
+| A/B comparison | Run identical configs with `--search-algorithm gumbel` vs `puct` |
+| Resuming old run | Use `--search-algorithm puct` if the model was trained with PUCT |
+| Very few simulations (<50) | Gumbel still works but SH phases become very short |
+| Evaluation / play | Either works; Gumbel is slightly more efficient with small budgets |
+
+**Tuning `--gumbel-top-k`:**
+
+| top_k | Budget allocation | Best for |
+|-------|-------------------|----------|
+| 8 | Concentrated (fewer candidates, more sims each) | Low sim budgets (100-200) |
+| **16** | **Balanced (default)** | Most training scenarios |
+| 32 | Wide (many candidates, fewer sims each) | High sim budgets (800+), opening diversity |
+
+Rule of thumb: `top_k` should be ≤ simulations / 4 so each action gets multiple simulations per phase.
+
 ### Parameter Combinations by Goal
 
 **Goal: Maximum Training Speed (development)**
 ```bash
 --simulations 200 \
---search-batch 64 \
 --games-per-iter 10 \
 --train-batch 256 \
 --epochs 3
@@ -674,15 +692,12 @@ Move temperature_moves+1 onwards: Greedy selection (best move)
 --simulations 400 \
 --workers 16 \
 --games-per-iter 64 \
---search-batch 64 \
---eval-batch 512 \
 --train-batch 256
 ```
 
 **Goal: Maximum Model Quality (production)**
 ```bash
 --simulations 800 \
---search-batch 64 \
 --games-per-iter 100 \
 --train-batch 1024 \
 --epochs 5 \
@@ -692,7 +707,6 @@ Move temperature_moves+1 onwards: Greedy selection (best move)
 **Goal: Low VRAM (4-6 GB GPU)**
 ```bash
 --simulations 400 \
---search-batch 32 \
 --filters 64 \
 --blocks 5 \
 --train-batch 128 \
@@ -702,7 +716,6 @@ Move temperature_moves+1 onwards: Greedy selection (best move)
 **Goal: Debugging / Testing**
 ```bash
 --simulations 50 \
---search-batch 16 \
 --games-per-iter 2 \
 --iterations 1
 ```
@@ -713,8 +726,8 @@ Watch these metrics during training:
 
 | Metric | Healthy Range | If Too Low | If Too High |
 |--------|---------------|------------|-------------|
-| moves/sec | 10-50 | Increase search-batch or use --workers | Expected with larger networks |
-| GPU util | 60-90% | Use --workers 16 or increase search-batch | Expected (good!) |
+| moves/sec | 10-50 | Increase --workers for better batching | Expected with larger networks |
+| GPU util | 60-90% | Use --workers 16 or more | Expected (good!) |
 | Loss | Decreasing | Normal | Check if stuck (reduce lr) |
 | policy_loss | 2.0-5.0 | Good convergence | May need more exploration |
 | value_loss | 0.1-0.5 | Good convergence | May need more games |
@@ -1002,8 +1015,8 @@ Open http://localhost:5000 in your browser.
 
 Reduce these parameters:
 1. `--train-batch` (e.g., 128 instead of 256)
-2. `--search-batch` (e.g., 32 instead of 64)
-3. `--eval-batch` (e.g., 256 instead of 512, for parallel mode)
+2. `--workers` (fewer workers = smaller auto-computed eval_batch)
+3. `--eval-batch` (override with a lower value if needed)
 4. Network size (`--filters`, `--blocks`)
 
 ### Training Too Slow
@@ -1015,8 +1028,8 @@ Reduce these parameters:
 
 ### Low GPU Utilization
 
-1. Enable parallel self-play: `--workers 16 --eval-batch 512`
-2. Increase `--search-batch` (e.g., 128 instead of 64)
+1. Enable parallel self-play: `--workers 16` (eval_batch auto-computed)
+2. Increase `--workers` for better cross-game batching
 3. Increase `--train-batch` during training phase
 
 ### High MCTS Timeout Evals (Stale Results & Root Retries)
@@ -1107,6 +1120,9 @@ train.py --resume checkpoints/f192-b15_2024-02-03_14-30-00 --iterations 100
 # With buffer persistence
 train.py --iterations 50 --buffer-persistence
 
+# Use classic PUCT instead of Gumbel (A/B testing)
+train.py --iterations 50 --search-algorithm puct
+
 # Disable evaluation and visualization (faster checkpointing)
 train.py --iterations 50 --no-eval --no-visualization
 
@@ -1118,9 +1134,20 @@ evaluate.py --checkpoint checkpoints/f192-b15_.../model_final.pt --opponent rand
 
 | When Used | Parameter | Default | Purpose |
 |-----------|-----------|---------|---------|
-| MCTS Search | `--search-batch` | 64 | Leaves per MCTS GPU call |
-| Parallel Eval | `--eval-batch` | 512 | Max leaves across all games |
+| Root Search | `--search-algorithm` | gumbel | `gumbel` (SH) or `puct` (Dirichlet) |
+| Gumbel | `--gumbel-top-k` | 16 | Candidate actions for Sequential Halving |
+| Parallel Eval | `--eval-batch` | auto | Auto-computed GPU batch size (workers x search_batch, rounded to 32) |
 | Training | `--train-batch` | 256 | Samples per gradient step |
+
+### New in v3.0
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| Gumbel Top-k SH | `--search-algorithm gumbel` | Gumbel MuZero root search replaces Dirichlet + PUCT at root (default) |
+| Sequential Halving | `--gumbel-top-k 16` | Efficient sim budget allocation via halving candidate set |
+| Improved policy targets | Enabled | `softmax(logit + sigma(Q_completed))` training targets with theoretical guarantees |
+| PUCT fallback | `--search-algorithm puct` | Original AlphaZero algorithm still available for A/B testing |
+| Gumbel tuning | 3 params | `--gumbel-c-visit`, `--gumbel-c-scale`, `--gumbel-top-k` |
 
 ### New in v2.1
 
@@ -1142,7 +1169,7 @@ evaluate.py --checkpoint checkpoints/f192-b15_.../model_final.pt --opponent rand
 
 ---
 
-**Last Updated**: 2026-02-03
+**Last Updated**: 2026-02-16
 
 
 │ GPU Batch Collection & Evaluation Pipeline Redesign                                                                           │

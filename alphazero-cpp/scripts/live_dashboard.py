@@ -275,6 +275,185 @@ DASHBOARD_HTML = """
                 min-width: 80px;
             }
         }
+        /* Parameter Controls */
+        .param-controls-section {
+            background: rgba(0,0,0,0.25);
+            border-top: 1px solid rgba(255,255,255,0.1);
+            padding: 0;
+        }
+        .param-controls-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 20px;
+            cursor: pointer;
+            user-select: none;
+            transition: background 0.2s;
+        }
+        .param-controls-header:hover {
+            background: rgba(255,255,255,0.05);
+        }
+        .param-controls-header .gear-icon {
+            font-size: 1.1em;
+        }
+        .param-controls-header .toggle-arrow {
+            transition: transform 0.3s;
+            font-size: 0.8em;
+            opacity: 0.6;
+        }
+        .param-controls-header .toggle-arrow.open {
+            transform: rotate(90deg);
+        }
+        .param-controls-header h3 {
+            flex: 1;
+            font-size: 1em;
+            color: #a8d8ea;
+            margin: 0;
+        }
+        .param-status {
+            font-size: 0.8em;
+            padding: 3px 10px;
+            border-radius: 12px;
+            display: none;
+        }
+        .param-status.pending {
+            display: inline-block;
+            background: rgba(241, 196, 15, 0.25);
+            color: #f1c40f;
+        }
+        .param-status.applied {
+            display: inline-block;
+            background: rgba(46, 204, 113, 0.25);
+            color: #2ecc71;
+        }
+        .param-controls-body {
+            padding: 0 20px 15px;
+        }
+        .param-groups {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 15px;
+            margin-bottom: 15px;
+        }
+        .param-group {
+            background: rgba(255,255,255,0.05);
+            border-radius: 10px;
+            padding: 12px;
+        }
+        .param-group h4 {
+            font-size: 0.9em;
+            color: #a8d8ea;
+            margin: 0 0 10px 0;
+            padding-bottom: 5px;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        .param-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 0;
+            font-size: 0.85em;
+        }
+        .param-row label {
+            flex: 1;
+            color: #95a5a6;
+            min-width: 0;
+        }
+        .param-row input[type="number"] {
+            width: 100px;
+            padding: 4px 6px;
+            background: rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 4px;
+            color: #eee;
+            font-size: 0.9em;
+            text-align: right;
+        }
+        .param-row input[type="number"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .param-row input[type="number"].modified {
+            border-color: #f1c40f;
+            box-shadow: 0 0 4px rgba(241, 196, 15, 0.3);
+        }
+        .param-row .param-current {
+            font-size: 0.8em;
+            color: #666;
+            min-width: 70px;
+            text-align: right;
+        }
+        .param-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .param-apply-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 8px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9em;
+            font-weight: bold;
+            transition: opacity 0.2s;
+        }
+        .param-apply-btn:hover {
+            opacity: 0.9;
+        }
+        .param-apply-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .param-reset-btn {
+            background: rgba(255,255,255,0.1);
+            color: #ccc;
+            border: 1px solid rgba(255,255,255,0.2);
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85em;
+            transition: background 0.2s;
+        }
+        .param-reset-btn:hover {
+            background: rgba(255,255,255,0.15);
+        }
+        .param-feedback {
+            font-size: 0.85em;
+            color: #95a5a6;
+        }
+        .export-section {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 20px;
+            margin: 0 20px 10px;
+            background: rgba(255,255,255,0.03);
+            border-radius: 8px;
+        }
+        .export-btn {
+            background: linear-gradient(135deg, #00b894 0%, #00cec9 100%);
+            color: white;
+            border: none;
+            padding: 8px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9em;
+            font-weight: bold;
+            transition: opacity 0.2s;
+        }
+        .export-btn:hover {
+            opacity: 0.9;
+        }
+        .export-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .export-feedback {
+            font-size: 0.85em;
+            color: #95a5a6;
+        }
     </style>
 </head>
 <body>
@@ -334,6 +513,7 @@ DASHBOARD_HTML = """
                 <div class="metric-row"><span>Worker Wait:</span><span id="worker-wait-ms">0ms</span></div>
                 <div class="metric-row"><span>Drop %:</span><span id="pool-load">0%</span></div>
                 <div class="metric-row"><span>Pipeline:</span><span id="pipeline-status">✅ Healthy</span></div>
+                <div class="metric-row"><span>Tree Depth:</span><span id="live-tree-depth">--</span></div>
             </div>
 
             <!-- GPU Performance Card -->
@@ -351,17 +531,187 @@ DASHBOARD_HTML = """
             <!-- Iteration Progress Card -->
             <div class="monitoring-card">
                 <h4>📊 Iteration Progress</h4>
+                <div class="metric-row"><span>Run Time:</span><span id="live-run-time">--</span></div>
                 <div class="metric-row"><span>Games:</span><span id="live-games">0/0</span></div>
                 <div class="metric-row"><span>W/D/L:</span><span id="live-wdl">0 / 0 / 0</span></div>
                 <div class="metric-row"><span>Moves:</span><span id="live-moves">0</span></div>
                 <div class="metric-row"><span>Games/min:</span><span id="live-gph">0</span></div>
+                <div class="metric-row"><span>Game Moves:</span><span id="live-current-moves">--</span></div>
             </div>
+
+            <!-- Refutation Status Card (hidden until asymmetric risk data arrives) -->
+            <div class="monitoring-card" id="refutation-card" style="display:none;">
+                <h4>Refutation Status</h4>
+                <div class="metric-row"><span>Standard Wins:</span><span id="ref-std-wins">0</span></div>
+                <div class="metric-row"><span>Opponent Wins:</span><span id="ref-opp-wins">0</span></div>
+                <div class="metric-row"><span>Draws:</span><span id="ref-draws">0</span></div>
+                <div class="metric-row"><span>Refutation Elo:</span><span id="ref-elo" style="font-size:1.1em;">--</span></div>
+            </div>
+
         </div>
 
         <!-- Bottleneck Indicator -->
         <div class="bottleneck-indicator">
             <span>System Status:</span>
             <span id="bottleneck-type" class="bottleneck-value">--</span>
+        </div>
+
+        <!-- Batch Analysis Section (below System Status) -->
+        <div style="display: flex; gap: 15px; margin-top: 15px;">
+            <!-- Batch Size Distribution -->
+            <div class="monitoring-card" style="flex: 2;">
+                <h4>📈 Batch Size Distribution</h4>
+                <div id="batch-histogram" style="width: 100%; height: 180px;"></div>
+                <div style="display: flex; justify-content: center; gap: 15px; font-size: 0.75em; margin-top: 4px;">
+                    <span><span style="color: #2ecc71;">■</span> Large Graph</span>
+                    <span><span style="color: #1abc9c;">■</span> Medium Graph</span>
+                    <span><span style="color: #3498db;">■</span> Small Graph</span>
+                    <span><span style="color: #9b59b6;">■</span> Mini Graph</span>
+                    <span><span style="color: #e67e22;">■</span> Eager</span>
+                </div>
+                <div class="metric-row" style="margin-top: 4px;">
+                    <span>Thresholds:</span>
+                    <span id="batch-thresholds">mini≤--, small≤--, medium≤--, large>--</span>
+                </div>
+                <div class="metric-row">
+                    <span>P25/P50/P75/P90:</span>
+                    <span id="batch-percentiles">-- / -- / -- / --</span>
+                </div>
+            </div>
+
+            <!-- Execution Path Pie Charts -->
+            <div class="monitoring-card" style="flex: 1;">
+                <h4>🎯 Execution Paths</h4>
+                <div style="display: flex; gap: 4px;">
+                    <div style="flex: 1; text-align: center;">
+                        <div style="font-size: 0.7em; color: #95a5a6; margin-bottom: 2px;">Batch Count</div>
+                        <div id="exec-path-pie" style="width: 100%; height: 160px;"></div>
+                    </div>
+                    <div style="flex: 1; text-align: center;">
+                        <div style="font-size: 0.7em; color: #95a5a6; margin-bottom: 2px;">Time Spent</div>
+                        <div id="exec-time-pie" style="width: 100%; height: 160px;"></div>
+                    </div>
+                </div>
+                <div class="metric-row" style="margin-top: 4px;">
+                    <span>Total Batches:</span>
+                    <span id="total-batches">0</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Export Model Section -->
+    <div class="export-section">
+        <button class="export-btn" id="export-btn" onclick="exportModel()">Export Model Weights</button>
+        <span class="export-feedback" id="export-feedback"></span>
+    </div>
+
+    <!-- Parameter Controls Section -->
+    <div class="param-controls-section">
+        <div class="param-controls-header" onclick="toggleParamControls()">
+            <span class="gear-icon">&#9881;</span>
+            <h3>Parameter Controls</h3>
+            <span class="param-status" id="param-status"></span>
+            <span class="toggle-arrow" id="param-toggle-arrow">&#9654;</span>
+        </div>
+        <div class="param-controls-body" id="param-controls-body" style="display: none;">
+            <div class="param-groups">
+                <!-- Training Group -->
+                <div class="param-group">
+                    <h4>Training</h4>
+                    <div class="param-row">
+                        <label>Learning Rate</label>
+                        <input type="number" data-param="lr" step="0.0001" min="0.000001" max="1">
+                        <span class="param-current" id="cur-lr"></span>
+                    </div>
+                    <div class="param-row">
+                        <label>Batch Size</label>
+                        <input type="number" data-param="train_batch" step="1" min="16" max="8192">
+                        <span class="param-current" id="cur-train_batch"></span>
+                    </div>
+                    <div class="param-row">
+                        <label>Epochs</label>
+                        <input type="number" data-param="epochs" step="1" min="1" max="100">
+                        <span class="param-current" id="cur-epochs"></span>
+                    </div>
+                </div>
+
+                <!-- MCTS / Search Group -->
+                <div class="param-group">
+                    <h4>MCTS / Search</h4>
+                    <div class="param-row">
+                        <label>Simulations</label>
+                        <input type="number" data-param="simulations" step="50" min="50" max="10000">
+                        <span class="param-current" id="cur-simulations"></span>
+                    </div>
+                    <div class="param-row">
+                        <label>C_Explore</label>
+                        <input type="number" data-param="c_explore" step="0.1" min="0.1" max="10">
+                        <span class="param-current" id="cur-c_explore"></span>
+                    </div>
+                    <div class="param-row">
+                        <label>Risk Beta</label>
+                        <input type="number" data-param="risk_beta" step="0.1" min="-3" max="3">
+                        <span class="param-current" id="cur-risk_beta"></span>
+                    </div>
+                    <div class="param-row">
+                        <label>Opponent Min</label>
+                        <input type="number" data-param="opponent_risk_min" step="0.1" min="-3" max="3">
+                        <span class="param-current" id="cur-opponent_risk_min"></span>
+                    </div>
+                    <div class="param-row">
+                        <label>Opponent Max</label>
+                        <input type="number" data-param="opponent_risk_max" step="0.1" min="-3" max="3">
+                        <span class="param-current" id="cur-opponent_risk_max"></span>
+                    </div>
+                    <div class="param-row">
+                        <label>Temp Moves</label>
+                        <input type="number" data-param="temperature_moves" step="1" min="0" max="200">
+                        <span class="param-current" id="cur-temperature_moves"></span>
+                    </div>
+                    <div class="param-row">
+                        <label>Dir. Alpha</label>
+                        <input type="number" data-param="dirichlet_alpha" step="0.01" min="0.01" max="2">
+                        <span class="param-current" id="cur-dirichlet_alpha"></span>
+                    </div>
+                    <div class="param-row">
+                        <label>Dir. Epsilon</label>
+                        <input type="number" data-param="dirichlet_epsilon" step="0.05" min="0" max="1">
+                        <span class="param-current" id="cur-dirichlet_epsilon"></span>
+                    </div>
+                    <div class="param-row">
+                        <label>FPU Base</label>
+                        <input type="number" data-param="fpu_base" step="0.05" min="0" max="2">
+                        <span class="param-current" id="cur-fpu_base"></span>
+                    </div>
+                </div>
+
+                <!-- Self-Play Group -->
+                <div class="param-group">
+                    <h4>Self-Play</h4>
+                    <div class="param-row">
+                        <label>Games/Iter</label>
+                        <input type="number" data-param="games_per_iter" step="1" min="1" max="10000">
+                        <span class="param-current" id="cur-games_per_iter"></span>
+                    </div>
+                    <div class="param-row">
+                        <label>Max Fillup</label>
+                        <input type="number" data-param="max_fillup_factor" step="1" min="0" max="100">
+                        <span class="param-current" id="cur-max_fillup_factor"></span>
+                    </div>
+                    <div class="param-row">
+                        <label>Save Interval</label>
+                        <input type="number" data-param="save_interval" step="1" min="1" max="1000">
+                        <span class="param-current" id="cur-save_interval"></span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="param-actions">
+                <button class="param-apply-btn" id="param-apply-btn" onclick="applyParams()">Apply for Next Phase</button>
+                <button class="param-reset-btn" onclick="resetParams()">Reset to Current</button>
+                <span class="param-feedback" id="param-feedback"></span>
+            </div>
         </div>
     </div>
 
@@ -384,6 +734,12 @@ DASHBOARD_HTML = """
             <div id="wdl-chart" class="chart"></div>
         </div>
 
+        <!-- Draw Breakdown -->
+        <div class="card">
+            <h3>📊 Draw Breakdown</h3>
+            <div id="draw-breakdown-chart" class="chart"></div>
+        </div>
+
         <!-- MCTS Simulations -->
         <div class="card">
             <h3>🔬 MCTS Simulations/sec</h3>
@@ -394,12 +750,6 @@ DASHBOARD_HTML = """
         <div class="card">
             <h3>⏱️ Time Breakdown</h3>
             <div id="time-chart" class="chart"></div>
-        </div>
-
-        <!-- Model Evaluation -->
-        <div class="card">
-            <h3>🧪 Model Evaluation</h3>
-            <div id="eval-chart" class="chart"></div>
         </div>
 
         <!-- Average Game Length -->
@@ -425,18 +775,25 @@ DASHBOARD_HTML = """
             whiteWins: [],
             blackWins: [],
             draws: [],
+            drawsRepetition: [],
+            drawsStalemate: [],
+            drawsFiftyMove: [],
+            drawsInsufficient: [],
+            drawsMaxMoves: [],
             selfplayTime: [],
             trainTime: [],
             avgGameLength: [],
-            evalWinRate: [],
-            evalEndgameScore: [],
-            evalEndgameMoveAccuracy: [],
         };
 
         let totalGames = 0;
         let totalMoves = 0;
         let startTime = Date.now();
         let totalIterations = 100;
+
+        // Parameter controls state
+        let socket = null;
+        let currentParams = {};
+        let pendingApplied = false;
 
         // Chart colors
         const colors = {
@@ -514,6 +871,15 @@ DASHBOARD_HTML = """
                 { x: [], y: [], type: 'bar', name: 'Black', marker: { color: colors.black } }
             ], {...layoutDefaults, barmode: 'stack', yaxis: {...layoutDefaults.yaxis, title: 'Games'}});
 
+            // Draw Breakdown chart
+            Plotly.newPlot('draw-breakdown-chart', [
+                { x: [], y: [], type: 'bar', name: 'Repetition', marker: { color: '#e74c3c' } },
+                { x: [], y: [], type: 'bar', name: 'Stalemate', marker: { color: '#f39c12' } },
+                { x: [], y: [], type: 'bar', name: 'Fifty-Move', marker: { color: '#9b59b6' } },
+                { x: [], y: [], type: 'bar', name: 'Material', marker: { color: '#1abc9c' } },
+                { x: [], y: [], type: 'bar', name: 'Max-Moves', marker: { color: '#95a5a6' } }
+            ], {...layoutDefaults, barmode: 'stack', yaxis: {...layoutDefaults.yaxis, title: 'Draws'}});
+
             // Time breakdown chart
             Plotly.newPlot('time-chart', [
                 { x: [], y: [], type: 'bar', name: 'Self-Play', marker: { color: colors.primary } },
@@ -528,27 +894,61 @@ DASHBOARD_HTML = """
                 marker: { size: 4 }
             }], {...layoutDefaults, yaxis: {...layoutDefaults.yaxis, title: 'Moves per Game'}});
 
-            // Evaluation chart (dual Y-axis: win rate % left, move accuracy % right)
-            Plotly.newPlot('eval-chart', [
-                { x: [], y: [], type: 'scatter', mode: 'lines+markers',
-                  name: 'vs Random Win Rate (%)', line: { color: colors.primary, width: 2 },
-                  marker: { size: 5 }, yaxis: 'y' },
-                { x: [], y: [], type: 'scatter', mode: 'lines+markers',
-                  name: 'Endgame Move Accuracy (%)', line: { color: colors.secondary, width: 2 },
-                  marker: { size: 5, symbol: 'diamond' }, yaxis: 'y2' }
-            ], {
+            // Batch size histogram
+            Plotly.newPlot('batch-histogram', [{
+                x: [], y: [], type: 'bar',
+                marker: {
+                    color: [],  // Will be set dynamically based on routing
+                    line: { color: 'rgba(255,255,255,0.3)', width: 1 }
+                },
+                hovertemplate: 'Batch %{x}: %{y} calls<extra></extra>'
+            }], {
                 ...layoutDefaults,
-                yaxis: { ...layoutDefaults.yaxis, title: 'Win Rate (%)', side: 'left',
-                         range: [0, 105] },
-                yaxis2: {
-                    title: 'Move Accuracy (%)',
-                    overlaying: 'y',
-                    side: 'right',
-                    range: [0, 105],
-                    gridcolor: 'rgba(255,255,255,0.05)',
-                    tickfont: { color: '#ecf0f1' },
-                    titlefont: { color: '#ecf0f1' }
-                }
+                margin: { t: 5, b: 30, l: 45, r: 10 },
+                xaxis: {
+                    ...layoutDefaults.xaxis,
+                    title: { text: 'Batch Size', font: { size: 9 } },
+                    tickmode: 'array',
+                    tickvals: [],
+                    ticktext: []
+                },
+                yaxis: { ...layoutDefaults.yaxis, title: { text: 'Count', font: { size: 9 } } },
+                showlegend: false,
+                bargap: 0.1
+            });
+
+            // Execution path pie chart (batch count)
+            Plotly.newPlot('exec-path-pie', [{
+                values: [0, 0, 0, 0, 0],
+                labels: ['Large', 'Medium', 'Small', 'Mini', 'Eager'],
+                type: 'pie',
+                marker: {
+                    colors: ['#2ecc71', '#1abc9c', '#3498db', '#9b59b6', '#e67e22']
+                },
+                textinfo: 'percent',
+                textfont: { color: '#fff', size: 10 },
+                hovertemplate: '%{label}: %{value} batches (%{percent})<extra></extra>'
+            }], {
+                ...layoutDefaults,
+                margin: { t: 5, b: 5, l: 5, r: 5 },
+                showlegend: false
+            });
+
+            // Execution time distribution pie chart
+            Plotly.newPlot('exec-time-pie', [{
+                values: [0, 0, 0, 0, 0],
+                labels: ['Large', 'Medium', 'Small', 'Mini', 'Eager'],
+                type: 'pie',
+                marker: {
+                    colors: ['#2ecc71', '#1abc9c', '#3498db', '#9b59b6', '#e67e22']
+                },
+                textinfo: 'percent',
+                textfont: { color: '#fff', size: 10 },
+                hovertemplate: '%{label}: %{value:.0f}ms (%{percent})<extra></extra>'
+            }], {
+                ...layoutDefaults,
+                margin: { t: 5, b: 5, l: 5, r: 5 },
+                showlegend: false
             });
         }
 
@@ -566,13 +966,14 @@ DASHBOARD_HTML = """
             data.whiteWins.push(metrics.white_wins);
             data.blackWins.push(metrics.black_wins);
             data.draws.push(metrics.draws);
+            data.drawsRepetition.push(metrics.draws_repetition || 0);
+            data.drawsStalemate.push(metrics.draws_stalemate || 0);
+            data.drawsFiftyMove.push(metrics.draws_fifty_move || 0);
+            data.drawsInsufficient.push(metrics.draws_insufficient || 0);
+            data.drawsMaxMoves.push(metrics.draws_max_moves || 0);
             data.selfplayTime.push(metrics.selfplay_time);
             data.trainTime.push(metrics.train_time);
             data.avgGameLength.push(metrics.avg_game_length);
-            data.evalWinRate.push(metrics.eval_win_rate != null ? metrics.eval_win_rate * 100 : null);
-            data.evalEndgameScore.push(metrics.eval_endgame_score);
-            data.evalEndgameMoveAccuracy.push(metrics.eval_endgame_move_accuracy != null ? metrics.eval_endgame_move_accuracy * 100 : null);
-
             // Update cumulative stats
             totalGames += metrics.num_games;
             totalMoves += Math.round(metrics.moves_per_sec * metrics.selfplay_time);
@@ -606,40 +1007,20 @@ DASHBOARD_HTML = """
                 { x: data.iterations.slice(), y: data.blackWins.slice(), type: 'bar', name: 'Black', marker: { color: colors.black } }
             ], {...layoutDefaults, barmode: 'stack', yaxis: {...layoutDefaults.yaxis, title: 'Games'}});
 
+            // Update draw breakdown chart
+            Plotly.react('draw-breakdown-chart', [
+                { x: data.iterations.slice(), y: data.drawsRepetition.slice(), type: 'bar', name: 'Repetition', marker: { color: '#e74c3c' } },
+                { x: data.iterations.slice(), y: data.drawsStalemate.slice(), type: 'bar', name: 'Stalemate', marker: { color: '#f39c12' } },
+                { x: data.iterations.slice(), y: data.drawsFiftyMove.slice(), type: 'bar', name: 'Fifty-Move', marker: { color: '#9b59b6' } },
+                { x: data.iterations.slice(), y: data.drawsInsufficient.slice(), type: 'bar', name: 'Material', marker: { color: '#1abc9c' } },
+                { x: data.iterations.slice(), y: data.drawsMaxMoves.slice(), type: 'bar', name: 'Max-Moves', marker: { color: '#95a5a6' } }
+            ], {...layoutDefaults, barmode: 'stack', yaxis: {...layoutDefaults.yaxis, title: 'Draws'}});
+
             // Update time chart (all iterations)
             Plotly.react('time-chart', [
                 { x: data.iterations.slice(), y: data.selfplayTime.slice(), type: 'bar', name: 'Self-Play', marker: { color: colors.primary } },
                 { x: data.iterations.slice(), y: data.trainTime.slice(), type: 'bar', name: 'Training', marker: { color: colors.tertiary } }
             ], {...layoutDefaults, barmode: 'stack', yaxis: {...layoutDefaults.yaxis, title: 'Seconds'}});
-
-            // Update evaluation chart (only if eval data exists)
-            if (metrics.eval_win_rate != null) {
-                // Filter out null entries for clean lines
-                const evalIters = data.iterations.filter((_, i) => data.evalWinRate[i] != null);
-                const evalWR = data.evalWinRate.filter(v => v != null);
-                const evalMA = data.evalEndgameMoveAccuracy.filter(v => v != null);
-                Plotly.react('eval-chart', [
-                    { x: evalIters, y: evalWR, type: 'scatter', mode: 'lines+markers',
-                      name: 'vs Random Win Rate (%)', line: { color: colors.primary, width: 2 },
-                      marker: { size: 5 }, yaxis: 'y' },
-                    { x: evalIters, y: evalMA, type: 'scatter', mode: 'lines+markers',
-                      name: 'Endgame Move Accuracy (%)', line: { color: colors.secondary, width: 2 },
-                      marker: { size: 5, symbol: 'diamond' }, yaxis: 'y2' }
-                ], {
-                    ...layoutDefaults,
-                    yaxis: { ...layoutDefaults.yaxis, title: 'Win Rate (%)', side: 'left',
-                             range: [0, 105] },
-                    yaxis2: {
-                        title: 'Move Accuracy (%)',
-                        overlaying: 'y',
-                        side: 'right',
-                        range: [0, 105],
-                        gridcolor: 'rgba(255,255,255,0.05)',
-                        tickfont: { color: '#ecf0f1' },
-                        titlefont: { color: '#ecf0f1' }
-                    }
-                });
-            }
 
             // Update header stats
             document.getElementById('iteration').textContent = iter;
@@ -673,12 +1054,15 @@ DASHBOARD_HTML = """
 
         // WebSocket connection
         function connectWebSocket() {
-            const socket = io();
+            socket = io();
 
             socket.on('connect', () => {
                 console.log('Connected to dashboard server');
                 document.getElementById('status').textContent = 'Connected';
                 document.getElementById('status').className = 'status connected';
+                // Reset export button in case a prior request was lost
+                document.getElementById('export-btn').disabled = false;
+                document.getElementById('export-feedback').textContent = '';
             });
 
             socket.on('disconnect', () => {
@@ -781,10 +1165,57 @@ DASHBOARD_HTML = """
                 }
 
                 // Iteration progress
+                const phaseElapsed = data.phase_elapsed || 0;
+                updateMetricWithHighlight('live-run-time', formatTime(phaseElapsed));
                 updateMetricWithHighlight('live-games', `${data.games_completed}/${data.total_games}`);
                 updateMetricWithHighlight('live-wdl', `${data.white_wins || 0} / ${data.draws || 0} / ${data.black_wins || 0}`);
                 updateMetricWithHighlight('live-moves', (data.moves || 0).toLocaleString());
                 updateMetricWithHighlight('live-gph', (data.games_per_hour / 60).toFixed(2));
+
+                // Tree depth display
+                const maxDepth = data.max_search_depth || 0;
+                const minDepth = data.min_search_depth || 0;
+                const avgDepth = data.avg_search_depth || 0;
+                if (maxDepth > 0) {
+                    updateMetricWithHighlight('live-tree-depth',
+                        `${minDepth}\u2013${maxDepth} (avg ${avgDepth.toFixed(1)})`);
+                } else {
+                    updateMetricWithHighlight('live-tree-depth', '--');
+                }
+
+                // Current game moves (min–max across active workers)
+                const minMoves = data.min_current_moves || 0;
+                const maxMoves = data.max_current_moves || 0;
+                if (maxMoves > 0) {
+                    updateMetricWithHighlight('live-current-moves', `${minMoves}\u2013${maxMoves}`);
+                } else {
+                    updateMetricWithHighlight('live-current-moves', '--');
+                }
+
+                // Refutation Status (only show when asymmetric risk is active)
+                const stdWins = data.standard_wins || 0;
+                const oppWins = data.opponent_wins || 0;
+                const asymDraws = data.asymmetric_draws || 0;
+                const totalAsym = stdWins + oppWins + asymDraws;
+                const refCard = document.getElementById('refutation-card');
+                if (totalAsym > 0) {
+                    refCard.style.display = '';
+                    updateMetricWithHighlight('ref-std-wins', stdWins);
+                    updateMetricWithHighlight('ref-opp-wins', oppWins);
+                    updateMetricWithHighlight('ref-draws', asymDraws);
+                    const eloEl = document.getElementById('ref-elo');
+                    if (totalAsym >= 20) {
+                        const score = Math.max(0.01, Math.min(0.99, (stdWins + 0.5 * asymDraws) / totalAsym));
+                        const elo = -400 * Math.log10((1 - score) / score);
+                        eloEl.textContent = (elo >= 0 ? '+' : '') + Math.round(elo);
+                        eloEl.style.color = elo > 0 ? '#2ecc71' : elo < 0 ? '#e74c3c' : '#3498db';
+                    } else {
+                        eloEl.textContent = '\u23F3 n=' + totalAsym;
+                        eloEl.style.color = '#95a5a6';
+                    }
+                } else {
+                    refCard.style.display = 'none';
+                }
 
                 // Update buffer size in header
                 document.getElementById('buffer-size').textContent = data.buffer_size.toLocaleString();
@@ -810,8 +1241,257 @@ DASHBOARD_HTML = """
 
                 // Update elapsed time from server
                 startTime = Date.now() - (data.total_elapsed * 1000);
+
+                // Routing thresholds (used by both histogram and thresholds display)
+                const largeThreshold = data.large_graph_threshold || 0;
+                const mediumGraphSize = data.medium_graph_size || 0;
+                const smallGraphSize = data.small_graph_size || 0;
+                const miniGraphSize = data.mini_graph_size || 0;
+
+                // Update batch size histogram
+                if (data.batch_histogram && data.batch_histogram.length > 0) {
+                    const bins = data.batch_histogram.map(d => d[0]);
+                    const counts = data.batch_histogram.map(d => d[1]);
+
+                    // Color bars based on actual routing thresholds (not just size zones)
+                    const miniThreshold = data.mini_threshold || 0;
+                    const smallThreshold = data.small_threshold || 0;
+                    const mediumThreshold = data.medium_threshold || 0;
+
+                    const barColors = bins.map(bin => {
+                        if (bin > largeThreshold) return '#2ecc71';                                           // Large graph - green
+                        if (bin <= miniGraphSize && bin >= miniThreshold) return '#9b59b6';                    // Mini graph - purple
+                        if (bin <= smallGraphSize && bin >= smallThreshold) return '#3498db';                  // Small graph - blue
+                        if (bin <= mediumGraphSize && bin >= mediumThreshold) return '#1abc9c';                // Medium graph - teal
+                        return '#e67e22';                                                                      // Eager - orange
+                    });
+
+                    Plotly.react('batch-histogram', [{
+                        x: bins,
+                        y: counts,
+                        type: 'bar',
+                        marker: {
+                            color: barColors,
+                            line: { color: 'rgba(255,255,255,0.3)', width: 1 }
+                        },
+                        hovertemplate: 'Batch %{x}: %{y} calls<extra></extra>'
+                    }], {
+                        ...layoutDefaults,
+                        margin: { t: 5, b: 30, l: 45, r: 10 },
+                        xaxis: {
+                            ...layoutDefaults.xaxis,
+                            title: { text: 'Batch Size', font: { size: 9 } },
+                            tickmode: 'array',
+                            tickvals: bins,
+                            ticktext: bins.map(String),
+                            range: [0, Math.max(...bins) + 1]
+                        },
+                        yaxis: { ...layoutDefaults.yaxis, title: { text: 'Count', font: { size: 9 } } },
+                        showlegend: false,
+                        bargap: 0.1
+                    });
+                }
+
+                // Update batch percentiles display
+                if (data.batch_p50 > 0) {
+                    document.getElementById('batch-percentiles').textContent =
+                        `${data.batch_p25} / ${data.batch_p50} / ${data.batch_p75} / ${data.batch_p90}`;
+                }
+
+                // Update batch thresholds display (show all 4 tiers with crossover thresholds)
+                if (smallGraphSize > 0 || largeThreshold > 0) {
+                    const mediumThreshold = data.medium_threshold || 0;
+                    const smallThreshold = data.small_threshold || 0;
+                    const miniThreshold = data.mini_threshold || 0;
+                    const largeText = largeThreshold >= (data.batch_max || 9999) ? 'disabled' : `>${largeThreshold}`;
+                    let thresholdText = `mini\u2264${miniGraphSize}(\u2265${miniThreshold}), small\u2264${smallGraphSize}(\u2265${smallThreshold})`;
+                    if (mediumGraphSize > smallGraphSize) {
+                        thresholdText += `, medium\u2264${mediumGraphSize}(\u2265${mediumThreshold})`;
+                    }
+                    thresholdText += `, large ${largeText}`;
+                    document.getElementById('batch-thresholds').textContent = thresholdText;
+                }
+
+                // Update execution path pie charts (count + time)
+                const largeGraphFires = data.large_graph_fires || 0;
+                const mediumGraphFires = data.medium_graph_fires || 0;
+                const smallGraphFires = data.small_graph_fires || 0;
+                const miniGraphFires = data.mini_graph_fires || 0;
+                const eagerFires = data.eager_fires || 0;
+                const totalBatches = largeGraphFires + mediumGraphFires + smallGraphFires + miniGraphFires + eagerFires;
+
+                if (totalBatches > 0) {
+                    // Count distribution pie
+                    Plotly.react('exec-path-pie', [{
+                        values: [largeGraphFires, mediumGraphFires, smallGraphFires, miniGraphFires, eagerFires],
+                        labels: ['Large', 'Medium', 'Small', 'Mini', 'Eager'],
+                        type: 'pie',
+                        marker: { colors: ['#2ecc71', '#1abc9c', '#3498db', '#9b59b6', '#e67e22'] },
+                        textinfo: 'percent',
+                        textfont: { color: '#fff', size: 10 },
+                        hovertemplate: '%{label}: %{value} batches (%{percent})<extra></extra>'
+                    }], {
+                        ...layoutDefaults,
+                        margin: { t: 5, b: 5, l: 5, r: 5 },
+                        showlegend: false
+                    });
+
+                    // Time distribution pie
+                    const largeTime = data.large_graph_time_ms || 0;
+                    const mediumTime = data.medium_graph_time_ms || 0;
+                    const smallTime = data.small_graph_time_ms || 0;
+                    const miniTime = data.mini_graph_time_ms || 0;
+                    const eagerTime = data.eager_time_ms || 0;
+
+                    Plotly.react('exec-time-pie', [{
+                        values: [largeTime, mediumTime, smallTime, miniTime, eagerTime],
+                        labels: ['Large', 'Medium', 'Small', 'Mini', 'Eager'],
+                        type: 'pie',
+                        marker: { colors: ['#2ecc71', '#1abc9c', '#3498db', '#9b59b6', '#e67e22'] },
+                        textinfo: 'percent',
+                        textfont: { color: '#fff', size: 10 },
+                        hovertemplate: '%{label}: %{value:.0f}ms (%{percent})<extra></extra>'
+                    }], {
+                        ...layoutDefaults,
+                        margin: { t: 5, b: 5, l: 5, r: 5 },
+                        showlegend: false
+                    });
+
+                    document.getElementById('total-batches').textContent = totalBatches.toLocaleString();
+                }
+            });
+
+            // --- Parameter Controls SocketIO handlers ---
+            socket.on('params_current', (params) => {
+                populateParams(params);
+                if (pendingApplied) {
+                    const statusEl = document.getElementById('param-status');
+                    statusEl.textContent = 'Applied';
+                    statusEl.className = 'param-status applied';
+                    setTimeout(() => { statusEl.className = 'param-status'; }, 5000);
+                    pendingApplied = false;
+                }
+            });
+
+            socket.on('params_pending_ack', (resp) => {
+                const statusEl = document.getElementById('param-status');
+                const count = Object.keys(resp.accepted || {}).length;
+                statusEl.textContent = `Pending (${count})`;
+                statusEl.className = 'param-status pending';
+                document.getElementById('param-apply-btn').disabled = false;
+                pendingApplied = true;
+
+                const feedbackEl = document.getElementById('param-feedback');
+                if (resp.errors && resp.errors.length > 0) {
+                    feedbackEl.textContent = 'Errors: ' + resp.errors.join(', ');
+                    feedbackEl.style.color = '#e74c3c';
+                } else {
+                    feedbackEl.textContent = `${count} change(s) queued`;
+                    feedbackEl.style.color = '#f1c40f';
+                }
+            });
+
+            socket.on('params_applied', (resp) => {
+                const statusEl = document.getElementById('param-status');
+                const phase = resp.phase ? ` (${resp.phase})` : '';
+                statusEl.textContent = `Applied at iter ${resp.iteration}${phase}`;
+                statusEl.className = 'param-status applied';
+                setTimeout(() => { statusEl.className = 'param-status'; }, 5000);
+
+                const feedbackEl = document.getElementById('param-feedback');
+                feedbackEl.textContent = `Applied${phase}: ${(resp.applied || []).join(', ')}`;
+                feedbackEl.style.color = '#2ecc71';
+            });
+
+            socket.on('export_ack', (resp) => {
+                const feedbackEl = document.getElementById('export-feedback');
+                feedbackEl.textContent = 'Queued, waiting for training loop...';
+                feedbackEl.style.color = '#f1c40f';
+            });
+
+            socket.on('export_complete', (resp) => {
+                const btn = document.getElementById('export-btn');
+                const feedbackEl = document.getElementById('export-feedback');
+                btn.disabled = false;
+                if (resp.status === 'saved') {
+                    feedbackEl.textContent = 'Saved: ' + resp.filename;
+                    feedbackEl.style.color = '#2ecc71';
+                } else {
+                    feedbackEl.textContent = 'Error: ' + (resp.error || 'unknown');
+                    feedbackEl.style.color = '#e74c3c';
+                }
             });
         }
+
+        // --- Parameter Controls Functions ---
+        function toggleParamControls() {
+            const body = document.getElementById('param-controls-body');
+            const arrow = document.getElementById('param-toggle-arrow');
+            if (body.style.display === 'none') {
+                body.style.display = 'block';
+                arrow.classList.add('open');
+            } else {
+                body.style.display = 'none';
+                arrow.classList.remove('open');
+            }
+        }
+
+        function populateParams(params) {
+            currentParams = Object.assign({}, params);
+            document.querySelectorAll('[data-param]').forEach(input => {
+                const key = input.dataset.param;
+                if (key in params) {
+                    input.value = params[key];
+                    input.classList.remove('modified');
+                    const curEl = document.getElementById('cur-' + key);
+                    if (curEl) curEl.textContent = '(active: ' + params[key] + ')';
+                }
+            });
+        }
+
+        function applyParams() {
+            const changes = {};
+            document.querySelectorAll('[data-param]').forEach(input => {
+                const key = input.dataset.param;
+                const val = parseFloat(input.value);
+                if (key in currentParams && !isNaN(val) && val !== currentParams[key]) {
+                    changes[key] = val;
+                }
+            });
+            if (Object.keys(changes).length === 0) {
+                const feedbackEl = document.getElementById('param-feedback');
+                feedbackEl.textContent = 'No changes to apply';
+                feedbackEl.style.color = '#95a5a6';
+                return;
+            }
+            document.getElementById('param-apply-btn').disabled = true;
+            socket.emit('apply_params', changes);
+        }
+
+        function resetParams() {
+            populateParams(currentParams);
+            document.getElementById('param-feedback').textContent = '';
+        }
+
+        function exportModel() {
+            const btn = document.getElementById('export-btn');
+            btn.disabled = true;
+            document.getElementById('export-feedback').textContent = 'Requesting...';
+            socket.emit('export_model');
+        }
+
+        // Input change listeners for modified highlighting
+        document.querySelectorAll('[data-param]').forEach(input => {
+            input.addEventListener('input', () => {
+                const key = input.dataset.param;
+                const val = parseFloat(input.value);
+                if (key in currentParams && !isNaN(val) && val !== currentParams[key]) {
+                    input.classList.add('modified');
+                } else {
+                    input.classList.remove('modified');
+                }
+            });
+        });
 
         // Helper function to update metric with highlight animation
         function updateMetricWithHighlight(elementId, value) {
@@ -854,6 +1534,37 @@ class LiveDashboardServer:
         self.start_time = None
         self.total_iterations = 100
 
+        # Parameter controls: browser → training loop
+        self._pending_updates: Dict[str, any] = {}
+        self._pending_meta: Dict[str, Dict] = {}
+        self._pending_lock = threading.Lock()
+        self._current_params: Dict[str, any] = {}
+
+        # Export model: browser → training loop
+        self._export_requested: bool = False
+
+    def set_current_params(self, params: dict):
+        """Push authoritative parameter values. Broadcasts to all connected clients."""
+        self._current_params = params.copy()
+        if self.socketio is not None and self.running:
+            self.socketio.emit('params_current', self._current_params)
+
+    def poll_updates(self):
+        """Atomically drain pending parameter updates + source metadata."""
+        with self._pending_lock:
+            updates = self._pending_updates.copy()
+            self._pending_updates.clear()
+            meta = self._pending_meta.copy()
+            self._pending_meta.clear()
+        return updates, meta
+
+    def poll_export_request(self) -> bool:
+        """Atomically read and clear export request flag."""
+        with self._pending_lock:
+            requested = self._export_requested
+            self._export_requested = False
+        return requested
+
     def _create_app(self):
         """Create Flask app with SocketIO."""
         if not FLASK_AVAILABLE:
@@ -883,6 +1594,56 @@ class LiveDashboardServer:
                 'total_iterations': self.total_iterations,
                 'elapsed_seconds': time.time() - self.start_time if self.start_time else 0
             })
+            # Send current parameter values so controls populate on connect
+            if self._current_params:
+                emit('params_current', self._current_params)
+
+        # Parameter control spec: (type, min, max)
+        PARAM_SPEC = {
+            'lr': (float, 1e-6, 1.0),
+            'train_batch': (int, 16, 8192),
+            'epochs': (int, 1, 100),
+            'simulations': (int, 50, 10000),
+            'c_explore': (float, 0.1, 10.0),
+            'risk_beta': (float, -3.0, 3.0),
+            'temperature_moves': (int, 0, 200),
+            'dirichlet_alpha': (float, 0.01, 2.0),
+            'dirichlet_epsilon': (float, 0.0, 1.0),
+            'fpu_base': (float, 0.0, 2.0),
+            'opponent_risk_min': (float, -3.0, 3.0),
+            'opponent_risk_max': (float, -3.0, 3.0),
+            'games_per_iter': (int, 1, 10000),
+            'max_fillup_factor': (int, 0, 100),
+            'save_interval': (int, 1, 1000),
+        }
+
+        @socketio.on('apply_params')
+        def handle_apply_params(data):
+            validated = {}
+            errors = []
+            for key, value in data.items():
+                if key not in PARAM_SPEC:
+                    errors.append(f"Unknown: {key}")
+                    continue
+                ptype, pmin, pmax = PARAM_SPEC[key]
+                try:
+                    typed = ptype(value)
+                    validated[key] = max(pmin, min(pmax, typed))
+                except (ValueError, TypeError) as e:
+                    errors.append(f"{key}: {e}")
+            with self._pending_lock:
+                self._pending_updates.update(validated)
+                for key in validated:
+                    self._pending_meta[key] = {'source': 'dashboard', 'reason': ''}
+            socketio.emit('params_pending_ack', {
+                'accepted': validated, 'errors': errors
+            })
+
+        @socketio.on('export_model')
+        def handle_export_model():
+            with self._pending_lock:
+                self._export_requested = True
+            emit('export_ack', {'status': 'queued'})
 
         self.app = app
         self.socketio = socketio
@@ -960,16 +1721,26 @@ class LiveDashboardServer:
             'white_wins': metrics.white_wins,
             'black_wins': metrics.black_wins,
             'draws': metrics.draws,
+            'standard_wins': getattr(metrics, 'standard_wins', 0),
+            'opponent_wins': getattr(metrics, 'opponent_wins', 0),
+            'asymmetric_draws': getattr(metrics, 'asymmetric_draws', 0),
             'avg_game_length': metrics.avg_game_length,
             'num_games': metrics.num_games,
             'buffer_size': metrics.buffer_size,
             'selfplay_time': metrics.selfplay_time,
             'train_time': metrics.train_time,
             'iteration_time': metrics.total_time,
-            'eval_win_rate': metrics.eval_win_rate,
-            'eval_endgame_score': metrics.eval_endgame_score,
-            'eval_endgame_total': getattr(metrics, 'eval_endgame_total', 5),
-            'eval_endgame_move_accuracy': getattr(metrics, 'eval_endgame_move_accuracy', None),
+            'grad_norm_avg': getattr(metrics, 'grad_norm_avg', 0.0),
+            'grad_norm_max': getattr(metrics, 'grad_norm_max', 0.0),
+            'wdl_alpha': getattr(metrics, 'wdl_alpha', 0.0),
+            'risk_beta': getattr(metrics, 'risk_beta', 0.0),
+            'num_train_batches': getattr(metrics, 'num_train_batches', 0),
+            'draws_repetition': getattr(metrics, 'draws_repetition', 0),
+            'draws_early_repetition': getattr(metrics, 'draws_early_repetition', 0),
+            'draws_stalemate': getattr(metrics, 'draws_stalemate', 0),
+            'draws_fifty_move': getattr(metrics, 'draws_fifty_move', 0),
+            'draws_insufficient': getattr(metrics, 'draws_insufficient', 0),
+            'draws_max_moves': getattr(metrics, 'draws_max_moves', 0),
         }
 
         self.history.append(dashboard_metrics)
@@ -982,6 +1753,10 @@ class LiveDashboardServer:
                        white_wins: int = 0,
                        black_wins: int = 0,
                        draws: int = 0,
+                       # Per-persona outcome tracking (asymmetric risk)
+                       standard_wins: int = 0,
+                       opponent_wins: int = 0,
+                       asymmetric_draws: int = 0,
                        # System monitoring metrics
                        timeout_evals: int = 0,
                        pool_exhaustion: int = 0,
@@ -994,17 +1769,51 @@ class LiveDashboardServer:
                        root_retries: int = 0,
                        stale_flushed: int = 0,
                        # GPU metrics
-                       cuda_graph_fires: int = 0,
+                       cuda_graph_fires: int = 0,  # Deprecated: sum of all graph fires
+                       large_graph_fires: int = 0,
+                       medium_graph_fires: int = 0,
+                       small_graph_fires: int = 0,
+                       mini_graph_fires: int = 0,
                        eager_fires: int = 0,
                        graph_fire_rate: float = 0.0,
                        avg_infer_time_ms: float = 0.0,
                        gpu_memory_used_mb: float = 0.0,
                        cuda_graph_enabled: bool = False,
+                       # Tree depth metrics
+                       max_search_depth: int = 0,
+                       min_search_depth: int = 0,
+                       avg_search_depth: float = 0.0,
+                       # Active game move counts
+                       min_current_moves: int = 0,
+                       max_current_moves: int = 0,
                        # Queue status metrics
                        queue_fill_pct: float = 0.0,
                        gpu_wait_ms: float = 0.0,
                        worker_wait_ms: float = 0.0,
-                       buffer_swaps: int = 0):
+                       buffer_swaps: int = 0,
+                       # Batch size distribution percentiles
+                       batch_p25: int = 0,
+                       batch_p50: int = 0,
+                       batch_p75: int = 0,
+                       batch_p90: int = 0,
+                       batch_min: int = 0,
+                       batch_max: int = 0,
+                       # Batch histogram data (list of [bin_center, count])
+                       batch_histogram: list = None,
+                       large_graph_threshold: int = 0,
+                       medium_graph_size: int = 0,
+                       small_graph_size: int = 0,
+                       mini_graph_size: int = 0,
+                       # Crossover thresholds for each tier
+                       medium_threshold: int = 0,
+                       small_threshold: int = 0,
+                       mini_threshold: int = 0,
+                       # Per-path inference time (ms)
+                       large_graph_time_ms: float = 0.0,
+                       medium_graph_time_ms: float = 0.0,
+                       small_graph_time_ms: float = 0.0,
+                       mini_graph_time_ms: float = 0.0,
+                       eager_time_ms: float = 0.0):
         """Push real-time progress updates during self-play (every few seconds).
 
         Args:
@@ -1062,6 +1871,9 @@ class LiveDashboardServer:
             'white_wins': white_wins,
             'black_wins': black_wins,
             'draws': draws,
+            'standard_wins': standard_wins,
+            'opponent_wins': opponent_wins,
+            'asymmetric_draws': asymmetric_draws,
             'buffer_size': buffer_size,
             'phase_elapsed': elapsed_time,
             'phase_eta': eta_seconds,
@@ -1080,16 +1892,50 @@ class LiveDashboardServer:
             'stale_flushed': stale_flushed,
             # GPU metrics
             'cuda_graph_fires': cuda_graph_fires,
+            'large_graph_fires': large_graph_fires,
+            'medium_graph_fires': medium_graph_fires,
+            'small_graph_fires': small_graph_fires,
+            'mini_graph_fires': mini_graph_fires,
             'eager_fires': eager_fires,
             'graph_fire_rate': graph_fire_rate,
             'avg_infer_time_ms': avg_infer_time_ms,
             'gpu_memory_used_mb': gpu_memory_used_mb,
             'cuda_graph_enabled': cuda_graph_enabled,
+            # Tree depth
+            'max_search_depth': max_search_depth,
+            'min_search_depth': min_search_depth,
+            'avg_search_depth': avg_search_depth,
+            # Active game move counts
+            'min_current_moves': min_current_moves,
+            'max_current_moves': max_current_moves,
             # Queue status metrics
             'queue_fill_pct': queue_fill_pct,
             'gpu_wait_ms': gpu_wait_ms,
             'worker_wait_ms': worker_wait_ms,
             'buffer_swaps': buffer_swaps,
+            # Batch size distribution percentiles
+            'batch_p25': batch_p25,
+            'batch_p50': batch_p50,
+            'batch_p75': batch_p75,
+            'batch_p90': batch_p90,
+            'batch_min': batch_min,
+            'batch_max': batch_max,
+            # Batch histogram data and routing thresholds
+            'batch_histogram': batch_histogram or [],
+            'large_graph_threshold': large_graph_threshold,
+            'medium_graph_size': medium_graph_size,
+            'small_graph_size': small_graph_size,
+            'mini_graph_size': mini_graph_size,
+            # Crossover thresholds for each tier
+            'medium_threshold': medium_threshold,
+            'small_threshold': small_threshold,
+            'mini_threshold': mini_threshold,
+            # Per-path inference time
+            'large_graph_time_ms': large_graph_time_ms,
+            'medium_graph_time_ms': medium_graph_time_ms,
+            'small_graph_time_ms': small_graph_time_ms,
+            'mini_graph_time_ms': mini_graph_time_ms,
+            'eager_time_ms': eager_time_ms,
         }
 
         self.socketio.emit('progress', progress_data)

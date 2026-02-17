@@ -6,6 +6,12 @@
 #include <omp.h>
 #endif
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <immintrin.h>
+#endif
+
 namespace selfplay {
 
 // ============================================================================
@@ -238,7 +244,8 @@ int GlobalEvaluationQueue::get_results(
     float* out_policies,
     float* out_values,
     int max_results,
-    int timeout_ms)
+    int timeout_ms,
+    float* out_wdl)
 {
     if (worker_id < 0 || worker_id >= static_cast<int>(MAX_WORKERS)) {
         return 0;
@@ -287,6 +294,13 @@ int GlobalEvaluationQueue::get_results(
 
         // Copy value
         out_values[i] = result.value;
+
+        // Copy WDL probabilities if caller wants them (Phase 2)
+        if (out_wdl != nullptr) {
+            out_wdl[i * 3 + 0] = result.wdl[0];
+            out_wdl[i * 3 + 1] = result.wdl[1];
+            out_wdl[i * 3 + 2] = result.wdl[2];
+        }
         retrieved++;
     }
 
@@ -309,7 +323,8 @@ int GlobalEvaluationQueue::try_get_results(
     int worker_id,
     float* out_policies,
     float* out_values,
-    int max_results)
+    int max_results,
+    float* out_wdl)
 {
     if (worker_id < 0 || worker_id >= static_cast<int>(MAX_WORKERS)) {
         return 0;
@@ -347,6 +362,13 @@ int GlobalEvaluationQueue::try_get_results(
         }
 
         out_values[i] = result.value;
+
+        // Copy WDL probabilities if caller wants them (Phase 2)
+        if (out_wdl != nullptr) {
+            out_wdl[i * 3 + 0] = result.wdl[0];
+            out_wdl[i * 3 + 1] = result.wdl[1];
+            out_wdl[i * 3 + 2] = result.wdl[2];
+        }
         retrieved++;
     }
 
@@ -502,23 +524,32 @@ int GlobalEvaluationQueue::collect_batch(
 
     int batch_size_i = static_cast<int>(batch_size);
 
-    #pragma omp parallel for schedule(static)
+    // Skip OpenMP fork overhead for tiny batches (fork cost ~1-5µs > work cost)
+    bool use_omp = batch_size_i >= 8;
+    int num_threads = std::min(batch_size_i,
+        static_cast<int>(std::thread::hardware_concurrency()));
+
+    #pragma omp parallel for schedule(static) num_threads(num_threads) if(use_omp)
     for (int b = 0; b < batch_size_i; ++b) {
         int slot = batch_staging_slots_[b];
 
-        // Bounded spin-wait until worker has finished writing this slot's data.
-        // In practice, workers finish memcpy well before the GPU thread
-        // completes stall detection, so this almost never actually spins.
-        // The spin count check (~every 1024 yields) provides:
-        //   1. shutdown_ escape to prevent hard-lock during graceful shutdown
-        //   2. Detection of severely descheduled workers (>100ms warning)
+        // Two-tier spin-wait: _mm_pause (fast) → yield (fallback)
+        // Workers finish memcpy well before the GPU thread completes stall
+        // detection, so this almost never exceeds the pause tier.
+        // NOTE: No sleep_for — on Windows, sleep_for(1µs) actually sleeps
+        // 1-15ms due to 15.6ms timer resolution, which blocks the entire
+        // OMP parallel region and causes catastrophic queue overflow.
         bool slot_valid = true;
         {
             int spin_count = 0;
             auto spin_start = std::chrono::steady_clock::now();
             while (slot_ready_[slot].load(std::memory_order_acquire) == 0) {
-                std::this_thread::yield();
-                if (++spin_count % 1024 == 0) {
+                if (++spin_count <= 64) {
+                    _mm_pause();  // x86 PAUSE: ~10ns, saves power, prevents pipeline flush
+                } else {
+                    std::this_thread::yield();
+                }
+                if (spin_count % 1024 == 0) {
                     // Check shutdown to prevent hard-lock during teardown
                     if (shutdown_.load(std::memory_order_relaxed)) {
                         slot_valid = false;
@@ -585,7 +616,8 @@ int GlobalEvaluationQueue::collect_batch(
 void GlobalEvaluationQueue::submit_results(
     const float* policies,
     const float* values,
-    int batch_size)
+    int batch_size,
+    const float* wdl_probs)
 {
     if (batch_size <= 0 || batch_size > static_cast<int>(batch_mapping_.size())) {
         return;
@@ -617,6 +649,13 @@ void GlobalEvaluationQueue::submit_results(
         result.batch_index = i;           // Index within this batch's policy buffer
         result.buffer_id = static_cast<int8_t>(buf_id);  // Which double-buffer to read from
         result.value = values[i];
+
+        // Copy WDL probabilities if provided (Phase 2: root WDL accumulation)
+        if (wdl_probs != nullptr) {
+            result.wdl[0] = wdl_probs[i * 3 + 0];
+            result.wdl[1] = wdl_probs[i * 3 + 1];
+            result.wdl[2] = wdl_probs[i * 3 + 2];
+        }
 
         results_by_worker[worker_id].push_back(std::move(result));
         workers_to_notify[worker_id] = true;

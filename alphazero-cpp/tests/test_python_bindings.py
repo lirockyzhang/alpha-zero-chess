@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Test Python bindings for AlphaZero Sync"""
+"""Test Python bindings for AlphaZero chess engine."""
 
 import sys
 import os
 import numpy as np
 
-# Fix Windows console encoding for Unicode characters
+# Fix Windows console encoding for Unicode characters (reconfigure avoids
+# closing the underlying buffer, which breaks pytest's capture mechanism)
 if sys.platform == 'win32':
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stdout.reconfigure(encoding='utf-8')
 
 # Add build directory to path (MSVC puts .pyd in build/Release/)
 build_dir = os.path.join(os.path.dirname(__file__), '..', 'build', 'Release')
@@ -26,88 +26,71 @@ def test_module_info():
     print(f"Module name: {alphazero_cpp.__name__}")
     print("✓ PASS: Module loaded successfully\n")
 
-def test_mcts_search():
-    """Test MCTS search functionality"""
-    print("=== Test 2: MCTS Search ===")
-
-    # Create MCTS search engine
-    search = alphazero_cpp.MCTSSearch(num_simulations=100, c_puct=1.5)
-    print("✓ Created MCTS search engine")
-
-    # Create uniform policy (1858 moves)
-    policy = np.ones(1858, dtype=np.float32) / 1858.0
-    value = 0.0
-
-    # Run search on starting position
-    fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-    visit_counts = search.search(fen, policy, value)
-
-    print(f"✓ Search completed")
-    print(f"✓ Visit counts shape: {visit_counts.shape}")
-    print(f"✓ Visit counts dtype: {visit_counts.dtype}")
-
-    # Reset search tree
-    search.reset()
-    print("✓ Search tree reset")
-
-    print("✓ PASS: MCTS search works\n")
-
-def test_batch_coordinator():
-    """Test batch coordinator functionality"""
-    print("=== Test 3: Batch Coordinator ===")
-
-    # Create batch coordinator
-    coordinator = alphazero_cpp.BatchCoordinator(batch_size=256, batch_threshold=0.9)
-    print("✓ Created batch coordinator")
-
-    # Add games
-    fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-    for i in range(10):
-        coordinator.add_game(i, fen)
-    print("✓ Added 10 games")
-
-    # Get statistics
-    stats = coordinator.get_stats()
-    print(f"✓ Active games: {stats['active_games']}")
-    print(f"✓ Pending evals: {stats['pending_evals']}")
-    print(f"✓ Batch counter: {stats['batch_counter']}")
-
-    # Check game completion
-    is_complete = coordinator.is_game_complete(0)
-    print(f"✓ Game 0 complete: {is_complete}")
-
-    print("✓ PASS: Batch coordinator works\n")
-
 def test_position_encoding():
     """Test position encoding functionality"""
-    print("=== Test 4: Position Encoding ===")
+    print("=== Test 2: Position Encoding ===")
 
     fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-    encoding = alphazero_cpp.encode_position(fen)
 
+    # Test single-arg form
+    encoding = alphazero_cpp.encode_position(fen)
     print(f"✓ Encoding shape: {encoding.shape}")
     print(f"✓ Encoding dtype: {encoding.dtype}")
-    print(f"✓ Expected shape: (119, 8, 8)")
+    print(f"✓ Expected shape: (8, 8, 122) [NHWC]")
 
-    if encoding.shape == (119, 8, 8):
-        print("✓ PASS: Position encoding works\n")
-    else:
-        print("✗ FAIL: Position encoding shape mismatch\n")
+    assert encoding.shape == (8, 8, 122), f"Shape mismatch: {encoding.shape} != (8, 8, 122)"
+    assert encoding.dtype == np.float32, f"Dtype mismatch: {encoding.dtype}"
+
+    # Test two-arg form with history FENs
+    history = [
+        "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    ]
+    encoding2 = alphazero_cpp.encode_position(fen, history)
+    assert encoding2.shape == (8, 8, 122), f"Two-arg shape mismatch: {encoding2.shape}"
+    print("✓ Two-arg encode_position(fen, history_fens) works")
+
+    print("✓ PASS: Position encoding works\n")
 
 def test_move_conversion():
     """Test move conversion utilities"""
-    print("=== Test 5: Move Conversion ===")
+    print("=== Test 3: Move Conversion ===")
 
-    # Test move to index
-    index = alphazero_cpp.move_to_index("e2e4")
-    print(f"✓ Move 'e2e4' -> index {index}")
-
-    # Test index to move
     fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+
+    # Test move to index (requires FEN for perspective handling)
+    index = alphazero_cpp.move_to_index("e2e4", fen)
+    print(f"✓ Move 'e2e4' -> index {index}")
+    assert 0 <= index < 4672, f"Index {index} out of range"
+
+    # Test index to move (round-trip)
     move = alphazero_cpp.index_to_move(index, fen)
     print(f"✓ Index {index} -> move '{move}'")
+    assert move == "e2e4", f"Round-trip failed: expected 'e2e4', got '{move}'"
 
-    print("✓ PASS: Move conversion works (placeholder implementation)\n")
+    print("✓ PASS: Move conversion works\n")
+
+def test_wdl_to_value():
+    """Test WDL to scalar value conversion"""
+    print("=== Test 4: WDL to Value ===")
+
+    # Pure win: pw=1 → value = 1-0 = 1
+    v = alphazero_cpp.wdl_to_value(1.0, 0.0, 0.0)
+    assert abs(v - 1.0) < 1e-6, f"Pure win: expected 1.0, got {v}"
+
+    # Pure loss: pl=1 → value = 0-1 = -1
+    v = alphazero_cpp.wdl_to_value(0.0, 0.0, 1.0)
+    assert abs(v - (-1.0)) < 1e-6, f"Pure loss: expected -1.0, got {v}"
+
+    # Pure draw: → value = 0-0 = 0 (risk adjustment at node level, not here)
+    v = alphazero_cpp.wdl_to_value(0.0, 1.0, 0.0)
+    assert abs(v) < 1e-6, f"Draw: expected 0.0, got {v}"
+
+    # Mixed WDL: pw=0.7, pd=0.2, pl=0.1 → value = 0.7-0.1 = 0.6
+    v = alphazero_cpp.wdl_to_value(0.7, 0.2, 0.1)
+    assert abs(v - 0.6) < 1e-6, f"Mixed WDL: expected 0.6, got {v}"
+
+    print("✓ PASS: WDL to value works\n")
 
 if __name__ == "__main__":
     print("========================================")
@@ -116,19 +99,13 @@ if __name__ == "__main__":
 
     try:
         test_module_info()
-        test_mcts_search()
-        test_batch_coordinator()
         test_position_encoding()
         test_move_conversion()
+        test_wdl_to_value()
 
         print("========================================")
         print("✓✓✓ ALL PYTHON BINDING TESTS PASSED ✓✓✓")
         print("========================================")
-        print("\nNext Steps:")
-        print("1. Implement full position encoding (119 planes)")
-        print("2. Implement move-to-index mapping (1858 moves)")
-        print("3. Add zero-copy tensor interface for GPU")
-        print("4. Test with actual neural network")
 
     except Exception as e:
         print("========================================")

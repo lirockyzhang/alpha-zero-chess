@@ -1,0 +1,313 @@
+  Auto-setting eval-batch=128 (workers × search_batch, rounded to 32)
+  Auto queue_capacity: 8192 (from 8 workers * 16 search_batch * 8)
+Created run directory: checkpoints\f192-b15_2026-02-15_17-11-28
+======================================================================
+AlphaZero Training with C++ Backend
+======================================================================
+Run directory:       checkpoints\f192-b15_2026-02-15_17-11-28
+Device:              cuda (NVIDIA GeForce RTX 4060 Laptop GPU)
+Network:             192 filters x 15 blocks
+Input channels:      122
+MCTS:                800 sims, search_batch=16, c_puct=1.5, fpu_base=0.3
+Self-play:           Parallel (8 workers, eval_batch=128)
+Training:            200 iters x 32 games
+                     train_batch=256, lr=0.001, epochs=5
+Value head:          WDL (soft cross-entropy), risk_beta=0.0
+Buffer:              100000 positions
+Checkpoints:         model_iter_*.pt (every 5 iters)
+Visualization:       summary.html
+Progress reports:    Every 30 seconds
+======================================================================
+Network parameters:  10,796,681
+  Initial WDL distribution: [[0.294 0.374 0.331]]
+Initializing metrics tracker... done
+
+Initializing LIVE dashboard server...
+ * Serving Flask app 'live_dashboard'
+ * Debug mode: off
+  Live dashboard started: http://127.0.0.1:5001
+  Browser opened automatically
+  Real-time updates via WebSocket
+
+============================================================
+INITIALIZATION COMPLETE - Starting training...
+============================================================
+
+
+**********************************************************************
+Run directory: checkpoints\f192-b15_2026-02-15_17-11-28
+Control file:  checkpoints\f192-b15_2026-02-15_17-11-28\param_updates.json
+Stop file:     checkpoints\f192-b15_2026-02-15_17-11-28\stop
+**********************************************************************
+
+
+======================================================================
+SETTINGS (iteration 1/200)
+======================================================================
+  Search:    simulations=800, c_puct=1.5, fpu_base=0.3, search_batch=16
+  Explore:   dirichlet_alpha=0.3, dirichlet_epsilon=0.25, temperature_moves=30
+  Risk:      risk_beta=0, risk_beta_final=0, risk_beta_warmup=0
+  Training:  lr=1.00e-03, train_batch=256, epochs=5
+  Self-play: games_per_iter=32, workers=8, max_fillup_factor=3
+======================================================================
+Iteration 1/200
+  Self-play: generating 32 games...
+  Parallel: 8 workers × 4 games = 32 games
+  eval_batch=128, gpu_timeout=20ms, queue_capacity=8192, root_eval_retries=3
+  CUDA graph calibration skipped, using defaults: mini=64, small=128, medium=129, large_threshold=120
+  CUDA Graphs captured: large=128, medium=129, small=128, mini=64
+  Routing: batch>120->large, batch<=129(>=128)->medium, batch<=128(>=64)->small, batch<=64(>=0)->mini, else->eager
+  Total buffer memory: 29.4 MB
+    ⏱ 31 sec | Games: 0/32 | Moves: 0.0/s | Sims: 8,669/s | NN: 8,786/s | Batch: 126 | Buffer: 0 | ETA: calculating...
+    ⏱ 1 min 1 sec | Games: 0/32 | Moves: 0.0/s | Sims: 8,735/s | NN: 8,834/s | Batch: 126 | Buffer: 0 | ETA: calculating...
+    ⏱ 1 min 32 sec | Games: 0/32 | Moves: 0.0/s | Sims: 8,689/s | NN: 8,708/s | Batch: 126 | Buffer: 0 | ETA: calculating...
+    ⏱ 2 min 2 sec | Games: 0/32 | Moves: 0.0/s | Sims: 8,509/s | NN: 8,541/s | Batch: 126 | Buffer: 0 | ETA: calculating...
+    ⏱ 2 min 33 sec | Games: 0/32 | Moves: 0.0/s | Sims: 8,442/s | NN: 8,443/s | Batch: 125 | Buffer: 0 | ETA: calculating...
+    ⏱ 3 min 3 sec | Games: 2/32 | Moves: 2.4/s | Sims: 8,337/s | NN: 8,346/s | Batch: 125 | Buffer: 435 | ETA: 10 min 26 sec
+    ⏱ 3 min 34 sec | Games: 4/32 | Moves: 4.5/s | Sims: 8,293/s | NN: 8,270/s | Batch: 125 | Buffer: 960 | ETA: 10 min 48 sec
+    ⏱ 4 min 4 sec | Games: 8/32 | Moves: 8.8/s | Sims: 8,312/s | NN: 8,271/s | Batch: 125 | Buffer: 2,151 | ETA: 10 min 21 sec
+    ⏱ 4 min 35 sec | Games: 8/32 | Moves: 7.8/s | Sims: 8,327/s | NN: 8,293/s | Batch: 125 | Buffer: 2,151 | ETA: 10 min 19 sec
+    ⏱ 5 min 5 sec | Games: 8/32 | Moves: 7.0/s | Sims: 8,344/s | NN: 8,312/s | Batch: 125 | Buffer: 2,151 | ETA: 10 min 18 sec
+    ⏱ 5 min 36 sec | Games: 8/32 | Moves: 6.4/s | Sims: 8,314/s | NN: 8,283/s | Batch: 125 | Buffer: 2,151 | ETA: 10 min 20 sec
+    ⏱ 6 min 7 sec | Games: 8/32 | Moves: 5.9/s | Sims: 8,294/s | NN: 8,252/s | Batch: 125 | Buffer: 2,151 | ETA: 10 min 22 sec
+    ⏱ 6 min 37 sec | Games: 8/32 | Moves: 5.4/s | Sims: 8,267/s | NN: 8,226/s | Batch: 125 | Buffer: 2,151 | ETA: 10 min 24 sec
+    ⏱ 7 min 8 sec | Games: 9/32 | Moves: 5.8/s | Sims: 8,236/s | NN: 8,188/s | Batch: 125 | Buffer: 2,464 | ETA: 10 min 11 sec
+    ⏱ 7 min 39 sec | Games: 11/32 | Moves: 6.5/s | Sims: 8,229/s | NN: 8,175/s | Batch: 125 | Buffer: 3,000 | ETA: 9 min 16 sec
+    ⏱ 8 min 9 sec | Games: 13/32 | Moves: 7.5/s | Sims: 8,218/s | NN: 8,162/s | Batch: 125 | Buffer: 3,665 | ETA: 8 min 41 sec
+    ⏱ 8 min 40 sec | Games: 14/32 | Moves: 7.9/s | Sims: 8,234/s | NN: 8,176/s | Batch: 125 | Buffer: 4,110 | ETA: 8 min 33 sec
+    ⏱ 9 min 10 sec | Games: 15/32 | Moves: 8.2/s | Sims: 8,249/s | NN: 8,193/s | Batch: 125 | Buffer: 4,496 | ETA: 8 min 14 sec
+    ⏱ 9 min 41 sec | Games: 16/32 | Moves: 8.5/s | Sims: 8,268/s | NN: 8,211/s | Batch: 125 | Buffer: 4,965 | ETA: 8 min
+    ⏱ 10 min 12 sec | Games: 16/32 | Moves: 8.1/s | Sims: 8,275/s | NN: 8,219/s | Batch: 125 | Buffer: 4,965 | ETA: 8 min
+    ⏱ 10 min 42 sec | Games: 19/32 | Moves: 8.9/s | Sims: 8,282/s | NN: 8,214/s | Batch: 125 | Buffer: 5,728 | ETA: 6 min 18 sec
+    ⏱ 11 min 13 sec | Games: 19/32 | Moves: 8.5/s | Sims: 8,288/s | NN: 8,223/s | Batch: 125 | Buffer: 5,728 | ETA: 6 min 18 sec
+    ⏱ 11 min 43 sec | Games: 19/32 | Moves: 8.1/s | Sims: 8,300/s | NN: 8,232/s | Batch: 125 | Buffer: 5,728 | ETA: 6 min 17 sec
+    ⏱ 12 min 14 sec | Games: 21/32 | Moves: 8.5/s | Sims: 8,296/s | NN: 8,224/s | Batch: 125 | Buffer: 6,257 | ETA: 5 min 16 sec
+    ⏱ 12 min 45 sec | Games: 22/32 | Moves: 8.5/s | Sims: 8,287/s | NN: 8,212/s | Batch: 125 | Buffer: 6,514 | ETA: 4 min 45 sec
+    ⏱ 13 min 15 sec | Games: 23/32 | Moves: 8.7/s | Sims: 8,289/s | NN: 8,211/s | Batch: 125 | Buffer: 6,899 | ETA: 4 min 20 sec
+    ⏱ 13 min 46 sec | Games: 23/32 | Moves: 8.3/s | Sims: 8,292/s | NN: 8,213/s | Batch: 125 | Buffer: 6,899 | ETA: 4 min 20 sec
+    ⏱ 14 min 17 sec | Games: 24/32 | Moves: 8.6/s | Sims: 8,289/s | NN: 8,209/s | Batch: 125 | Buffer: 7,379 | ETA: 3 min 57 sec
+    ⏱ 14 min 47 sec | Games: 25/32 | Moves: 8.7/s | Sims: 8,272/s | NN: 8,190/s | Batch: 124 | Buffer: 7,687 | ETA: 3 min 28 sec
+    ⏱ 15 min 18 sec | Games: 26/32 | Moves: 8.8/s | Sims: 8,203/s | NN: 8,119/s | Batch: 124 | Buffer: 8,049 | ETA: 3 min 1 sec
+    ⏱ 15 min 48 sec | Games: 30/32 | Moves: 9.7/s | Sims: 8,079/s | NN: 7,991/s | Batch: 122 | Buffer: 9,223 | ETA: 1 min
+    ⏱ 16 min 19 sec | Games: 30/32 | Moves: 9.4/s | Sims: 7,889/s | NN: 7,804/s | Batch: 119 | Buffer: 9,223 | ETA: 1 min 2 sec
+    ⏱ 16 min 50 sec | Games: 30/32 | Moves: 9.1/s | Sims: 7,712/s | NN: 7,628/s | Batch: 116 | Buffer: 9,223 | ETA: 1 min 3 sec
+    ⏱ 17 min 20 sec | Games: 30/32 | Moves: 8.9/s | Sims: 7,544/s | NN: 7,462/s | Batch: 114 | Buffer: 9,223 | ETA: 1 min 5 sec
+    ⏱ 17 min 51 sec | Games: 30/32 | Moves: 8.6/s | Sims: 7,386/s | NN: 7,306/s | Batch: 112 | Buffer: 9,223 | ETA: 1 min 6 sec
+    ⏱ 18 min 22 sec | Games: 31/32 | Moves: 8.7/s | Sims: 7,214/s | NN: 7,135/s | Batch: 109 | Buffer: 9,601 | ETA: 34 sec
+  Parallel stats: 7,865,791 NN evals (791.1/move), avg_batch=109.0, batches=72,192
+  📊 Batch distribution (n=72192): P25=113, P50=128, P75=128, P90=128, range=[1, 128]
+     Top 5: 128(38268), 32(7060), 113(4771), 127(3837), 126(2671)
+  Sample game: 1/2-1/2 in 215 moves -> checkpoints\f192-b15_2026-02-15_17-11-28\sample_games\iter_0001.pgn
+  Sample Game: 1/2-1/2 in 215 moves
+    Moves: b1a3 f7f6 c2c4 d7d6 a3b1 g8h6 e2e3 e7e5 g2g4 a7a5 h2h4 h6g8 d1b3 b7b6 c4c5 b8a6 g1e2 a6b8 e2c3 g7g6 ... (190 moves) ... e3e7 h7h6 e7f6 h6h5 b4d2
+  Training: 5 epochs on 9943 positions...
+  Training complete: loss=8.9743 (policy=8.4406, value=0.5338, grad_norm=5.20/14.91) in 10.3s
+
+  ──────────────────────────────────────────────────────────────────
+  ITERATION 1 SUMMARY
+  ──────────────────────────────────────────────────────────────────
+  Self-Play:
+    Games:           32 (0W / 32D / 0L)
+    Rates:           W=0% D=100% L=0%
+    Moves:           9943 total, 310.7 avg/game
+    Time:            18 min 23 sec (9.0 moves/sec)
+    MCTS Sims:       7,954,400 (7,209/sec)
+    NN Evals:        7,865,791 (7,128/sec)
+  Training:
+    Loss:            8.9743 (policy=8.4406, value=0.5338)
+    Grad Norm:       avg=5.20, max=14.91
+    Batches:         5 (125 samples/sec)
+    Time:            10 sec
+  Buffer:            9,943 positions
+  Iteration Time:    18 min 33 sec
+  ETA:               61 hr 38 min 40 sec (199 iterations remaining)
+  ──────────────────────────────────────────────────────────────────
+
+
+======================================================================
+SETTINGS (iteration 2/200)
+======================================================================
+  Search:    simulations=800, c_puct=1.5, fpu_base=0.3, search_batch=16
+  Explore:   dirichlet_alpha=0.3, dirichlet_epsilon=0.25, temperature_moves=30
+  Risk:      risk_beta=0, risk_beta_final=0, risk_beta_warmup=0
+  Training:  lr=1.00e-03, train_batch=256, epochs=5
+  Self-play: games_per_iter=32, workers=8, max_fillup_factor=3
+======================================================================
+Iteration 2/200
+  Self-play: generating 32 games...
+  Parallel: 8 workers × 4 games = 32 games
+  eval_batch=128, gpu_timeout=20ms, queue_capacity=8192, root_eval_retries=3
+  CUDA graph calibration skipped, using defaults: mini=64, small=128, medium=129, large_threshold=120
+  CUDA Graphs captured: large=128, medium=129, small=128, mini=64
+  Routing: batch>120->large, batch<=129(>=128)->medium, batch<=128(>=64)->small, batch<=64(>=0)->mini, else->eager
+  Total buffer memory: 29.4 MB
+    ⏱ 30 sec | Games: 0/32 | Moves: 0.0/s | Sims: 8,899/s | NN: 8,585/s | Batch: 126 | Buffer: 9,943 | ETA: calculating...
+    ⏱ 1 min 1 sec | Games: 6/32 | Moves: 5.9/s | Sims: 8,853/s | NN: 8,552/s | Batch: 125 | Buffer: 10,302 | ETA: 2 min 20 sec
+    ⏱ 1 min 31 sec | Games: 9/32 | Moves: 6.0/s | Sims: 8,709/s | NN: 8,444/s | Batch: 125 | Buffer: 10,495 | ETA: 2 min 9 sec
+    ⏱ 2 min 2 sec | Games: 11/32 | Moves: 6.4/s | Sims: 8,701/s | NN: 8,378/s | Batch: 125 | Buffer: 10,724 | ETA: 2 min 17 sec
+    ⏱ 2 min 33 sec | Games: 14/32 | Moves: 7.1/s | Sims: 8,657/s | NN: 8,326/s | Batch: 125 | Buffer: 11,026 | ETA: 2 min 8 sec
+    ⏱ 3 min 3 sec | Games: 18/32 | Moves: 8.7/s | Sims: 8,623/s | NN: 8,319/s | Batch: 125 | Buffer: 11,539 | ETA: 1 min 55 sec
+    ⏱ 3 min 34 sec | Games: 19/32 | Moves: 7.9/s | Sims: 8,658/s | NN: 8,355/s | Batch: 125 | Buffer: 11,633 | ETA: 1 min 46 sec
+    ⏱ 4 min 4 sec | Games: 23/32 | Moves: 9.0/s | Sims: 8,674/s | NN: 8,360/s | Batch: 125 | Buffer: 12,152 | ETA: 1 min 19 sec
+    ⏱ 4 min 35 sec | Games: 26/32 | Moves: 9.3/s | Sims: 8,644/s | NN: 8,328/s | Batch: 125 | Buffer: 12,498 | ETA: 54 sec
+    ⏱ 5 min 6 sec | Games: 28/32 | Moves: 8.8/s | Sims: 8,268/s | NN: 7,965/s | Batch: 120 | Buffer: 12,648 | ETA: 37 sec
+    ⏱ 5 min 36 sec | Games: 29/32 | Moves: 8.3/s | Sims: 7,831/s | NN: 7,547/s | Batch: 114 | Buffer: 12,746 | ETA: 29 sec
+    ⏱ 6 min 7 sec | Games: 31/32 | Moves: 8.6/s | Sims: 7,293/s | NN: 7,029/s | Batch: 107 | Buffer: 13,112 | ETA: 11 sec
+    ⏱ 6 min 37 sec | Games: 31/32 | Moves: 8.0/s | Sims: 6,811/s | NN: 6,565/s | Batch: 100 | Buffer: 13,112 | ETA: 12 sec
+  Parallel stats: 2,616,379 NN evals (770.9/move), avg_batch=99.1, batches=26,413
+  📊 Batch distribution (n=26413): P25=64, P50=128, P75=128, P90=128, range=[1, 128]
+     Top 5: 128(14702), 16(3743), 113(2559), 48(1483), 64(1372)
+  Sample game: 0-1 in 98 moves -> checkpoints\f192-b15_2026-02-15_17-11-28\sample_games\iter_0002.pgn
+  Sample Game: 0-1 in 98 moves
+    Moves: g1f3 g8h6 h2h4 b8a6 h4h5 h6g8 e2e4 f7f5 f1c4 c7c6 a2a3 d8a5 c4f1 c6c5 f1c4 g8f6 c2c3 a6c7 c4b3 d7d5 ... (73 moves) ... a7c5 c1d2 a5b4 d2b4 d6d4
+  Training: 5 epochs on 13337 positions...
+  Training complete: loss=8.3163 (policy=8.1286, value=0.1877, grad_norm=1.14/1.55) in 0.8s
+
+  ──────────────────────────────────────────────────────────────────
+  ITERATION 2 SUMMARY
+  ──────────────────────────────────────────────────────────────────
+  Self-Play:
+    Games:           32 (0W / 30D / 2L)
+    Rates:           W=0% D=94% L=6%
+    Moves:           3394 total, 106.1 avg/game
+    Time:            6 min 41 sec (8.5 moves/sec)
+    MCTS Sims:       2,715,200 (6,763/sec)
+    NN Evals:        2,616,379 (6,517/sec)
+  Training:
+    Loss:            8.3163 (policy=8.1286, value=0.1877)
+    Grad Norm:       avg=1.14, max=1.55
+    Batches:         5 (1518 samples/sec)
+    Time:            0 sec
+  Buffer:            13,337 positions
+  Iteration Time:    6 min 42 sec
+  ETA:               41 hr 43 min 56 sec (198 iterations remaining)
+  ──────────────────────────────────────────────────────────────────
+
+
+======================================================================
+SETTINGS (iteration 3/200)
+======================================================================
+  Search:    simulations=800, c_puct=1.5, fpu_base=0.3, search_batch=16
+  Explore:   dirichlet_alpha=0.3, dirichlet_epsilon=0.25, temperature_moves=30
+  Risk:      risk_beta=0, risk_beta_final=0, risk_beta_warmup=0
+  Training:  lr=1.00e-03, train_batch=256, epochs=5
+  Self-play: games_per_iter=32, workers=8, max_fillup_factor=3
+======================================================================
+Iteration 3/200
+  Self-play: generating 32 games...
+  Parallel: 8 workers × 4 games = 32 games
+  eval_batch=128, gpu_timeout=20ms, queue_capacity=8192, root_eval_retries=3
+  CUDA graph calibration skipped, using defaults: mini=64, small=128, medium=129, large_threshold=120
+  CUDA Graphs captured: large=128, medium=129, small=128, mini=64
+  Routing: batch>120->large, batch<=129(>=128)->medium, batch<=128(>=64)->small, batch<=64(>=0)->mini, else->eager
+  Total buffer memory: 29.4 MB
+    ⏱ 30 sec | Games: 0/32 | Moves: 0.0/s | Sims: 8,949/s | NN: 9,143/s | Batch: 126 | Buffer: 13,337 | ETA: calculating...
+    ⏱ 1 min 1 sec | Games: 0/32 | Moves: 0.0/s | Sims: 8,968/s | NN: 9,048/s | Batch: 126 | Buffer: 13,337 | ETA: calculating...
+    ⏱ 1 min 31 sec | Games: 0/32 | Moves: 0.0/s | Sims: 9,046/s | NN: 9,053/s | Batch: 126 | Buffer: 13,337 | ETA: calculating...
+    ⏱ 2 min 2 sec | Games: 0/32 | Moves: 0.0/s | Sims: 8,977/s | NN: 8,985/s | Batch: 125 | Buffer: 13,337 | ETA: calculating...
+    ⏱ 2 min 33 sec | Games: 1/32 | Moves: 1.4/s | Sims: 8,857/s | NN: 8,848/s | Batch: 125 | Buffer: 13,549 | ETA: 9 min 53 sec
+    ⏱ 3 min 3 sec | Games: 2/32 | Moves: 2.5/s | Sims: 8,718/s | NN: 8,691/s | Batch: 125 | Buffer: 13,798 | ETA: 10 min 34 sec
+    ⏱ 3 min 34 sec | Games: 3/32 | Moves: 3.5/s | Sims: 8,696/s | NN: 8,644/s | Batch: 125 | Buffer: 14,082 | ETA: 11 min 2 sec
+    ⏱ 4 min 5 sec | Games: 6/32 | Moves: 6.8/s | Sims: 8,686/s | NN: 8,634/s | Batch: 125 | Buffer: 15,016 | ETA: 11 min 10 sec
+    ⏱ 4 min 35 sec | Games: 7/32 | Moves: 7.4/s | Sims: 8,697/s | NN: 8,643/s | Batch: 125 | Buffer: 15,381 | ETA: 11 min 11 sec
+    ⏱ 5 min 6 sec | Games: 7/32 | Moves: 6.7/s | Sims: 8,671/s | NN: 8,627/s | Batch: 125 | Buffer: 15,381 | ETA: 11 min 13 sec
+    ⏱ 5 min 36 sec | Games: 9/32 | Moves: 8.0/s | Sims: 8,646/s | NN: 8,594/s | Batch: 125 | Buffer: 16,033 | ETA: 10 min 37 sec
+    ⏱ 6 min 7 sec | Games: 10/32 | Moves: 7.8/s | Sims: 8,599/s | NN: 8,544/s | Batch: 125 | Buffer: 16,212 | ETA: 9 min 48 sec
+    ⏱ 6 min 38 sec | Games: 11/32 | Moves: 8.0/s | Sims: 8,573/s | NN: 8,513/s | Batch: 125 | Buffer: 16,507 | ETA: 9 min 24 sec
+    ⏱ 7 min 8 sec | Games: 11/32 | Moves: 7.4/s | Sims: 8,534/s | NN: 8,478/s | Batch: 125 | Buffer: 16,507 | ETA: 9 min 27 sec
+    ⏱ 7 min 39 sec | Games: 13/32 | Moves: 8.1/s | Sims: 8,506/s | NN: 8,438/s | Batch: 125 | Buffer: 17,041 | ETA: 8 min 29 sec
+    ⏱ 8 min 9 sec | Games: 14/32 | Moves: 8.2/s | Sims: 8,498/s | NN: 8,420/s | Batch: 125 | Buffer: 17,355 | ETA: 8 min 6 sec
+    ⏱ 8 min 40 sec | Games: 14/32 | Moves: 7.7/s | Sims: 8,502/s | NN: 8,424/s | Batch: 125 | Buffer: 17,355 | ETA: 8 min 6 sec
+    ⏱ 9 min 11 sec | Games: 15/32 | Moves: 8.0/s | Sims: 8,484/s | NN: 8,406/s | Batch: 125 | Buffer: 17,735 | ETA: 7 min 50 sec
+    ⏱ 9 min 41 sec | Games: 16/32 | Moves: 8.1/s | Sims: 8,471/s | NN: 8,395/s | Batch: 125 | Buffer: 18,047 | ETA: 7 min 24 sec
+    ⏱ 10 min 12 sec | Games: 16/32 | Moves: 7.7/s | Sims: 8,462/s | NN: 8,379/s | Batch: 125 | Buffer: 18,047 | ETA: 7 min 25 sec
+    ⏱ 10 min 43 sec | Games: 17/32 | Moves: 7.9/s | Sims: 8,440/s | NN: 8,353/s | Batch: 125 | Buffer: 18,407 | ETA: 7 min 4 sec
+    ⏱ 11 min 13 sec | Games: 20/32 | Moves: 9.0/s | Sims: 8,403/s | NN: 8,305/s | Batch: 124 | Buffer: 19,416 | ETA: 5 min 47 sec
+    ⏱ 11 min 44 sec | Games: 20/32 | Moves: 8.6/s | Sims: 8,369/s | NN: 8,275/s | Batch: 125 | Buffer: 19,416 | ETA: 5 min 48 sec
+    ⏱ 12 min 14 sec | Games: 20/32 | Moves: 8.3/s | Sims: 8,354/s | NN: 8,257/s | Batch: 124 | Buffer: 19,416 | ETA: 5 min 49 sec
+    ⏱ 12 min 45 sec | Games: 20/32 | Moves: 7.9/s | Sims: 8,342/s | NN: 8,242/s | Batch: 124 | Buffer: 19,416 | ETA: 5 min 49 sec
+    ⏱ 13 min 16 sec | Games: 24/32 | Moves: 9.3/s | Sims: 8,329/s | NN: 8,224/s | Batch: 124 | Buffer: 20,720 | ETA: 3 min 56 sec
+    ⏱ 13 min 46 sec | Games: 25/32 | Moves: 9.1/s | Sims: 8,268/s | NN: 8,164/s | Batch: 124 | Buffer: 20,887 | ETA: 3 min 24 sec
+    ⏱ 14 min 17 sec | Games: 25/32 | Moves: 8.8/s | Sims: 8,200/s | NN: 8,095/s | Batch: 123 | Buffer: 20,887 | ETA: 3 min 26 sec
+    ⏱ 14 min 47 sec | Games: 25/32 | Moves: 8.5/s | Sims: 8,121/s | NN: 8,017/s | Batch: 123 | Buffer: 20,887 | ETA: 3 min 28 sec
+    ⏱ 15 min 18 sec | Games: 27/32 | Moves: 9.0/s | Sims: 8,022/s | NN: 7,915/s | Batch: 122 | Buffer: 21,606 | ETA: 2 min 32 sec
+    ⏱ 15 min 48 sec | Games: 27/32 | Moves: 8.7/s | Sims: 7,905/s | NN: 7,798/s | Batch: 121 | Buffer: 21,606 | ETA: 2 min 34 sec
+    ⏱ 16 min 19 sec | Games: 29/32 | Moves: 8.9/s | Sims: 7,767/s | NN: 7,662/s | Batch: 119 | Buffer: 22,021 | ETA: 1 min 32 sec
+    ⏱ 16 min 50 sec | Games: 29/32 | Moves: 8.6/s | Sims: 7,624/s | NN: 7,521/s | Batch: 117 | Buffer: 22,021 | ETA: 1 min 34 sec
+    ⏱ 17 min 20 sec | Games: 31/32 | Moves: 9.0/s | Sims: 7,449/s | NN: 7,347/s | Batch: 114 | Buffer: 22,722 | ETA: 32 sec
+  Parallel stats: 7,670,939 NN evals (788.9/move), avg_batch=111.8, batches=68,597
+  📊 Batch distribution (n=68597): P25=112, P50=127, P75=128, P90=128, range=[1, 128]
+     Top 5: 128(33453), 112(3853), 113(3680), 127(3564), 48(3061)
+  Sample game: 1/2-1/2 in 212 moves -> checkpoints\f192-b15_2026-02-15_17-11-28\sample_games\iter_0003.pgn
+  Sample Game: 1/2-1/2 in 212 moves
+    Moves: f2f4 f7f6 c2c4 b7b6 g2g4 a7a6 a2a3 g7g5 f1h3 f8h6 h3f1 d7d6 d1c2 e8f8 c2g6 h7g6 e2e3 c8d7 b2b3 a8a7 ... (187 moves) ... d6d7 a6a7 f1a1 a7b8 d7c6
+  Training: 5 epochs on 23060 positions...
+  Training complete: loss=7.9393 (policy=7.8431, value=0.0963, grad_norm=0.86/0.89) in 0.8s
+
+  ──────────────────────────────────────────────────────────────────
+  ITERATION 3 SUMMARY
+  ──────────────────────────────────────────────────────────────────
+  Self-Play:
+    Games:           32 (0W / 32D / 0L)
+    Rates:           W=0% D=100% L=0%
+    Moves:           9723 total, 303.8 avg/game
+    Time:            17 min 45 sec (9.1 moves/sec)
+    MCTS Sims:       7,778,400 (7,297/sec)
+    NN Evals:        7,670,939 (7,196/sec)
+  Training:
+    Loss:            7.9393 (policy=7.8431, value=0.0963)
+    Grad Norm:       avg=0.86, max=0.89
+    Batches:         5 (1525 samples/sec)
+    Time:            0 sec
+  Buffer:            23,060 positions
+  Iteration Time:    17 min 46 sec
+  ETA:               47 hr 8 min 27 sec (197 iterations remaining)
+  ──────────────────────────────────────────────────────────────────
+
+
+======================================================================
+SETTINGS (iteration 4/200)
+======================================================================
+  Search:    simulations=800, c_puct=1.5, fpu_base=0.3, search_batch=16
+  Explore:   dirichlet_alpha=0.3, dirichlet_epsilon=0.25, temperature_moves=30
+  Risk:      risk_beta=0, risk_beta_final=0, risk_beta_warmup=0
+  Training:  lr=1.00e-03, train_batch=256, epochs=5
+  Self-play: games_per_iter=32, workers=8, max_fillup_factor=3
+======================================================================
+Iteration 4/200
+  Self-play: generating 32 games...
+  Parallel: 8 workers × 4 games = 32 games
+  eval_batch=128, gpu_timeout=20ms, queue_capacity=8192, root_eval_retries=3
+  CUDA graph calibration skipped, using defaults: mini=64, small=128, medium=129, large_threshold=120
+  CUDA Graphs captured: large=128, medium=129, small=128, mini=64
+  Routing: batch>120->large, batch<=129(>=128)->medium, batch<=128(>=64)->small, batch<=64(>=0)->mini, else->eager
+  Total buffer memory: 29.4 MB
+    ⏱ 30 sec | Games: 0/32 | Moves: 0.0/s | Sims: 8,334/s | NN: 8,422/s | Batch: 126 | Buffer: 23,060 | ETA: calculating...
+    ⏱ 1 min 1 sec | Games: 0/32 | Moves: 0.0/s | Sims: 8,344/s | NN: 8,351/s | Batch: 126 | Buffer: 23,060 | ETA: calculating...
+    ⏱ 1 min 31 sec | Games: 0/32 | Moves: 0.0/s | Sims: 8,282/s | NN: 8,321/s | Batch: 126 | Buffer: 23,060 | ETA: calculating...
+    ⏱ 2 min 2 sec | Games: 0/32 | Moves: 0.0/s | Sims: 7,986/s | NN: 7,991/s | Batch: 125 | Buffer: 23,060 | ETA: calculating...
+    ⏱ 2 min 33 sec | Games: 0/32 | Moves: 0.0/s | Sims: 7,856/s | NN: 7,860/s | Batch: 125 | Buffer: 23,060 | ETA: calculating...
+    ⏱ 3 min 3 sec | Games: 1/32 | Moves: 1.2/s | Sims: 7,699/s | NN: 7,678/s | Batch: 125 | Buffer: 23,272 | ETA: 11 min 22 sec
+    ⏱ 3 min 34 sec | Games: 3/32 | Moves: 3.3/s | Sims: 7,656/s | NN: 7,641/s | Batch: 125 | Buffer: 23,757 | ETA: 11 min 44 sec
+    ⏱ 4 min 4 sec | Games: 5/32 | Moves: 5.2/s | Sims: 7,617/s | NN: 7,595/s | Batch: 125 | Buffer: 24,330 | ETA: 12 min
+    ⏱ 4 min 35 sec | Games: 7/32 | Moves: 6.9/s | Sims: 7,635/s | NN: 7,610/s | Batch: 125 | Buffer: 24,968 | ETA: 11 min 54 sec
+    ⏱ 5 min 6 sec | Games: 7/32 | Moves: 6.2/s | Sims: 7,625/s | NN: 7,601/s | Batch: 125 | Buffer: 24,968 | ETA: 11 min 54 sec
+    ⏱ 5 min 36 sec | Games: 7/32 | Moves: 5.7/s | Sims: 7,597/s | NN: 7,575/s | Batch: 125 | Buffer: 24,968 | ETA: 11 min 57 sec
+    ⏱ 6 min 7 sec | Games: 7/32 | Moves: 5.2/s | Sims: 7,589/s | NN: 7,564/s | Batch: 125 | Buffer: 24,968 | ETA: 11 min 58 sec
+    ⏱ 6 min 37 sec | Games: 8/32 | Moves: 5.9/s | Sims: 7,571/s | NN: 7,542/s | Batch: 125 | Buffer: 25,427 | ETA: 12 min 30 sec
+    ⏱ 7 min 8 sec | Games: 8/32 | Moves: 5.5/s | Sims: 7,539/s | NN: 7,505/s | Batch: 125 | Buffer: 25,427 | ETA: 12 min 33 sec
+    ⏱ 7 min 39 sec | Games: 8/32 | Moves: 5.2/s | Sims: 7,465/s | NN: 7,423/s | Batch: 125 | Buffer: 25,427 | ETA: 12 min 40 sec
+    ⏱ 8 min 9 sec | Games: 9/32 | Moves: 5.5/s | Sims: 7,411/s | NN: 7,365/s | Batch: 125 | Buffer: 25,743 | ETA: 12 min 20 sec
+    ⏱ 8 min 40 sec | Games: 9/32 | Moves: 5.2/s | Sims: 7,375/s | NN: 7,325/s | Batch: 125 | Buffer: 25,743 | ETA: 12 min 23 sec
+    ⏱ 9 min 10 sec | Games: 13/32 | Moves: 7.4/s | Sims: 7,359/s | NN: 7,305/s | Batch: 125 | Buffer: 27,120 | ETA: 10 min 45 sec
+    ⏱ 9 min 41 sec | Games: 13/32 | Moves: 7.0/s | Sims: 7,330/s | NN: 7,274/s | Batch: 125 | Buffer: 27,120 | ETA: 10 min 47 sec
+    ⏱ 10 min 12 sec | Games: 15/32 | Moves: 7.8/s | Sims: 7,350/s | NN: 7,293/s | Batch: 125 | Buffer: 27,857 | ETA: 9 min 51 sec
+    ⏱ 10 min 42 sec | Games: 15/32 | Moves: 7.5/s | Sims: 7,348/s | NN: 7,293/s | Batch: 125 | Buffer: 27,857 | ETA: 9 min 51 sec
+    ⏱ 11 min 13 sec | Games: 15/32 | Moves: 7.1/s | Sims: 7,351/s | NN: 7,296/s | Batch: 125 | Buffer: 27,857 | ETA: 9 min 51 sec
+    ⏱ 11 min 43 sec | Games: 17/32 | Moves: 7.6/s | Sims: 7,351/s | NN: 7,297/s | Batch: 125 | Buffer: 28,440 | ETA: 8 min 36 sec
+    ⏱ 12 min 14 sec | Games: 17/32 | Moves: 7.3/s | Sims: 7,370/s | NN: 7,318/s | Batch: 125 | Buffer: 28,440 | ETA: 8 min 35 sec
+    ⏱ 12 min 44 sec | Games: 17/32 | Moves: 7.0/s | Sims: 7,354/s | NN: 7,299/s | Batch: 125 | Buffer: 28,440 | ETA: 8 min 36 sec
+    ⏱ 13 min 15 sec | Games: 18/32 | Moves: 7.1/s | Sims: 7,371/s | NN: 7,308/s | Batch: 125 | Buffer: 28,743 | ETA: 7 min 59 sec
+    ⏱ 13 min 46 sec | Games: 21/32 | Moves: 7.9/s | Sims: 7,381/s | NN: 7,317/s | Batch: 125 | Buffer: 29,622 | ETA: 6 min 12 sec
+    ⏱ 14 min 16 sec | Games: 22/32 | Moves: 8.1/s | Sims: 7,384/s | NN: 7,321/s | Batch: 125 | Buffer: 29,988 | ETA: 5 min 41 sec
+    ⏱ 14 min 47 sec | Games: 24/32 | Moves: 8.4/s | Sims: 7,405/s | NN: 7,343/s | Batch: 125 | Buffer: 30,544 | ETA: 4 min 29 sec

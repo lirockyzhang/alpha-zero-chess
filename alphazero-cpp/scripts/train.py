@@ -4,7 +4,7 @@ AlphaZero Training with C++ Backend
 
 This script uses:
 - C++ MCTS (alphazero-cpp) for fast tree search with proper leaf evaluation
-- C++ ReplayBuffer for high-performance data storage with optional persistence
+- C++ ReplayBuffer for high-performance data storage
 - CUDA for neural network inference and training
 - 192x15 network architecture (192 filters, 15 residual blocks)
 - 122-channel position encoding
@@ -18,8 +18,7 @@ Output Directory Structure:
         ├── model_final.pt               # Final checkpoint
         ├── training_metrics.json        # Loss, games, moves per iteration
         ├── summary.html                 # Training summary (default, unless --no-visualization)
-        ├── evaluation_results.json      # Evaluation metrics per checkpoint
-        └── replay_buffer.rpbf           # Always saved; use --load-buffer to load on resume
+        └── evaluation_results.json      # Evaluation metrics per checkpoint
 
 Usage:
     # Basic training (recommended starting point)
@@ -34,14 +33,12 @@ Usage:
     # Resume from run directory (finds latest checkpoint)
     uv run python alphazero-cpp/scripts/train.py --resume checkpoints/f192-b15_2024-02-03_14-30-00
 
-    # With buffer loading (buffer always saved; --load-buffer loads on startup)
-    uv run python alphazero-cpp/scripts/train.py --load-buffer
-
 Parameters:
     --iterations        Number of training iterations (default: 100)
     --games-per-iter    Self-play games per iteration (default: 50)
     --simulations       MCTS simulations per move (default: 800)
-    --search-batch      Leaves to evaluate per MCTS iteration (default: 32)
+    --search-algorithm  Root search: gumbel (default) or puct
+    --c-explore         MCTS exploration constant (default: 1.5)
     --train-batch       Samples per training gradient step (default: 256)
     --lr                Learning rate (default: 0.001)
     --filters           Network filters (default: 192)
@@ -49,30 +46,25 @@ Parameters:
     --buffer-size       Replay buffer size (default: 100000)
     --epochs            Training epochs per iteration (default: 5)
     --temperature-moves Moves with temperature=1 (default: 30)
-    --c-puct            MCTS exploration constant (default: 1.5)
     --device            Device: cuda or cpu (default: cuda)
     --save-dir          Base checkpoint directory (default: checkpoints)
     --resume            Resume from checkpoint path or run directory
-    --save-interval     Save checkpoint every N iterations (default: 5)
-    --load-buffer        Load replay buffer on startup (always saved regardless)
+    --save-interval     Save checkpoint every N iterations (default: 1)
     --no-visualization  Disable summary.html generation (default: enabled)
-    --no-eval           Skip evaluation before checkpoint (default: enabled)
 
     Parallel Self-Play (enabled automatically when --workers > 1):
     --workers              Self-play workers. 1=sequential, >1=parallel (default: 1)
-    --eval-batch           Max positions per GPU call in parallel mode (default: 512)
     --gpu-batch-timeout-ms GPU batch collection timeout in ms (default: 20)
     --worker-timeout-ms    Worker wait time for NN results in ms (default: 2000)
-    --dirichlet-alpha      Dirichlet noise alpha for root exploration (default: 0.3)
-    --dirichlet-epsilon    Dirichlet noise weight for root exploration (default: 0.25)
 
-    Parameter Relationships (for parallel mode):
-    --eval-batch should be >= --search-batch * --workers for optimal GPU utilization.
-    --search-batch is per-game MCTS leaf batch size; --eval-batch is the cross-game GPU batch.
+    search_batch is auto-derived: gumbel→gumbel_top_k, puct→1.
+    eval_batch (GPU-effective) is auto-computed as workers*search_batch*mirror_factor.
+    input_batch_size = eval_batch / mirror_factor (used for C++ queue and CUDA graphs).
 """
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -84,12 +76,24 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 from datetime import datetime, timedelta
 
+# Force line-buffered UTF-8 output (prevents silent buffering when piped through tee)
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+    sys.stderr.reconfigure(encoding='utf-8', line_buffering=True)
+elif sys.platform == 'win32':
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+
+import io
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
+import chess
+import chess.pgn
 
 # Add paths
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -108,14 +112,8 @@ except ImportError:
 
 import chess
 
-
-# =============================================================================
-# Constants
-# =============================================================================
-
-# 122-channel encoding (8 history * 14 piece planes + 8 repetition + 2 color/castling)
-INPUT_CHANNELS = 122
-POLICY_SIZE = 4672
+from generate_summary import generate_summary_html
+from network import AlphaZeroNet, INPUT_CHANNELS, POLICY_SIZE
 
 
 def format_duration(seconds: float) -> str:
@@ -150,7 +148,7 @@ def format_duration(seconds: float) -> str:
 # =============================================================================
 
 class GracefulShutdown:
-    """Handles graceful shutdown on Ctrl+C (SIGINT).
+    """Handles graceful shutdown on Ctrl+C (SIGINT) or stop file.
 
     When shutdown is requested:
     1. Finishes current game (if in self-play)
@@ -163,25 +161,42 @@ class GracefulShutdown:
         self.shutdown_requested = False
         self._lock = threading.Lock()
         self._original_handler = None
+        self.stop_file_path = None  # Set after run_dir is known
 
-    def request_shutdown(self, signum=None, frame=None):
+    def request_shutdown(self, signum=None, frame=None, source="sigint"):
         """Request graceful shutdown."""
         with self._lock:
             if not self.shutdown_requested:
                 self.shutdown_requested = True
-                print("\n\n" + "!" * 70)
-                print("! SHUTDOWN REQUESTED - Finishing current game and saving...")
-                print("! Press Ctrl+C again to force quit (may lose data)")
-                print("!" * 70 + "\n")
+                if source == "sigint":
+                    print("\n\n" + "!" * 70)
+                    print("! SHUTDOWN REQUESTED - Finishing current game and saving...")
+                    print("! Press Ctrl+C again to force quit (may lose data)")
+                    print("!" * 70 + "\n")
+                elif source == "stop_file":
+                    print("\n" + "!" * 70)
+                    print("! [LLM] Stop file detected — stopping immediately")
+                    print("! Press Ctrl+C to force quit (may lose data)")
+                    print("!" * 70 + "\n")
 
                 # Restore original handler for force quit
                 if self._original_handler:
                     signal.signal(signal.SIGINT, self._original_handler)
 
     def should_stop(self) -> bool:
-        """Check if shutdown was requested."""
+        """Check if shutdown was requested (SIGINT or stop file)."""
         with self._lock:
-            return self.shutdown_requested
+            if self.shutdown_requested:
+                return True
+        # Check stop file (if configured)
+        if self.stop_file_path and os.path.exists(self.stop_file_path):
+            try:
+                os.remove(self.stop_file_path)
+            except OSError:
+                pass
+            self.request_shutdown(source="stop_file")
+            return True
+        return False
 
     def install_handler(self):
         """Install the graceful shutdown signal handler."""
@@ -283,509 +298,23 @@ class ProgressReporter:
 
 
 # =============================================================================
-# Visual Training Dashboard (Plotly)
+# Refutation Elo
 # =============================================================================
 
-class TrainingDashboard:
-    """Interactive visual dashboard for monitoring training progress.
+MIN_REFUTATION_SAMPLES = 20  # Minimum games before Elo is statistically meaningful
 
-    Creates an HTML dashboard with live-updating charts showing:
-    - Loss curves (total, policy, value)
-    - Performance metrics (moves/s, sims/s, NN evals/s)
-    - Game statistics (win/draw/loss, game length)
-    - Resource utilization (buffer size, iteration times)
+def compute_refutation_elo(standard_wins, opponent_wins, draws):
+    """Compute Refutation Elo from per-persona outcomes.
 
-    The dashboard auto-refreshes and can be viewed in a browser during training.
+    Returns Elo difference (positive = standard is stronger).
+    Returns None if insufficient data (< MIN_REFUTATION_SAMPLES).
     """
-
-    def __init__(self, output_dir: str = "training_dashboard", update_interval: int = 1):
-        """Initialize the dashboard.
-
-        Args:
-            output_dir: Directory to save dashboard files
-            update_interval: Update dashboard every N iterations
-        """
-        self.output_dir = Path(output_dir)
-        self.update_interval = update_interval
-        self.enabled = False
-
-        # Data storage for all metrics
-        self.data = {
-            # Iteration tracking
-            'iterations': [],
-            'timestamps': [],
-            'elapsed_minutes': [],
-
-            # Loss metrics
-            'total_loss': [],
-            'policy_loss': [],
-            'value_loss': [],
-
-            # Self-play performance
-            'moves_per_sec': [],
-            'sims_per_sec': [],
-            'nn_evals_per_sec': [],
-            'games_per_hour': [],
-
-            # Game statistics
-            'white_wins': [],
-            'black_wins': [],
-            'draws': [],
-            'avg_game_length': [],
-            'total_games_cumulative': [],
-
-            # Buffer and timing
-            'buffer_size': [],
-            'selfplay_time': [],
-            'train_time': [],
-            'iteration_time': [],
-
-            # Cumulative metrics
-            'total_moves_cumulative': [],
-            'total_sims_cumulative': [],
-        }
-
-        self.start_time = None
-        self.total_games = 0
-        self.total_moves = 0
-        self.total_sims = 0
-
-    def enable(self):
-        """Enable the dashboard and create output directory."""
-        try:
-            import plotly
-            self.enabled = True
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            self.start_time = time.time()
-            print(f"  Dashboard enabled: {self.output_dir}/dashboard.html")
-            return True
-        except ImportError:
-            print("  WARNING: plotly not installed. Install with: pip install plotly")
-            print("  Dashboard disabled.")
-            self.enabled = False
-            return False
-
-    def add_iteration(self, metrics: 'IterationMetrics'):
-        """Add metrics from a completed iteration."""
-        if not self.enabled:
-            return
-
-        # Update cumulative counters
-        self.total_games += metrics.num_games
-        self.total_moves += metrics.total_moves
-        self.total_sims += metrics.total_simulations
-
-        # Calculate rates
-        moves_per_sec = metrics.total_moves / metrics.selfplay_time if metrics.selfplay_time > 0 else 0
-        sims_per_sec = metrics.total_simulations / metrics.selfplay_time if metrics.selfplay_time > 0 else 0
-        nn_evals_per_sec = metrics.total_nn_evals / metrics.selfplay_time if metrics.selfplay_time > 0 else 0
-        games_per_hour = metrics.num_games / metrics.selfplay_time * 3600 if metrics.selfplay_time > 0 else 0
-
-        elapsed = time.time() - self.start_time
-
-        # Store all metrics
-        self.data['iterations'].append(metrics.iteration)
-        self.data['timestamps'].append(datetime.now().strftime('%H:%M:%S'))
-        self.data['elapsed_minutes'].append(elapsed / 60)
-
-        self.data['total_loss'].append(metrics.loss if metrics.loss > 0 else None)
-        self.data['policy_loss'].append(metrics.policy_loss if metrics.policy_loss > 0 else None)
-        self.data['value_loss'].append(metrics.value_loss if metrics.value_loss > 0 else None)
-
-        self.data['moves_per_sec'].append(moves_per_sec)
-        self.data['sims_per_sec'].append(sims_per_sec)
-        self.data['nn_evals_per_sec'].append(nn_evals_per_sec)
-        self.data['games_per_hour'].append(games_per_hour)
-
-        self.data['white_wins'].append(metrics.white_wins)
-        self.data['black_wins'].append(metrics.black_wins)
-        self.data['draws'].append(metrics.draws)
-        self.data['avg_game_length'].append(metrics.avg_game_length)
-        self.data['total_games_cumulative'].append(self.total_games)
-
-        self.data['buffer_size'].append(metrics.buffer_size)
-        self.data['selfplay_time'].append(metrics.selfplay_time)
-        self.data['train_time'].append(metrics.train_time)
-        self.data['iteration_time'].append(metrics.total_time)
-
-        self.data['total_moves_cumulative'].append(self.total_moves)
-        self.data['total_sims_cumulative'].append(self.total_sims)
-
-        # Update dashboard every N iterations
-        if metrics.iteration % self.update_interval == 0:
-            self._generate_dashboard()
-
-    def _generate_dashboard(self):
-        """Generate the HTML dashboard with all charts."""
-        if not self.enabled or len(self.data['iterations']) == 0:
-            return
-
-        try:
-            from plotly.subplots import make_subplots
-            import plotly.graph_objects as go
-            import plotly.io as pio
-        except ImportError:
-            return
-
-        # Create subplot grid: 3 rows x 3 cols
-        fig = make_subplots(
-            rows=3, cols=3,
-            subplot_titles=(
-                '📉 Training Loss', '⚡ Performance (moves/s)', '🎮 Games per Hour',
-                '🎯 Policy vs Value Loss', '🔬 MCTS Simulations/s', '📊 Win/Draw/Loss Distribution',
-                '💾 Replay Buffer Size', '⏱️ Iteration Time Breakdown', '📈 Cumulative Progress'
-            ),
-            specs=[
-                [{"type": "scatter"}, {"type": "scatter"}, {"type": "scatter"}],
-                [{"type": "scatter"}, {"type": "scatter"}, {"type": "bar"}],
-                [{"type": "scatter"}, {"type": "bar"}, {"type": "scatter"}]
-            ],
-            vertical_spacing=0.12,
-            horizontal_spacing=0.08
-        )
-
-        iterations = self.data['iterations']
-        colors = {
-            'primary': '#3498db',
-            'secondary': '#2ecc71',
-            'tertiary': '#e74c3c',
-            'quaternary': '#9b59b6',
-            'white': '#ecf0f1',
-            'draw': '#95a5a6',
-            'black': '#2c3e50'
-        }
-
-        # Row 1, Col 1: Training Loss
-        if any(l is not None for l in self.data['total_loss']):
-            fig.add_trace(go.Scatter(
-                x=iterations, y=self.data['total_loss'],
-                mode='lines+markers', name='Total Loss',
-                line=dict(color=colors['primary'], width=2),
-                marker=dict(size=6)
-            ), row=1, col=1)
-
-        # Row 1, Col 2: Moves per second
-        fig.add_trace(go.Scatter(
-            x=iterations, y=self.data['moves_per_sec'],
-            mode='lines+markers', name='Moves/s',
-            line=dict(color=colors['secondary'], width=2),
-            marker=dict(size=6),
-            fill='tozeroy', fillcolor='rgba(46, 204, 113, 0.2)'
-        ), row=1, col=2)
-
-        # Row 1, Col 3: Games per hour
-        fig.add_trace(go.Scatter(
-            x=iterations, y=self.data['games_per_hour'],
-            mode='lines+markers', name='Games/hour',
-            line=dict(color=colors['quaternary'], width=2),
-            marker=dict(size=6)
-        ), row=1, col=3)
-
-        # Row 2, Col 1: Policy vs Value Loss
-        if any(l is not None for l in self.data['policy_loss']):
-            fig.add_trace(go.Scatter(
-                x=iterations, y=self.data['policy_loss'],
-                mode='lines+markers', name='Policy Loss',
-                line=dict(color=colors['primary'], width=2)
-            ), row=2, col=1)
-            fig.add_trace(go.Scatter(
-                x=iterations, y=self.data['value_loss'],
-                mode='lines+markers', name='Value Loss',
-                line=dict(color=colors['tertiary'], width=2)
-            ), row=2, col=1)
-
-        # Row 2, Col 2: MCTS Simulations per second
-        fig.add_trace(go.Scatter(
-            x=iterations, y=self.data['sims_per_sec'],
-            mode='lines+markers', name='Sims/s',
-            line=dict(color=colors['primary'], width=2),
-            fill='tozeroy', fillcolor='rgba(52, 152, 219, 0.2)'
-        ), row=2, col=2)
-
-        # Row 2, Col 3: Win/Draw/Loss distribution (stacked bar for last 10 iterations)
-        last_n = min(10, len(iterations))
-        if last_n > 0:
-            recent_iters = iterations[-last_n:]
-            fig.add_trace(go.Bar(
-                x=recent_iters, y=self.data['white_wins'][-last_n:],
-                name='White Wins', marker_color=colors['white'],
-                text=self.data['white_wins'][-last_n:], textposition='inside'
-            ), row=2, col=3)
-            fig.add_trace(go.Bar(
-                x=recent_iters, y=self.data['draws'][-last_n:],
-                name='Draws', marker_color=colors['draw']
-            ), row=2, col=3)
-            fig.add_trace(go.Bar(
-                x=recent_iters, y=self.data['black_wins'][-last_n:],
-                name='Black Wins', marker_color=colors['black']
-            ), row=2, col=3)
-
-        # Row 3, Col 1: Replay Buffer Size
-        fig.add_trace(go.Scatter(
-            x=iterations, y=self.data['buffer_size'],
-            mode='lines+markers', name='Buffer Size',
-            line=dict(color=colors['secondary'], width=2),
-            fill='tozeroy', fillcolor='rgba(46, 204, 113, 0.2)'
-        ), row=3, col=1)
-
-        # Row 3, Col 2: Iteration Time Breakdown (stacked bar for last 10)
-        if last_n > 0:
-            fig.add_trace(go.Bar(
-                x=recent_iters, y=self.data['selfplay_time'][-last_n:],
-                name='Self-Play Time', marker_color=colors['primary']
-            ), row=3, col=2)
-            fig.add_trace(go.Bar(
-                x=recent_iters, y=self.data['train_time'][-last_n:],
-                name='Train Time', marker_color=colors['tertiary']
-            ), row=3, col=2)
-
-        # Row 3, Col 3: Cumulative Progress (games and moves)
-        fig.add_trace(go.Scatter(
-            x=iterations, y=self.data['total_games_cumulative'],
-            mode='lines', name='Total Games',
-            line=dict(color=colors['primary'], width=2)
-        ), row=3, col=3)
-
-        # Update layout
-        fig.update_layout(
-            title=dict(
-                text=f'🎯 AlphaZero Training Dashboard - Iteration {iterations[-1] if iterations else 0}',
-                font=dict(size=24, color='#2c3e50'),
-                x=0.5
-            ),
-            showlegend=True,
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=-0.15,
-                xanchor="center",
-                x=0.5,
-                font=dict(size=10)
-            ),
-            height=1000,
-            template='plotly_white',
-            font=dict(family="Arial, sans-serif"),
-            margin=dict(t=80, b=100, l=60, r=60)
-        )
-
-        # Update axes labels
-        fig.update_xaxes(title_text="Iteration", row=3, col=1)
-        fig.update_xaxes(title_text="Iteration", row=3, col=2)
-        fig.update_xaxes(title_text="Iteration", row=3, col=3)
-
-        fig.update_yaxes(title_text="Loss", row=1, col=1)
-        fig.update_yaxes(title_text="Moves/sec", row=1, col=2)
-        fig.update_yaxes(title_text="Games/hour", row=1, col=3)
-        fig.update_yaxes(title_text="Loss", row=2, col=1)
-        fig.update_yaxes(title_text="Sims/sec", row=2, col=2)
-        fig.update_yaxes(title_text="Games", row=2, col=3)
-        fig.update_yaxes(title_text="Positions", row=3, col=1)
-        fig.update_yaxes(title_text="Seconds", row=3, col=2)
-        fig.update_yaxes(title_text="Count", row=3, col=3)
-
-        # Stack bars for win/loss and time breakdown
-        fig.update_layout(barmode='stack')
-
-        # Add auto-refresh meta tag
-        html_content = pio.to_html(fig, include_plotlyjs=True, full_html=True)
-
-        # Inject auto-refresh (every 30 seconds)
-        refresh_script = """
-        <script>
-            setTimeout(function() {
-                location.reload();
-            }, 30000);
-        </script>
-        <style>
-            body { background-color: #f5f6fa; }
-            .plotly-graph-div { background-color: white; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        </style>
-        """
-        html_content = html_content.replace('</head>', f'{refresh_script}</head>')
-
-        # Add header with stats
-        elapsed = time.time() - self.start_time if self.start_time else 0
-        header_html = f"""
-        <div style="text-align: center; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; margin-bottom: 20px; border-radius: 10px;">
-            <h1 style="margin: 0;">🧠 AlphaZero Training Monitor</h1>
-            <p style="margin: 10px 0 0 0; opacity: 0.9;">
-                Elapsed: {timedelta(seconds=int(elapsed))} |
-                Games: {self.total_games:,} |
-                Moves: {self.total_moves:,} |
-                Simulations: {self.total_sims:,}
-            </p>
-            <p style="margin: 5px 0 0 0; font-size: 12px; opacity: 0.7;">Auto-refreshes every 30 seconds</p>
-        </div>
-        """
-        html_content = html_content.replace('<body>', f'<body>{header_html}')
-
-        # Save dashboard
-        dashboard_path = self.output_dir / 'dashboard.html'
-        with open(dashboard_path, 'w', encoding='utf-8') as f:
-            f.write(html_content)
-
-        # Also save raw data as JSON for external analysis
-        self._save_data_json()
-
-    def _save_data_json(self):
-        """Save raw metrics data as JSON."""
-        import json
-        data_path = self.output_dir / 'metrics.json'
-        with open(data_path, 'w') as f:
-            json.dump(self.data, f, indent=2, default=str)
-
-    def finalize(self):
-        """Generate final dashboard and summary."""
-        if not self.enabled:
-            return
-
-        self._generate_dashboard()
-        self._generate_summary_report()
-        print(f"\n  📊 Final dashboard saved: {self.output_dir}/dashboard.html")
-        print(f"  📄 Training summary saved: {self.output_dir}/summary.html")
-        print(f"  📁 Raw metrics saved: {self.output_dir}/metrics.json")
-
-    def _generate_summary_report(self):
-        """Generate a final summary report."""
-        if not self.enabled or len(self.data['iterations']) == 0:
-            return
-
-        elapsed = time.time() - self.start_time if self.start_time else 0
-
-        # Calculate summary statistics
-        avg_moves_per_sec = sum(self.data['moves_per_sec']) / len(self.data['moves_per_sec']) if self.data['moves_per_sec'] else 0
-        avg_sims_per_sec = sum(self.data['sims_per_sec']) / len(self.data['sims_per_sec']) if self.data['sims_per_sec'] else 0
-        avg_games_per_hour = sum(self.data['games_per_hour']) / len(self.data['games_per_hour']) if self.data['games_per_hour'] else 0
-
-        total_white = sum(self.data['white_wins'])
-        total_draws = sum(self.data['draws'])
-        total_black = sum(self.data['black_wins'])
-        total_games = total_white + total_draws + total_black
-
-        # Loss improvement
-        valid_losses = [l for l in self.data['total_loss'] if l is not None and l > 0]
-        loss_improvement = ((valid_losses[0] - valid_losses[-1]) / valid_losses[0] * 100) if len(valid_losses) >= 2 else 0
-
-        summary_html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>AlphaZero Training Summary</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; background: #f5f6fa; padding: 20px; }}
-                .container {{ max-width: 1200px; margin: 0 auto; }}
-                .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; text-align: center; margin-bottom: 20px; }}
-                .card {{ background: white; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-                .card h2 {{ color: #2c3e50; margin-top: 0; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
-                .stat-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }}
-                .stat {{ background: #f8f9fa; padding: 15px; border-radius: 8px; text-align: center; }}
-                .stat-value {{ font-size: 24px; font-weight: bold; color: #3498db; }}
-                .stat-label {{ font-size: 12px; color: #7f8c8d; margin-top: 5px; }}
-                .progress-bar {{ height: 20px; background: #ecf0f1; border-radius: 10px; overflow: hidden; margin-top: 10px; }}
-                .progress-fill {{ height: 100%; background: linear-gradient(90deg, #3498db, #2ecc71); }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="header">
-                    <h1>🎯 AlphaZero Training Complete</h1>
-                    <p>Training Duration: {timedelta(seconds=int(elapsed))}</p>
-                </div>
-
-                <div class="card">
-                    <h2>📊 Overall Statistics</h2>
-                    <div class="stat-grid">
-                        <div class="stat">
-                            <div class="stat-value">{len(self.data['iterations'])}</div>
-                            <div class="stat-label">Iterations Completed</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-value">{self.total_games:,}</div>
-                            <div class="stat-label">Total Games Played</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-value">{self.total_moves:,}</div>
-                            <div class="stat-label">Total Moves</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-value">{self.total_sims:,}</div>
-                            <div class="stat-label">Total MCTS Simulations</div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="card">
-                    <h2>⚡ Performance Metrics</h2>
-                    <div class="stat-grid">
-                        <div class="stat">
-                            <div class="stat-value">{avg_moves_per_sec:.1f}</div>
-                            <div class="stat-label">Avg Moves/Second</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-value">{avg_sims_per_sec:,.0f}</div>
-                            <div class="stat-label">Avg Simulations/Second</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-value">{avg_games_per_hour:.1f}</div>
-                            <div class="stat-label">Avg Games/Hour</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-value">{self.data['buffer_size'][-1] if self.data['buffer_size'] else 0:,}</div>
-                            <div class="stat-label">Final Buffer Size</div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="card">
-                    <h2>🎮 Game Results</h2>
-                    <div class="stat-grid">
-                        <div class="stat">
-                            <div class="stat-value">{total_white}</div>
-                            <div class="stat-label">White Wins ({total_white/total_games*100:.1f}%)</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-value">{total_draws}</div>
-                            <div class="stat-label">Draws ({total_draws/total_games*100:.1f}%)</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-value">{total_black}</div>
-                            <div class="stat-label">Black Wins ({total_black/total_games*100:.1f}%)</div>
-                        </div>
-                    </div>
-                    <div class="progress-bar">
-                        <div class="progress-fill" style="width: {total_white/total_games*100:.1f}%; background: #ecf0f1;"></div>
-                    </div>
-                </div>
-
-                <div class="card">
-                    <h2>📉 Training Progress</h2>
-                    <div class="stat-grid">
-                        <div class="stat">
-                            <div class="stat-value">{valid_losses[0]:.4f}</div>
-                            <div class="stat-label">Initial Loss</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-value">{valid_losses[-1]:.4f}</div>
-                            <div class="stat-label">Final Loss</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-value">{loss_improvement:.1f}%</div>
-                            <div class="stat-label">Loss Improvement</div>
-                        </div>
-                    </div>
-                </div>
-
-                <p style="text-align: center; color: #7f8c8d; margin-top: 30px;">
-                    Generated by AlphaZero Training Script | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-                </p>
-            </div>
-        </body>
-        </html>
-        """
-
-        summary_path = self.output_dir / 'summary.html'
-        with open(summary_path, 'w', encoding='utf-8') as f:
-            f.write(summary_html)
+    total = standard_wins + opponent_wins + draws
+    if total < MIN_REFUTATION_SAMPLES:
+        return None
+    score = (standard_wins + 0.5 * draws) / total
+    score = max(0.01, min(0.99, score))  # clamp to avoid log(0)
+    return -400 * math.log10((1 - score) / score)
 
 
 # =============================================================================
@@ -803,6 +332,17 @@ class IterationMetrics:
     white_wins: int = 0
     black_wins: int = 0
     draws: int = 0
+    # Draw reason breakdown
+    draws_repetition: int = 0
+    draws_stalemate: int = 0
+    draws_fifty_move: int = 0
+    draws_insufficient: int = 0
+    draws_max_moves: int = 0
+    draws_early_repetition: int = 0
+    # Per-persona outcome tracking (asymmetric risk games only)
+    standard_wins: int = 0
+    opponent_wins: int = 0
+    asymmetric_draws: int = 0
     avg_game_length: float = 0.0
     total_simulations: int = 0
     total_nn_evals: int = 0
@@ -812,13 +352,11 @@ class IterationMetrics:
     policy_loss: float = 0.0
     value_loss: float = 0.0
     num_train_batches: int = 0
+    risk_beta: float = 0.0
+    grad_norm_avg: float = 0.0
+    grad_norm_max: float = 0.0
     # Buffer metrics
     buffer_size: int = 0
-    # Evaluation metrics
-    eval_win_rate: Optional[float] = None      # vs random win rate (0.0-1.0)
-    eval_endgame_score: Optional[int] = None   # puzzles fully correct (0-5)
-    eval_endgame_total: int = 5                # total endgame puzzles
-    eval_endgame_move_accuracy: Optional[float] = None  # consecutive move accuracy (0.0-1.0)
     # Timing
     total_time: float = 0.0
 
@@ -869,6 +407,34 @@ class MetricsTracker:
 
         print(f"  Self-Play:")
         print(f"    Games:           {m.num_games} ({m.white_wins}W / {m.draws}D / {m.black_wins}L)")
+        total_g = m.white_wins + m.black_wins + m.draws
+        if total_g > 0:
+            print(f"    Rates:           W={m.white_wins/total_g*100:.0f}% "
+                  f"D={m.draws/total_g*100:.0f}% L={m.black_wins/total_g*100:.0f}%")
+        if m.draws > 0:
+            parts = []
+            if m.draws_repetition > 0:
+                early_str = f" ({m.draws_early_repetition} early)" if m.draws_early_repetition > 0 else ""
+                parts.append(f"{m.draws_repetition} repetition{early_str}")
+            if m.draws_stalemate > 0:
+                parts.append(f"{m.draws_stalemate} stalemate")
+            if m.draws_fifty_move > 0:
+                parts.append(f"{m.draws_fifty_move} fifty-move")
+            if m.draws_insufficient > 0:
+                parts.append(f"{m.draws_insufficient} material")
+            if m.draws_max_moves > 0:
+                parts.append(f"{m.draws_max_moves} max-moves")
+            if parts:
+                print(f"    Draw breakdown:  {', '.join(parts)}")
+        total_asym = m.standard_wins + m.opponent_wins + m.asymmetric_draws
+        if total_asym > 0:
+            refutation_elo = compute_refutation_elo(m.standard_wins, m.opponent_wins, m.asymmetric_draws)
+            if refutation_elo is not None:
+                print(f"    Refutation:      Elo {refutation_elo:+.0f} "
+                      f"({m.standard_wins}S / {m.asymmetric_draws}D / {m.opponent_wins}O, n={total_asym})")
+            else:
+                print(f"    Refutation:      {m.standard_wins}S / {m.asymmetric_draws}D / {m.opponent_wins}O "
+                      f"(low sample, n={total_asym})")
         print(f"    Moves:           {m.total_moves} total, {m.avg_game_length:.1f} avg/game")
         print(f"    Time:            {format_duration(m.selfplay_time)} ({moves_per_sec:.1f} moves/sec)")
         print(f"    MCTS Sims:       {m.total_simulations:,} ({sims_per_sec:,.0f}/sec)")
@@ -877,8 +443,11 @@ class MetricsTracker:
         # Training metrics
         if m.train_time > 0:
             samples_per_sec = (m.num_train_batches * args.train_batch) / m.train_time
+            sm_str = f", risk_β={m.risk_beta:.2f}" if m.risk_beta != 0 else ""
             print(f"  Training:")
-            print(f"    Loss:            {m.loss:.4f} (policy={m.policy_loss:.4f}, value={m.value_loss:.4f})")
+            print(f"    Loss:            {m.loss:.4f} (policy={m.policy_loss:.4f}, value={m.value_loss:.4f}{sm_str})")
+            if m.grad_norm_avg > 0:
+                print(f"    Grad Norm:       avg={m.grad_norm_avg:.2f}, max={m.grad_norm_max:.2f}")
             print(f"    Batches:         {m.num_train_batches} ({samples_per_sec:.0f} samples/sec)")
             print(f"    Time:            {format_duration(m.train_time)}")
 
@@ -939,765 +508,6 @@ class MetricsTracker:
             print(f"    Black wins:      {total_b} ({total_b/total*100:.1f}%)")
 
         print("\n" + "=" * 70)
-
-
-# =============================================================================
-# Evaluation Functions (vs Random + Endgame Puzzles)
-# =============================================================================
-
-# Endgame puzzles for testing model strength
-# Each puzzle has a move_sequence: alternating model/opponent moves.
-# Indices 0, 2, 4, ... are model moves (verified against the network's prediction).
-# Indices 1, 3, 5, ... are opponent responses (played to advance the board).
-# Scoring: consecutive correct model moves from the start (prefix match).
-ENDGAME_PUZZLES = [
-    # Mate in 2: Queen + King coordination (forced line)
-    # After Qa1+ the only legal king move is Kb8 (a7/b7 controlled by Kb6), then Qa8#
-    {"fen": "k7/8/1K6/8/8/8/8/7Q w - - 0 1",
-     "move_sequence": ["Qa1+", "Kb8", "Qa8#"], "type": "KQ_mate_in_2"},
-
-    # Mate in 2: Back rank with two rooks
-    # Ra8+ forces king to h8 corner (f7/g7/h7 pawns block), then Rb8# is mate
-    {"fen": "6k1/5ppp/8/8/8/8/8/RR4K1 w - - 0 1",
-     "move_sequence": ["Ra8+", "Kh8", "Rb8#"], "type": "back_rank_mate_in_2"},
-
-    # Mate in 1: Scholar's mate
-    {"fen": "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4",
-     "move_sequence": ["Qxf7#"], "type": "scholars_mate"},
-
-    # Best move: Back rank check
-    {"fen": "6k1/5ppp/8/8/8/8/8/R3K3 w - - 0 1",
-     "move_sequence": ["Ra8+"], "type": "back_rank"},
-
-    # Best move: Pawn promotion
-    {"fen": "8/4P3/8/8/4k3/8/8/4K3 w - - 0 1",
-     "move_sequence": ["e8=Q"], "type": "pawn_promo"},
-]
-
-
-def play_vs_random(network: 'AlphaZeroNet', device: str, num_games: int = 5,
-                   simulations: int = 800, search_batch: int = 32,
-                   c_puct: float = 1.5) -> Dict[str, Any]:
-    """Play games against a random opponent to test basic competence (batched parallel).
-
-    Runs multiple games concurrently with batched GPU evaluation. All games share
-    a single evaluation loop that batches leaves across games for efficient GPU use.
-
-    Args:
-        network: The neural network to evaluate
-        device: CUDA or CPU device
-        num_games: Number of games to play
-        simulations: MCTS simulations per move for the model
-        search_batch: Leaf batch size for MCTS
-        c_puct: MCTS exploration constant
-
-    Returns:
-        Dictionary with wins, losses, draws counts
-    """
-    network.eval()
-    evaluator = BatchedEvaluator(network, device, use_amp=(device == "cuda"))
-
-    print(f"      vs_random: {num_games} games batched...", end=" ", flush=True)
-    start_time = time.time()
-
-    # Game state for each concurrent game
-    class GameState:
-        def __init__(self, game_idx: int):
-            self.game_idx = game_idx
-            self.board = chess.Board()
-            self.model_plays_white = (game_idx % 2 == 0)
-            self.move_count = 0
-            self.mcts = alphazero_cpp.BatchedMCTSSearch(
-                num_simulations=simulations,
-                batch_size=search_batch,
-                c_puct=c_puct
-            )
-            self.result = None  # "win", "loss", "draw" when game ends
-            self.needs_root_eval = False
-            self.in_mcts_search = False
-            # Cached data for current move
-            self.current_fen = None
-            self.current_obs_chw = None
-            self.current_mask = None
-            self.current_idx_to_move = {}
-
-    games = [GameState(i) for i in range(num_games)]
-    active_games = games.copy()
-
-    def prepare_move(g: GameState):
-        """Prepare a game for its next model move (encode position, build mask)."""
-        g.current_fen = g.board.fen()
-        obs = alphazero_cpp.encode_position(g.current_fen)
-        g.current_obs_chw = np.transpose(obs, (2, 0, 1))
-
-        legal_moves = list(g.board.legal_moves)
-        g.current_mask = np.zeros(POLICY_SIZE, dtype=np.float32)
-        g.current_idx_to_move = {}
-
-        for move in legal_moves:
-            idx = alphazero_cpp.move_to_index(move.uci(), g.current_fen)
-            if 0 <= idx < POLICY_SIZE:
-                g.current_mask[idx] = 1.0
-                g.current_idx_to_move[idx] = move
-
-        g.needs_root_eval = True
-        g.in_mcts_search = False
-
-    def finish_move(g: GameState):
-        """Select and play the best move after MCTS search completes."""
-        visit_counts = g.mcts.get_visit_counts()
-        policy = visit_counts * g.current_mask
-        if policy.sum() > 0:
-            action = np.argmax(policy)
-            if action in g.current_idx_to_move:
-                g.board.push(g.current_idx_to_move[action])
-            else:
-                g.board.push(random.choice(list(g.board.legal_moves)))
-        else:
-            legal = list(g.board.legal_moves)
-            if legal:
-                g.board.push(random.choice(legal))
-        g.mcts.reset()
-        g.move_count += 1
-        g.in_mcts_search = False
-        g.needs_root_eval = False
-
-    def check_game_over(g: GameState) -> bool:
-        """Check if game is over and set result."""
-        if g.board.is_game_over() or g.move_count >= 200:
-            result = g.board.result()
-            if result == "1-0":
-                g.result = "win" if g.model_plays_white else "loss"
-            elif result == "0-1":
-                g.result = "loss" if g.model_plays_white else "win"
-            else:
-                g.result = "draw"
-            return True
-        return False
-
-    # Initialize: advance to first model move for each game
-    for g in active_games:
-        # Play random moves until it's model's turn
-        while not check_game_over(g):
-            is_model_turn = (g.board.turn == chess.WHITE) == g.model_plays_white
-            if is_model_turn:
-                prepare_move(g)
-                break
-            else:
-                legal = list(g.board.legal_moves)
-                if legal:
-                    g.board.push(random.choice(legal))
-                g.move_count += 1
-
-    # Main loop: batch evaluations across all active games
-    while active_games:
-        # 1. Collect games needing root evaluation
-        root_eval_games = [g for g in active_games if g.needs_root_eval and g.result is None]
-        if root_eval_games:
-            obs_batch = np.stack([g.current_obs_chw for g in root_eval_games])
-            mask_batch = np.stack([g.current_mask for g in root_eval_games])
-            policies, values = evaluator.evaluate_batch(obs_batch, mask_batch)
-
-            for i, g in enumerate(root_eval_games):
-                g.mcts.init_search(g.current_fen, policies[i].astype(np.float32), float(values[i]))
-                g.needs_root_eval = False
-                g.in_mcts_search = True
-
-        # 2. Collect leaves from all games in MCTS search
-        games_in_search = [g for g in active_games if g.in_mcts_search and g.result is None]
-        if not games_in_search:
-            # Remove finished games
-            active_games = [g for g in active_games if g.result is None]
-            continue
-
-        all_obs = []
-        all_masks = []
-        leaf_counts = []  # Track how many leaves each game contributed
-
-        for g in games_in_search:
-            if g.mcts.is_complete():
-                leaf_counts.append(0)
-                continue
-
-            num_leaves, obs_batch, mask_batch = g.mcts.collect_leaves()
-            if num_leaves == 0:
-                leaf_counts.append(0)
-                continue
-
-            obs_nchw = np.transpose(obs_batch[:num_leaves], (0, 3, 1, 2))
-            all_obs.append(obs_nchw)
-            all_masks.append(mask_batch[:num_leaves])
-            leaf_counts.append(num_leaves)
-
-        # 3. Batch evaluate all leaves together
-        if all_obs:
-            combined_obs = np.concatenate(all_obs, axis=0)
-            combined_masks = np.concatenate(all_masks, axis=0)
-            all_policies, all_values = evaluator.evaluate_batch(combined_obs, combined_masks)
-
-            # 4. Distribute results back to each game
-            offset = 0
-            leaf_idx = 0
-            for g in games_in_search:
-                count = leaf_counts[leaf_idx]
-                leaf_idx += 1
-                if count == 0:
-                    continue
-                game_policies = all_policies[offset:offset + count]
-                game_values = all_values[offset:offset + count]
-                g.mcts.update_leaves(game_policies.astype(np.float32), game_values.astype(np.float32))
-                offset += count
-
-        # 5. Check for completed searches and advance games
-        for g in games_in_search:
-            if g.mcts.is_complete():
-                finish_move(g)
-
-                # Check game over
-                if check_game_over(g):
-                    continue
-
-                # Play random opponent move(s) until model's turn again
-                while not check_game_over(g):
-                    is_model_turn = (g.board.turn == chess.WHITE) == g.model_plays_white
-                    if is_model_turn:
-                        prepare_move(g)
-                        break
-                    else:
-                        legal = list(g.board.legal_moves)
-                        if legal:
-                            g.board.push(random.choice(legal))
-                        g.move_count += 1
-
-        # Remove finished games
-        active_games = [g for g in active_games if g.result is None]
-
-    # Tally results
-    results = {"wins": 0, "losses": 0, "draws": 0}
-    result_chars = []
-
-    for g in sorted(games, key=lambda x: x.game_idx):
-        if g.result == "win":
-            results["wins"] += 1
-            result_chars.append("W")
-        elif g.result == "loss":
-            results["losses"] += 1
-            result_chars.append("L")
-        else:
-            results["draws"] += 1
-            result_chars.append("D")
-
-    elapsed = time.time() - start_time
-    print(f"{''.join(result_chars)} ({elapsed:.1f}s)")
-
-    return results
-
-
-def test_endgame_positions(network: 'AlphaZeroNet', device: str, puzzles: List[Dict] = None) -> Dict[str, Any]:
-    """Test the model on endgame positions with move sequences.
-
-    For each puzzle, plays through the move_sequence checking the model's
-    predictions at each model turn (indices 0, 2, 4, ...). Opponent moves
-    (indices 1, 3, 5, ...) are played automatically to advance the board.
-
-    Scoring is prefix-based: count consecutive correct model moves from the
-    start. If the answer is ABCDE and the model predicts ABDEC, only AB count
-    (2 out of 5 model moves correct).
-
-    Args:
-        network: The neural network to evaluate
-        device: CUDA or CPU device
-        puzzles: List of puzzle dictionaries (uses ENDGAME_PUZZLES if None)
-
-    Returns:
-        Dictionary with score, move_accuracy, and details
-    """
-    if puzzles is None:
-        puzzles = ENDGAME_PUZZLES
-
-    network.eval()
-    evaluator = BatchedEvaluator(network, device, use_amp=(device == "cuda"))
-
-    puzzles_fully_correct = 0
-    total_model_moves = 0
-    total_consecutive_correct = 0
-    details = []
-
-    for puzzle in puzzles:
-        fen = puzzle["fen"]
-        move_sequence = puzzle["move_sequence"]
-        puzzle_type = puzzle["type"]
-
-        board = chess.Board(fen)
-
-        # Count model moves in this sequence (indices 0, 2, 4, ...)
-        num_model_moves = len(range(0, len(move_sequence), 2))
-        consecutive_correct = 0
-        sequence_broken = False
-        predicted_moves = []
-
-        for i, expected_san in enumerate(move_sequence):
-            is_model_turn = (i % 2 == 0)
-
-            if is_model_turn:
-                # Get model's prediction for this position
-                current_fen = board.fen()
-                obs = alphazero_cpp.encode_position(current_fen)
-                obs_chw = np.transpose(obs, (2, 0, 1))
-
-                legal_moves = list(board.legal_moves)
-                mask = np.zeros(POLICY_SIZE, dtype=np.float32)
-                idx_to_move = {}
-
-                for move in legal_moves:
-                    idx = alphazero_cpp.move_to_index(move.uci(), current_fen)
-                    if 0 <= idx < POLICY_SIZE:
-                        mask[idx] = 1.0
-                        idx_to_move[idx] = move
-
-                policy, value = evaluator.evaluate(obs_chw, mask)
-                policy = policy * mask
-
-                if policy.sum() > 0:
-                    top_idx = np.argmax(policy)
-                    if top_idx in idx_to_move:
-                        top_move = idx_to_move[top_idx]
-                        top_move_san = board.san(top_move)
-                        predicted_moves.append(top_move_san)
-
-                        if not sequence_broken and top_move_san == expected_san:
-                            consecutive_correct += 1
-                        else:
-                            sequence_broken = True
-                    else:
-                        predicted_moves.append("invalid")
-                        sequence_broken = True
-                else:
-                    predicted_moves.append("no_legal_moves")
-                    sequence_broken = True
-
-            # Play the expected move to advance the board
-            try:
-                expected_move = board.parse_san(expected_san)
-                board.push(expected_move)
-            except (ValueError, chess.InvalidMoveError):
-                break
-
-        all_correct = (consecutive_correct == num_model_moves)
-        if all_correct:
-            puzzles_fully_correct += 1
-
-        total_model_moves += num_model_moves
-        total_consecutive_correct += consecutive_correct
-
-        details.append({
-            "type": puzzle_type,
-            "fen": fen,
-            "move_sequence": move_sequence,
-            "predicted": predicted_moves,
-            "consecutive_correct": consecutive_correct,
-            "total_model_moves": num_model_moves,
-            "move_accuracy": consecutive_correct / num_model_moves if num_model_moves > 0 else 0,
-            "fully_correct": all_correct
-        })
-
-    return {
-        "score": puzzles_fully_correct,
-        "total": len(puzzles),
-        "accuracy": puzzles_fully_correct / len(puzzles) if puzzles else 0,
-        "move_score": total_consecutive_correct,
-        "total_moves": total_model_moves,
-        "move_accuracy": total_consecutive_correct / total_model_moves if total_model_moves > 0 else 0,
-        "details": details
-    }
-
-
-def evaluate_checkpoint(network: 'AlphaZeroNet', device: str,
-                        simulations: int = 800, search_batch: int = 32,
-                        c_puct: float = 1.5) -> Dict[str, Any]:
-    """Run full evaluation suite before saving checkpoint.
-
-    Args:
-        network: The neural network to evaluate
-        device: CUDA or CPU device
-        simulations: MCTS simulations per move (used for reference, capped for vs_random)
-        search_batch: Leaf batch size for MCTS
-        c_puct: MCTS exploration constant
-
-    Returns:
-        Dictionary with all evaluation results
-    """
-    results = {}
-
-    # 1. vs Random Agent (5 games)
-    # Cap simulations at 400 for vs_random - if model can't beat random with 400 sims,
-    # 1600 sims won't help. This keeps evaluation fast (~15-30s instead of 2+ min).
-    eval_sims = min(simulations, 400)
-    eval_search_batch = min(search_batch, 32)  # Ensure enough MCTS rounds
-    random_results = play_vs_random(network, device, num_games=5,
-                                    simulations=eval_sims,
-                                    search_batch=eval_search_batch,
-                                    c_puct=c_puct)
-    results["vs_random"] = {
-        "wins": random_results["wins"],
-        "losses": random_results["losses"],
-        "draws": random_results["draws"],
-        "win_rate": random_results["wins"] / 5.0
-    }
-
-    # 2. Endgame Puzzles (sequence-based evaluation)
-    endgame_results = test_endgame_positions(network, device)
-    results["endgame"] = {
-        "score": endgame_results["score"],
-        "total": endgame_results["total"],
-        "accuracy": endgame_results["accuracy"],
-        "move_score": endgame_results["move_score"],
-        "total_moves": endgame_results["total_moves"],
-        "move_accuracy": endgame_results["move_accuracy"],
-    }
-
-    return results
-
-
-# =============================================================================
-# Summary HTML Generation
-# =============================================================================
-
-def generate_summary_html(run_dir: str, config: Dict[str, Any]) -> str:
-    """Generate a summary HTML file with training metrics and evaluation results.
-
-    The HTML uses fetch() to load data from training_metrics.json and
-    evaluation_results.json at view time, with embedded JSON fallback for
-    file:// protocol (where CORS blocks fetch).
-
-    Args:
-        run_dir: The run directory to save summary.html
-        config: Training configuration
-
-    Returns:
-        Path to the generated summary.html file
-    """
-    # Read JSON files from disk for the embedded fallback
-    metrics_history = load_metrics_history(run_dir)
-    eval_history = load_eval_history(run_dir)
-
-    # Serialize full JSON objects for the fallback <script> block
-    metrics_json = json.dumps(metrics_history)
-    eval_json = json.dumps(eval_history)
-
-    # Config table rows (static, small — embedded directly by Python)
-    config_rows = (
-        f'<tr><td>Network</td><td>{config.get("filters", 192)} filters '
-        f'&times; {config.get("blocks", 15)} blocks</td></tr>\n'
-        f'                <tr><td>Simulations</td><td>{config.get("simulations", 800)} per move</td></tr>\n'
-        f'                <tr><td>Games/Iteration</td><td>{config.get("games_per_iter", 50)}</td></tr>\n'
-        f'                <tr><td>Buffer Size</td><td>{config.get("buffer_size", 100000):,}</td></tr>\n'
-        f'                <tr><td>Learning Rate</td><td>{config.get("lr", 0.001)}</td></tr>\n'
-        f'                <tr><td>Workers</td><td>{config.get("workers", 1)}</td></tr>'
-    )
-
-    # Build the HTML with static shell + dynamic JS
-    # Note: The f-string only interpolates: run_dir basename, timestamp, config_rows,
-    # metrics_json, eval_json. All data extraction happens in JavaScript.
-    run_name = os.path.basename(run_dir)
-    generated_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-    html_content = (
-        '<!DOCTYPE html>\n'
-        '<html>\n'
-        '<head>\n'
-        '    <title>AlphaZero Training Summary</title>\n'
-        '    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>\n'
-        '    <style>\n'
-        '        body { font-family: Arial, sans-serif; background: #f5f6fa; padding: 20px; margin: 0; }\n'
-        '        .container { max-width: 1200px; margin: 0 auto; }\n'
-        '        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; text-align: center; margin-bottom: 20px; }\n'
-        '        .card { background: white; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }\n'
-        '        .card h2 { color: #2c3e50; margin-top: 0; border-bottom: 2px solid #3498db; padding-bottom: 10px; }\n'
-        '        .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }\n'
-        '        .stat { background: #f8f9fa; padding: 15px; border-radius: 8px; text-align: center; }\n'
-        '        .stat-value { font-size: 24px; font-weight: bold; color: #3498db; }\n'
-        '        .stat-label { font-size: 12px; color: #7f8c8d; margin-top: 5px; }\n'
-        '        .chart-container { height: 300px; margin-top: 20px; }\n'
-        '        .config-table { width: 100%; border-collapse: collapse; }\n'
-        '        .config-table td { padding: 8px; border-bottom: 1px solid #eee; }\n'
-        '        .config-table td:first-child { font-weight: bold; color: #7f8c8d; width: 40%; }\n'
-        '        .hidden { display: none; }\n'
-        '    </style>\n'
-        '</head>\n'
-        '<body>\n'
-        '    <div class="container">\n'
-        '        <div class="header">\n'
-        '            <h1>&#127919; AlphaZero Training Summary</h1>\n'
-        f'            <p>Run: {run_name}</p>\n'
-        f'            <p id="generatedTime">Generated: {generated_time}</p>\n'
-        '        </div>\n'
-        '\n'
-        '        <div class="card">\n'
-        '            <h2>&#128202; Overall Statistics</h2>\n'
-        '            <div class="stat-grid">\n'
-        '                <div class="stat">\n'
-        '                    <div class="stat-value" id="statIterations">-</div>\n'
-        '                    <div class="stat-label">Iterations Completed</div>\n'
-        '                </div>\n'
-        '                <div class="stat">\n'
-        '                    <div class="stat-value" id="statGames">-</div>\n'
-        '                    <div class="stat-label">Total Games Played</div>\n'
-        '                </div>\n'
-        '                <div class="stat">\n'
-        '                    <div class="stat-value" id="statMoves">-</div>\n'
-        '                    <div class="stat-label">Total Moves</div>\n'
-        '                </div>\n'
-        '                <div class="stat">\n'
-        '                    <div class="stat-value" id="statImprovement">-</div>\n'
-        '                    <div class="stat-label">Loss Improvement</div>\n'
-        '                </div>\n'
-        '            </div>\n'
-        '        </div>\n'
-        '\n'
-        '        <div class="card hidden" id="evalCard">\n'
-        '            <h2>&#127919; Latest Evaluation (Iteration <span id="evalIter">-</span>)</h2>\n'
-        '            <div class="stat-grid">\n'
-        '                <div class="stat">\n'
-        '                    <div class="stat-value" id="evalWinRate">-</div>\n'
-        '                    <div class="stat-label" id="evalWinRateLabel">vs Random Win Rate</div>\n'
-        '                </div>\n'
-        '                <div class="stat">\n'
-        '                    <div class="stat-value" id="evalEndgame">-</div>\n'
-        '                    <div class="stat-label">Endgame Puzzles Fully Correct</div>\n'
-        '                </div>\n'
-        '                <div class="stat">\n'
-        '                    <div class="stat-value" id="evalMoveAcc">-</div>\n'
-        '                    <div class="stat-label" id="evalMoveAccLabel">Move Accuracy</div>\n'
-        '                </div>\n'
-        '            </div>\n'
-        '        </div>\n'
-        '\n'
-        '        <div class="card">\n'
-        '            <h2>&#128201; Training Loss</h2>\n'
-        '            <div class="chart-container">\n'
-        '                <canvas id="lossChart"></canvas>\n'
-        '            </div>\n'
-        '        </div>\n'
-        '\n'
-        '        <div class="card hidden" id="evalChartCard">\n'
-        '            <h2>&#127919; Evaluation Progress</h2>\n'
-        '            <div class="chart-container">\n'
-        '                <canvas id="evalChart"></canvas>\n'
-        '            </div>\n'
-        '        </div>\n'
-        '\n'
-        '        <div class="card">\n'
-        '            <h2>&#9881;&#65039; Configuration</h2>\n'
-        '            <table class="config-table">\n'
-        f'                {config_rows}\n'
-        '            </table>\n'
-        '        </div>\n'
-        '\n'
-        '        <p style="text-align: center; color: #7f8c8d; margin-top: 30px;">\n'
-        '            Generated by AlphaZero Training Script\n'
-        '        </p>\n'
-        '    </div>\n'
-        '\n'
-        '    <script>\n'
-        '        // Embedded fallback data (used when fetch() fails, e.g. file:// protocol)\n'
-        f'        const FALLBACK_METRICS = {metrics_json};\n'
-        f'        const FALLBACK_EVAL = {eval_json};\n'
-        '\n'
-        '        async function loadJSON(path, fallback) {\n'
-        '            try {\n'
-        '                const resp = await fetch(path);\n'
-        '                if (!resp.ok) throw new Error(resp.statusText);\n'
-        '                return await resp.json();\n'
-        '            } catch (e) {\n'
-        "                console.warn('fetch(' + path + ') failed, using embedded fallback:', e.message);\n"
-        '                return fallback;\n'
-        '            }\n'
-        '        }\n'
-        '\n'
-        '        function formatNumber(n) {\n'
-        '            return n.toLocaleString();\n'
-        '        }\n'
-        '\n'
-        '        function buildDashboard(metricsData, evalData) {\n'
-        '            const iterations = metricsData.iterations || [];\n'
-        '            const evaluations = evalData.evaluations || [];\n'
-        '\n'
-        '            // --- Overall statistics ---\n'
-        "            document.getElementById('statIterations').textContent = iterations.length;\n"
-        '\n'
-        '            if (iterations.length > 0) {\n'
-        '                const totalGames = iterations.reduce((s, m) => s + (m.games || 0), 0);\n'
-        '                const totalMoves = iterations.reduce((s, m) => s + (m.moves || 0), 0);\n'
-        "                document.getElementById('statGames').textContent = formatNumber(totalGames);\n"
-        "                document.getElementById('statMoves').textContent = formatNumber(totalMoves);\n"
-        '\n'
-        '                if (iterations.length >= 2 && iterations[0].loss > 0) {\n'
-        '                    const first = iterations[0].loss;\n'
-        '                    const last = iterations[iterations.length - 1].loss;\n'
-        '                    const improvement = (first - last) / first * 100;\n'
-        "                    document.getElementById('statImprovement').textContent = improvement.toFixed(1) + '%';\n"
-        '                } else {\n'
-        "                    document.getElementById('statImprovement').textContent = '0.0%';\n"
-        '                }\n'
-        '            } else {\n'
-        "                document.getElementById('statGames').textContent = '0';\n"
-        "                document.getElementById('statMoves').textContent = '0';\n"
-        "                document.getElementById('statImprovement').textContent = '0.0%';\n"
-        '            }\n'
-        '\n'
-        '            // --- Evaluation card ---\n'
-        '            if (evaluations.length > 0) {\n'
-        '                const latest = evaluations[evaluations.length - 1];\n'
-        '                const vsRandom = latest.vs_random || {};\n'
-        '                const endgame = latest.endgame || {};\n'
-        '\n'
-        "                document.getElementById('evalCard').classList.remove('hidden');\n"
-        "                document.getElementById('evalIter').textContent = latest.iteration || 'N/A';\n"
-        "                document.getElementById('evalWinRate').textContent =\n"
-        "                    ((vsRandom.win_rate || 0) * 100).toFixed(0) + '%';\n"
-        "                document.getElementById('evalWinRateLabel').textContent =\n"
-        "                    'vs Random Win Rate (' + (vsRandom.wins || 0) + '/5 games)';\n"
-        "                document.getElementById('evalEndgame').textContent =\n"
-        "                    (endgame.score || 0) + '/' + (endgame.total || 5);\n"
-        "                document.getElementById('evalMoveAcc').textContent =\n"
-        "                    ((endgame.move_accuracy || 0) * 100).toFixed(0) + '%';\n"
-        "                document.getElementById('evalMoveAccLabel').textContent =\n"
-        "                    'Move Accuracy (' + (endgame.move_score || 0) + '/' + (endgame.total_moves || 0) + ' moves)';\n"
-        '            }\n'
-        '\n'
-        '            // --- Loss chart ---\n'
-        '            const lossIters = iterations.map(m => m.iteration || 0);\n'
-        '            const losses = iterations.map(m => m.loss || 0);\n'
-        '            const policyLosses = iterations.map(m => m.policy_loss || 0);\n'
-        '            const valueLosses = iterations.map(m => m.value_loss || 0);\n'
-        '\n'
-        "            new Chart(document.getElementById('lossChart'), {\n"
-        "                type: 'line',\n"
-        '                data: {\n'
-        '                    labels: lossIters,\n'
-        '                    datasets: [\n'
-        '                        {\n'
-        "                            label: 'Total Loss',\n"
-        '                            data: losses,\n'
-        "                            borderColor: '#3498db',\n"
-        '                            fill: false,\n'
-        '                            tension: 0.1,\n'
-        "                            yAxisID: 'y'\n"
-        '                        },\n'
-        '                        {\n'
-        "                            label: 'Policy Loss',\n"
-        '                            data: policyLosses,\n'
-        "                            borderColor: '#2ecc71',\n"
-        '                            fill: false,\n'
-        '                            tension: 0.1,\n'
-        "                            yAxisID: 'y'\n"
-        '                        },\n'
-        '                        {\n'
-        "                            label: 'Value Loss',\n"
-        '                            data: valueLosses,\n'
-        "                            borderColor: '#e74c3c',\n"
-        '                            fill: false,\n'
-        '                            tension: 0.1,\n'
-        "                            yAxisID: 'y1'\n"
-        '                        }\n'
-        '                    ]\n'
-        '                },\n'
-        '                options: {\n'
-        '                    responsive: true,\n'
-        '                    maintainAspectRatio: false,\n'
-        '                    scales: {\n'
-        '                        y: {\n'
-        "                            type: 'linear',\n"
-        "                            position: 'left',\n"
-        '                            beginAtZero: false,\n'
-        "                            title: { display: true, text: 'Total/Policy Loss' }\n"
-        '                        },\n'
-        '                        y1: {\n'
-        "                            type: 'linear',\n"
-        "                            position: 'right',\n"
-        '                            beginAtZero: false,\n'
-        "                            title: { display: true, text: 'Value Loss' },\n"
-        '                            grid: { drawOnChartArea: false }\n'
-        '                        }\n'
-        '                    }\n'
-        '                }\n'
-        '            });\n'
-        '\n'
-        '            // --- Evaluation chart ---\n'
-        '            if (evaluations.length > 0) {\n'
-        "                document.getElementById('evalChartCard').classList.remove('hidden');\n"
-        '\n'
-        '                const evalIters = evaluations.map(e => e.iteration || 0);\n'
-        '                const winRates = evaluations.map(e => ((e.vs_random || {}).win_rate || 0) * 100);\n'
-        '                const moveAccs = evaluations.map(e => ((e.endgame || {}).move_accuracy || 0) * 100);\n'
-        '\n'
-        "                new Chart(document.getElementById('evalChart'), {\n"
-        "                    type: 'line',\n"
-        '                    data: {\n'
-        '                        labels: evalIters,\n'
-        '                        datasets: [\n'
-        '                            {\n'
-        "                                label: 'vs Random Win Rate (%)',\n"
-        '                                data: winRates,\n'
-        "                                borderColor: '#3498db',\n"
-        '                                fill: false,\n'
-        '                                tension: 0.1,\n'
-        "                                yAxisID: 'y'\n"
-        '                            },\n'
-        '                            {\n'
-        "                                label: 'Endgame Move Accuracy (%)',\n"
-        '                                data: moveAccs,\n'
-        "                                borderColor: '#2ecc71',\n"
-        '                                fill: false,\n'
-        '                                tension: 0.1,\n'
-        "                                yAxisID: 'y1'\n"
-        '                            }\n'
-        '                        ]\n'
-        '                    },\n'
-        '                    options: {\n'
-        '                        responsive: true,\n'
-        '                        maintainAspectRatio: false,\n'
-        '                        scales: {\n'
-        '                            y: {\n'
-        "                                type: 'linear',\n"
-        "                                position: 'left',\n"
-        '                                min: 0,\n'
-        '                                max: 100,\n'
-        "                                title: { display: true, text: 'Win Rate (%)' }\n"
-        '                            },\n'
-        '                            y1: {\n'
-        "                                type: 'linear',\n"
-        "                                position: 'right',\n"
-        '                                min: 0,\n'
-        '                                max: 100,\n'
-        "                                title: { display: true, text: 'Endgame Move Accuracy (%)' },\n"
-        '                                grid: { drawOnChartArea: false }\n'
-        '                            }\n'
-        '                        }\n'
-        '                    }\n'
-        '                });\n'
-        '            }\n'
-        '        }\n'
-        '\n'
-        '        // Load data and build dashboard\n'
-        '        (async function() {\n'
-        '            const [metricsData, evalData] = await Promise.all([\n'
-        "                loadJSON('./training_metrics.json', FALLBACK_METRICS),\n"
-        "                loadJSON('./evaluation_results.json', FALLBACK_EVAL)\n"
-        '            ]);\n'
-        '            buildDashboard(metricsData, evalData);\n'
-        '        })();\n'
-        '    </script>\n'
-        '</body>\n'
-        '</html>\n'
-    )
-
-    summary_path = os.path.join(run_dir, "summary.html")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        f.write(html_content)
-
-    return summary_path
 
 
 # =============================================================================
@@ -1817,45 +627,11 @@ def save_metrics_history(run_dir: str, metrics_history: Dict[str, Any]):
         json.dump(metrics_history, f, indent=2)
 
 
-def load_eval_history(run_dir: str) -> Dict[str, Any]:
-    """Load evaluation history from a run directory.
-
-    Args:
-        run_dir: Path to the run directory
-
-    Returns:
-        Evaluation history dictionary
-    """
-    eval_path = os.path.join(run_dir, "evaluation_results.json")
-    if os.path.exists(eval_path):
-        try:
-            with open(eval_path, 'r') as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-        except (json.JSONDecodeError, ValueError):
-            print(f"  Warning: Could not parse {eval_path}, starting fresh")
-    return {"evaluations": []}
-
-
-def save_eval_history(run_dir: str, eval_history: Dict[str, Any]):
-    """Save evaluation history to a run directory.
-
-    Args:
-        run_dir: Path to the run directory
-        eval_history: Evaluation history dictionary
-    """
-    eval_path = os.path.join(run_dir, "evaluation_results.json")
-    with open(eval_path, 'w') as f:
-        json.dump(eval_history, f, indent=2)
-
-
 def truncate_history_to_iteration(
     metrics_history: Dict[str, Any],
-    eval_history: Dict[str, Any],
     start_iter: int
-) -> tuple:
-    """Truncate metrics and eval history to discard records from reverted iterations.
+) -> int:
+    """Truncate metrics history to discard records from reverted iterations.
 
     When resuming from an earlier checkpoint (e.g., after model collapse),
     records at or after start_iter are stale and should be removed so new
@@ -1863,153 +639,18 @@ def truncate_history_to_iteration(
 
     Args:
         metrics_history: Training metrics dictionary (modified in-place)
-        eval_history: Evaluation history dictionary (modified in-place)
         start_iter: First iteration that will be (re-)trained; records with
                     iteration >= start_iter are discarded
 
     Returns:
-        (metrics_removed_count, eval_removed_count)
+        Number of metrics records removed
     """
     old_metrics = metrics_history.get("iterations", [])
     new_metrics = [r for r in old_metrics if r.get("iteration", 0) < start_iter]
     metrics_removed = len(old_metrics) - len(new_metrics)
     metrics_history["iterations"] = new_metrics
 
-    old_evals = eval_history.get("evaluations", [])
-    new_evals = [r for r in old_evals if r.get("iteration", 0) < start_iter]
-    eval_removed = len(old_evals) - len(new_evals)
-    eval_history["evaluations"] = new_evals
-
-    return metrics_removed, eval_removed
-
-
-# =============================================================================
-# Neural Network (AlphaZero Paper Architecture - Compatible with Python Backend)
-# =============================================================================
-# Architecture matches alphazero/neural/network.py for checkpoint compatibility:
-# - Input: 122 channels (extended encoding)
-# - Policy head: 2 filters (paper standard)
-# - Value head: 256 hidden units (paper standard)
-# - Layer naming: residual_tower, policy_head, value_head
-
-class ConvBlock(nn.Module):
-    """Convolutional block with batch norm and ReLU."""
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        return self.relu(self.bn(self.conv(x)))
-
-
-class ResidualBlock(nn.Module):
-    """Residual block matching Python backend."""
-    def __init__(self, num_filters: int):
-        super().__init__()
-        self.conv1 = nn.Conv2d(num_filters, num_filters, 3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(num_filters)
-        self.conv2 = nn.Conv2d(num_filters, num_filters, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(num_filters)
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        identity = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        return self.relu(out + identity)
-
-
-class PolicyHead(nn.Module):
-    """Policy head: outputs action probabilities (AlphaZero paper: 2 filters)."""
-    def __init__(self, in_channels: int, num_filters: int = 2, num_actions: int = POLICY_SIZE):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, num_filters, kernel_size=1, bias=False)
-        self.bn = nn.BatchNorm2d(num_filters)
-        self.relu = nn.ReLU(inplace=True)
-        self.fc = nn.Linear(num_filters * 8 * 8, num_actions)
-
-    def forward(self, x):
-        x = self.relu(self.bn(self.conv(x)))
-        x = x.reshape(x.size(0), -1)
-        return self.fc(x)
-
-
-class ValueHead(nn.Module):
-    """Value head: outputs position evaluation (AlphaZero paper: 256 hidden)."""
-    def __init__(self, in_channels: int, num_filters: int = 1, hidden_size: int = 256):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, num_filters, kernel_size=1, bias=False)
-        self.bn = nn.BatchNorm2d(num_filters)
-        self.relu = nn.ReLU(inplace=True)
-        self.fc1 = nn.Linear(num_filters * 8 * 8, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, 1)
-        self.tanh = nn.Tanh()
-
-    def forward(self, x):
-        x = self.relu(self.bn(self.conv(x)))
-        x = x.reshape(x.size(0), -1)
-        x = self.relu(self.fc1(x))
-        return self.tanh(self.fc2(x))
-
-
-class AlphaZeroNet(nn.Module):
-    """AlphaZero neural network - compatible with Python backend checkpoints.
-
-    Architecture matches alphazero/neural/network.py exactly for checkpoint compatibility.
-    Uses AlphaZero paper standard settings:
-    - 122 input channels (extended encoding)
-    - 2 policy filters
-    - 256 value hidden units
-    """
-
-    def __init__(
-        self,
-        input_channels: int = INPUT_CHANNELS,
-        num_filters: int = 192,
-        num_blocks: int = 15,
-        num_actions: int = POLICY_SIZE,
-        policy_filters: int = 2,
-        value_filters: int = 1,
-        value_hidden: int = 256
-    ):
-        super().__init__()
-        self.input_channels = input_channels
-        self.num_filters = num_filters
-        self.num_blocks = num_blocks
-        self.num_actions = num_actions
-
-        # Input convolution
-        self.input_conv = ConvBlock(input_channels, num_filters)
-
-        # Residual tower (nn.Sequential for Python compatibility)
-        self.residual_tower = nn.Sequential(
-            *[ResidualBlock(num_filters) for _ in range(num_blocks)]
-        )
-
-        # Output heads (with Python-compatible naming)
-        self.policy_head = PolicyHead(num_filters, policy_filters, num_actions)
-        self.value_head = ValueHead(num_filters, value_filters, value_hidden)
-
-    def forward(self, x, mask=None):
-        # Shared trunk
-        x = self.input_conv(x)
-        x = self.residual_tower(x)
-
-        # Policy head
-        policy_logits = self.policy_head(x)
-
-        if mask is not None:
-            # Mask illegal moves (use -1e4 for FP16 compatibility)
-            policy_logits = policy_logits.masked_fill(mask == 0, -1e4)
-
-        policy = F.softmax(policy_logits, dim=1)
-
-        # Value head
-        value = self.value_head(x)
-
-        return policy, value
+    return metrics_removed
 
 
 # =============================================================================
@@ -2024,7 +665,7 @@ class BatchedEvaluator:
         self.device = device
         self.use_amp = use_amp and device == "cuda"
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def evaluate(self, obs: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, float]:
         """Evaluate single position."""
         obs_tensor = torch.from_numpy(obs).float().unsqueeze(0).to(self.device)
@@ -2032,13 +673,13 @@ class BatchedEvaluator:
 
         if self.use_amp:
             with autocast('cuda'):
-                policy, value = self.network(obs_tensor, mask_tensor)
+                policy, value, _, _ = self.network(obs_tensor, mask_tensor)
         else:
-            policy, value = self.network(obs_tensor, mask_tensor)
+            policy, value, _, _ = self.network(obs_tensor, mask_tensor)
 
         return policy[0].cpu().numpy(), float(value[0].item())
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def evaluate_batch(self, obs_batch: np.ndarray, mask_batch: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Evaluate batch of positions."""
         obs_tensor = torch.from_numpy(obs_batch).float().to(self.device)
@@ -2046,9 +687,9 @@ class BatchedEvaluator:
 
         if self.use_amp:
             with autocast('cuda'):
-                policies, values = self.network(obs_tensor, mask_tensor)
+                policies, values, _, _ = self.network(obs_tensor, mask_tensor)
         else:
-            policies, values = self.network(obs_tensor, mask_tensor)
+            policies, values, _, _ = self.network(obs_tensor, mask_tensor)
 
         return policies.cpu().numpy(), values.squeeze(-1).cpu().numpy()
 
@@ -2065,25 +706,23 @@ class CppSelfPlay:
         evaluator: BatchedEvaluator,
         num_simulations: int = 800,
         mcts_batch_size: int = 64,
-        c_puct: float = 1.5,
+        c_explore: float = 1.5,
         temperature_moves: int = 30,
-        draw_score: float = 0.0
     ):
         self.evaluator = evaluator
         self.num_simulations = num_simulations
         self.mcts_batch_size = mcts_batch_size
-        self.c_puct = c_puct
+        self.c_explore = c_explore
         self.temperature_moves = temperature_moves
-        self.draw_score = draw_score
 
         # Create C++ MCTS engine (BatchedMCTSSearch is the Python binding name)
         self.mcts = alphazero_cpp.BatchedMCTSSearch(
             num_simulations=num_simulations,
             batch_size=mcts_batch_size,
-            c_puct=c_puct
+            c_puct=c_explore  # C++ binding kwarg stays c_puct
         )
 
-    def play_game(self) -> Tuple[List[np.ndarray], List[np.ndarray], float, int, int, int]:
+    def play_game(self) -> Tuple[List[np.ndarray], List[np.ndarray], float, int, int, int, List[str], str]:
         """Play a single self-play game.
 
         Returns:
@@ -2093,6 +732,8 @@ class CppSelfPlay:
             num_moves: Number of moves played
             total_sims: Total MCTS simulations
             total_evals: Total NN evaluations
+            moves_uci: List of UCI move strings
+            result_reason: Draw reason string (repetition/stalemate/fifty_move/insufficient/max_moves/checkmate/"")
         """
         board = chess.Board()
         observations = []
@@ -2187,9 +828,89 @@ class CppSelfPlay:
         elif result == "0-1":
             value = -1.0
         else:
-            value = self.draw_score  # Asymmetric draw value from White's perspective
+            value = 0.0  # Pure training label (risk_beta is search-time only)
 
-        return observations, policies, value, move_count, total_sims, total_evals
+        # Determine result reason for draw breakdown tracking
+        if value == 0.0:
+            if move_count >= 512:
+                result_reason = "max_moves"
+            elif board.is_repetition():
+                result_reason = "repetition"
+            elif board.is_stalemate():
+                result_reason = "stalemate"
+            elif board.is_fifty_moves():
+                result_reason = "fifty_move"
+            elif board.is_insufficient_material():
+                result_reason = "insufficient"
+            else:
+                result_reason = "max_moves"  # fallback
+        elif board.is_checkmate():
+            result_reason = "checkmate"
+        else:
+            result_reason = ""
+
+        # Extract UCI move history
+        moves_uci = [m.uci() for m in board.move_stack]
+
+        return observations, policies, value, move_count, total_sims, total_evals, moves_uci, result_reason
+
+
+# =============================================================================
+# Sample Game PGN Export
+# =============================================================================
+
+def save_sample_game_pgn(run_dir: str, iteration: int, moves_uci: list,
+                          result_str: str, num_moves: int) -> Optional[str]:
+    """Save a sample self-play game as PGN file.
+
+    Args:
+        run_dir: Training run directory
+        iteration: Current iteration number (1-indexed)
+        moves_uci: List of UCI move strings (e.g. ["e2e4", "e7e5", ...])
+        result_str: PGN result string ("1-0", "0-1", "1/2-1/2")
+        num_moves: Total number of moves
+
+    Returns:
+        Path to saved PGN file, or None if save failed
+    """
+    try:
+        # Create sample_games directory
+        pgn_dir = os.path.join(run_dir, "sample_games")
+        os.makedirs(pgn_dir, exist_ok=True)
+
+        # Build PGN game from UCI moves
+        game = chess.pgn.Game()
+        game.headers["Event"] = "AlphaZero Self-Play"
+        game.headers["Site"] = "Training"
+        game.headers["Date"] = datetime.now().strftime("%Y.%m.%d")
+        game.headers["Round"] = str(iteration)
+        game.headers["White"] = "AlphaZero"
+        game.headers["Black"] = "AlphaZero"
+        game.headers["Result"] = result_str
+
+        # Replay moves on a board to build the PGN game tree
+        node = game
+        board = chess.Board()
+        for uci_str in moves_uci:
+            move = chess.Move.from_uci(uci_str)
+            if move in board.legal_moves:
+                node = node.add_variation(move)
+                board.push(move)
+            else:
+                # Shouldn't happen, but be defensive
+                break
+
+        # Save to file
+        pgn_path = os.path.join(pgn_dir, f"iter_{iteration:04d}.pgn")
+        with open(pgn_path, "w") as f:
+            print(game, file=f)
+
+        print(f"  Sample game: {result_str} in {num_moves} moves -> {pgn_path}")
+        return pgn_path
+
+    except Exception as e:
+        print(f"  Warning: Failed to save sample game PGN: {e}")
+        return None
 
 
 # =============================================================================
@@ -2264,6 +985,318 @@ def run_parallel_selfplay_with_interrupt(
     return result[0]
 
 
+def calibrate_cuda_graphs(
+    network: nn.Module,
+    device: str,
+    eval_batch: int,
+    warmup_iters: int = 5,
+    measure_iters: int = 20
+) -> dict:
+    """
+    Measure eager vs CUDA graph performance to determine optimal thresholds.
+
+    The crossover point where CUDA graph beats eager execution depends on:
+        Graph wins when: graph_replay_time < eager_overhead + per_sample × batch_size
+        Crossover batch: B = (graph_time - eager_overhead) / per_sample
+
+    For a graph of size G with actual batch B (B ≤ G), we pay for G samples but
+    only needed B — this is "padding waste". The calibration finds where graph
+    replay + padding is still cheaper than eager overhead.
+
+    Returns dict with:
+    - mini_graph_size: Size for mini graph (graph always wins at any fill)
+    - small_graph_size: Size for small graph (graph needs some fill to win)
+    - large_graph_threshold: Minimum batch to use large graph
+    - eager_overhead_ms: Fixed eager overhead
+    - eager_per_sample_ms: Per-sample eager cost
+    - measurements: Raw timing data for debugging
+    """
+    import statistics
+
+    if device != "cuda":
+        mini_graph_size = 64
+        small_graph_size = mini_graph_size * 2
+        medium_graph_size = max(small_graph_size + 1, eval_batch // 2)
+        return {
+            'mini_graph_size': mini_graph_size,
+            'small_graph_size': small_graph_size,
+            'medium_graph_size': medium_graph_size,
+            'large_graph_threshold': eval_batch * 7 // 8,
+            'mini_threshold': 0,
+            'small_threshold': mini_graph_size,
+            'medium_threshold': small_graph_size,
+            'eager_overhead_ms': 0.0,
+            'eager_per_sample_ms': 0.0,
+            'measurements': {},
+            'skipped': True
+        }
+
+    network.eval()
+    torch.cuda.synchronize()
+
+    # Test sizes: powers of 2, capped at eval_batch
+    test_sizes = [s for s in [8, 16, 32, 64, 128, 256, 512, 1024] if s <= eval_batch]
+    if eval_batch not in test_sizes:
+        test_sizes.append(eval_batch)
+    test_sizes = sorted(test_sizes)
+
+    print("  GPU warmup...", end=" ", flush=True)
+    # Extended warmup to reach thermal steady-state (~2 seconds of sustained load)
+    # This is critical: calibration on a "cold" GPU gives optimistic timings
+    warmup_obs = torch.zeros(eval_batch, INPUT_CHANNELS, 8, 8, device='cuda')
+    warmup_mask = torch.zeros(eval_batch, POLICY_SIZE, device='cuda')
+    warmup_start = time.time()
+    warmup_count = 0
+    while time.time() - warmup_start < 2.0:  # 2 seconds of sustained inference
+        with torch.no_grad(), autocast('cuda'):
+            network(warmup_obs, warmup_mask)
+        warmup_count += 1
+    torch.cuda.synchronize()
+    print(f"done ({warmup_count} iters)")
+
+    # --- Measure eager execution times ---
+    # IMPORTANT: Start from numpy to match the real runtime path in neural_evaluator
+    # (lines ~1341-1342: torch.from_numpy(arr).float().to(device))
+    # This captures the CPU→GPU transfer cost that dominates for large batches.
+    print(f"  Measuring eager: ", end="", flush=True)
+    eager_times = {}  # size -> list of times in ms
+
+    for size in test_sizes:
+        obs_np = np.zeros((size, INPUT_CHANNELS, 8, 8), dtype=np.float32)
+        mask_np = np.zeros((size, POLICY_SIZE), dtype=np.float32)
+
+        # Warmup for this size (full pipeline)
+        for _ in range(warmup_iters):
+            obs_t = torch.from_numpy(obs_np).float().to('cuda')
+            mask_t = torch.from_numpy(mask_np).float().to('cuda')
+            with torch.no_grad(), autocast('cuda'):
+                network(obs_t, mask_t)
+            torch.cuda.synchronize()
+
+        # Measure full pipeline (matches runtime eager path)
+        times = []
+        for _ in range(measure_iters):
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            obs_t = torch.from_numpy(obs_np).float().to('cuda')
+            mask_t = torch.from_numpy(mask_np).float().to('cuda')
+            with torch.no_grad(), autocast('cuda'):
+                network(obs_t, mask_t)
+            torch.cuda.synchronize()
+            times.append((time.perf_counter() - start) * 1000)
+
+        eager_times[size] = times
+        print(f"{size}", end="→" if size != test_sizes[-1] else "\n", flush=True)
+
+    # --- Fit linear model: eager_time = overhead + per_sample * batch_size ---
+    # Using least squares fit on median times for robustness
+    sizes = np.array(list(eager_times.keys()), dtype=np.float64)
+    medians = np.array([statistics.median(eager_times[s]) for s in eager_times.keys()], dtype=np.float64)
+
+    # Linear regression: y = a + b*x
+    # b = Cov(x,y) / Var(x), a = mean(y) - b * mean(x)
+    x_mean, y_mean = sizes.mean(), medians.mean()
+    cov_xy = ((sizes - x_mean) * (medians - y_mean)).sum()
+    var_x = ((sizes - x_mean) ** 2).sum()
+
+    if var_x > 0:
+        per_sample_ms = cov_xy / var_x
+        overhead_ms = y_mean - per_sample_ms * x_mean
+    else:
+        per_sample_ms = 0.0
+        overhead_ms = y_mean
+
+    # Calculate R² for fit quality
+    y_pred = overhead_ms + per_sample_ms * sizes
+    ss_res = ((medians - y_pred) ** 2).sum()
+    ss_tot = ((medians - y_mean) ** 2).sum()
+    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    # Ensure non-negative values (sanity check)
+    overhead_ms = max(0.0, overhead_ms)
+    per_sample_ms = max(0.0, per_sample_ms)
+
+    # --- Measure CUDA graph times ---
+    # Benchmark from 16 upward to find the largest "always wins" size for mini graph.
+    # Also include eval_batch//2 (medium candidate) and eval_batch (large).
+    medium_graph_size_candidate = eval_batch // 2
+    graph_sizes = [s for s in [16, 32, 64, 128, medium_graph_size_candidate, eval_batch]
+                   if s <= eval_batch]
+    graph_sizes = sorted(set(graph_sizes))
+
+    print(f"  Measuring graphs: ", end="", flush=True)
+    graph_times = {}  # size -> median time in ms (including copy-in)
+
+    for size in graph_sizes:
+        try:
+            obs = torch.zeros(size, INPUT_CHANNELS, 8, 8, device='cuda')
+            mask = torch.zeros(size, POLICY_SIZE, device='cuda')
+
+            # Warmup pass
+            with torch.no_grad(), autocast('cuda'):
+                network(obs, mask)
+
+            # Capture graph
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                with torch.no_grad(), autocast('cuda'):
+                    network(obs, mask)
+
+            # Prepare numpy source for copy-in measurement
+            # (matches runtime: static_obs[:batch_size].copy_(torch.from_numpy(...)))
+            obs_np = np.zeros((size, INPUT_CHANNELS, 8, 8), dtype=np.float32)
+            mask_np = np.zeros((size, POLICY_SIZE), dtype=np.float32)
+
+            # Warmup replays with copy-in
+            for _ in range(warmup_iters):
+                obs.copy_(torch.from_numpy(obs_np))
+                mask.copy_(torch.from_numpy(mask_np))
+                graph.replay()
+            torch.cuda.synchronize()
+
+            # Measure copy-in + replay (matches runtime graph paths)
+            times = []
+            for _ in range(measure_iters):
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                obs.copy_(torch.from_numpy(obs_np))
+                mask.copy_(torch.from_numpy(mask_np))
+                graph.replay()
+                torch.cuda.synchronize()
+                times.append((time.perf_counter() - start) * 1000)
+
+            graph_times[size] = statistics.median(times)
+            print(f"{size}", end="→" if size != graph_sizes[-1] else "\n", flush=True)
+
+            # Clean up graph to free memory
+            del graph, obs, mask
+            torch.cuda.empty_cache()
+
+        except Exception as e:
+            print(f"\n  Warning: Graph capture failed for size {size}: {e}")
+            continue
+
+    if not graph_times:
+        print("  Warning: No CUDA graphs captured, using defaults")
+        mini_graph_size = 64
+        small_graph_size = mini_graph_size * 2
+        medium_graph_size = max(small_graph_size + 1, eval_batch // 2)
+        return {
+            'mini_graph_size': mini_graph_size,
+            'small_graph_size': small_graph_size,
+            'medium_graph_size': medium_graph_size,
+            'large_graph_threshold': eval_batch * 7 // 8,
+            'mini_threshold': 0,
+            'small_threshold': mini_graph_size,
+            'medium_threshold': small_graph_size,
+            'eager_overhead_ms': overhead_ms,
+            'eager_per_sample_ms': per_sample_ms,
+            'measurements': {'eager': eager_times, 'graph': {}},
+            'failed': True
+        }
+
+    # --- Calculate crossovers and select optimal parameters ---
+    # Report measurement variance as coefficient of variation (CV = std/mean)
+    avg_cv = sum(statistics.stdev(t) / statistics.mean(t) for t in eager_times.values() if len(t) > 1) / len(eager_times)
+    reliability = "high" if avg_cv < 0.05 else "moderate" if avg_cv < 0.15 else "low"
+
+    print(f"\n  Eager: {overhead_ms:.1f}ms overhead + {per_sample_ms:.3f}ms/sample (R2={r_squared:.3f})")
+    print(f"  Measurement variance: {avg_cv*100:.1f}% CV ({reliability} reliability)")
+    print("  Graph crossovers:")
+
+    crossovers = {}  # size -> crossover batch
+    for size, graph_time in sorted(graph_times.items()):
+        if per_sample_ms > 0:
+            crossover = (graph_time - overhead_ms) / per_sample_ms
+        else:
+            crossover = 0 if graph_time < overhead_ms else float('inf')
+
+        crossovers[size] = crossover
+        fill_pct = (crossover / size * 100) if size > 0 else 0
+
+        # Explain what crossover means in practical terms
+        if crossover <= 0:
+            verdict = "graph always wins"
+        elif crossover >= size:
+            verdict = "graph never wins"
+        else:
+            verdict = f"graph wins at {fill_pct:.0f}%+ fill"
+
+        print(f"    Size {size:4d}: graph={graph_time:.1f}ms, crossover={crossover:.0f}, {verdict}")
+
+    # Select mini graph: largest measured size where graph always wins (crossover ≤ 0)
+    always_wins = [s for s, c in crossovers.items() if c <= 0]
+    if always_wins:
+        mini_graph_size = max(always_wins)
+        mini_quality = "graph always wins"
+    else:
+        # No size where graph always wins — use smallest measured size
+        mini_graph_size = min(graph_times.keys())
+        mini_quality = "no always-wins size, using smallest"
+
+    # Small = 2× mini (geometric doubling), capped at eval_batch
+    small_graph_size = min(mini_graph_size * 2, eval_batch)
+
+    # Medium = eval_batch // 2 (skip if it would overlap with small)
+    medium_graph_size = eval_batch // 2
+
+    # Compute crossover threshold for each tier
+    # crossover = minimum batch where graph(S) beats eager(B)
+    def get_threshold(size):
+        if size in crossovers:
+            return max(0, int(crossovers[size]))  # clamp to 0 (0 = graph always wins)
+        # If size wasn't benchmarked, interpolate from linear model
+        graph_est = overhead_ms + per_sample_ms * size  # rough estimate
+        return 0  # conservative: assume graph wins
+
+    mini_threshold = get_threshold(mini_graph_size)
+
+    # Small lower bound: max(mini_graph_size, crossover)
+    # Prevents batches <= mini_graph_size that fail mini_threshold from leaking into small
+    small_threshold = max(mini_graph_size, get_threshold(small_graph_size))
+
+    # Medium: min(7/8 * medium_graph_size, crossover) caps padding waste at 12.5%
+    # max(small_graph_size, ...) prevents batches <= small_graph_size from leaking in
+    if medium_graph_size > small_graph_size:
+        medium_crossover = get_threshold(medium_graph_size)
+        medium_threshold = max(small_graph_size, min(medium_graph_size * 7 // 8, medium_crossover))
+    else:
+        medium_threshold = 0
+
+    # Large: min(7/8 * eval_batch, crossover) — matches medium's pattern
+    # When medium is skipped, large must cover everything above small (no gap)
+    large_crossover = get_threshold(eval_batch)
+    if medium_graph_size > small_graph_size:
+        large_graph_threshold = max(medium_graph_size, min(eval_batch * 7 // 8, large_crossover))
+    else:
+        large_graph_threshold = max(small_graph_size, min(eval_batch * 7 // 8, large_crossover))
+
+    print(f"\n  Selected: mini={mini_graph_size} ({mini_quality})")
+    print(f"           small={small_graph_size} (2x mini, threshold={small_threshold})")
+    if medium_graph_size > small_graph_size:
+        print(f"           medium={medium_graph_size} (eval_batch//2, threshold={medium_threshold})")
+    print(f"           large_threshold={large_graph_threshold} (7/8 fill)")
+
+    return {
+        'mini_graph_size': mini_graph_size,
+        'small_graph_size': small_graph_size,
+        'medium_graph_size': medium_graph_size,
+        'large_graph_threshold': large_graph_threshold,
+        'mini_threshold': mini_threshold,
+        'small_threshold': small_threshold,
+        'medium_threshold': medium_threshold,
+        'eager_overhead_ms': overhead_ms,
+        'eager_per_sample_ms': per_sample_ms,
+        'r_squared': r_squared,
+        'avg_cv': avg_cv,
+        'measurements': {
+            'eager_medians': {s: statistics.median(t) for s, t in eager_times.items()},
+            'graph_medians': graph_times,
+            'crossovers': crossovers
+        }
+    }
+
+
 def run_parallel_selfplay(
     network: nn.Module,
     replay_buffer,
@@ -2271,7 +1304,7 @@ def run_parallel_selfplay(
     args,
     iteration: int,
     progress_callback=None,
-    live_dashboard=None
+    live_dashboard=None,
 ) -> IterationMetrics:
     """Run parallel self-play using cross-game batching.
 
@@ -2295,6 +1328,9 @@ def run_parallel_selfplay(
     metrics = IterationMetrics(iteration=iteration)
     selfplay_start = time.time()
 
+    def total_buffer_size():
+        return replay_buffer.size()
+
     # Calculate how many games per worker to match games_per_iter
     games_per_worker = max(1, args.games_per_iter // args.workers)
     actual_total_games = games_per_worker * args.workers
@@ -2308,14 +1344,16 @@ def run_parallel_selfplay(
     else:
         queue_capacity = max(8192, args.workers * args.search_batch * 8)
 
+    risk_beta = args.risk_beta
+
     # Create parallel coordinator
     coordinator = alphazero_cpp.ParallelSelfPlayCoordinator(
         num_workers=args.workers,
         games_per_worker=games_per_worker,
         num_simulations=args.simulations,
         mcts_batch_size=args.search_batch,
-        gpu_batch_size=args.eval_batch,
-        c_puct=args.c_puct,
+        gpu_batch_size=args.input_batch_size,
+        c_puct=args.c_explore,  # C++ binding kwarg stays c_puct
         dirichlet_alpha=args.dirichlet_alpha,
         dirichlet_epsilon=args.dirichlet_epsilon,
         temperature_moves=args.temperature_moves,
@@ -2323,15 +1361,28 @@ def run_parallel_selfplay(
         worker_timeout_ms=args.worker_timeout_ms,
         queue_capacity=queue_capacity,
         root_eval_retries=args.root_eval_retries,
-        draw_score=args.draw_score
+        fpu_base=args.fpu_base,
+        risk_beta=risk_beta,
+        opponent_risk_min=args.opponent_risk_min,
+        opponent_risk_max=args.opponent_risk_max,
+        use_gumbel=(args.search_algorithm == "gumbel"),
+        gumbel_top_k=args.gumbel_top_k,
+        gumbel_c_visit=args.gumbel_c_visit,
+        gumbel_c_scale=args.gumbel_c_scale
     )
 
     # Set replay buffer so data is stored directly
     coordinator.set_replay_buffer(replay_buffer)
 
     print(f"  Parallel: {args.workers} workers × {games_per_worker} games = {actual_total_games} games")
-    print(f"  eval_batch={args.eval_batch}, gpu_timeout={args.gpu_batch_timeout_ms}ms, "
+    print(f"  eval_batch={args.eval_batch} GPU-effective "
+          f"(input={args.input_batch_size}), gpu_timeout={args.gpu_batch_timeout_ms}ms, "
           f"queue_capacity={queue_capacity}, root_eval_retries={args.root_eval_retries}")
+    if args.search_algorithm == "gumbel":
+        print(f"  Search: Gumbel Top-k SH (top_k={args.gumbel_top_k}, "
+              f"c_visit={args.gumbel_c_visit}, c_scale={args.gumbel_c_scale})")
+    else:
+        print(f"  Search: PUCT (Dirichlet alpha={args.dirichlet_alpha}, eps={args.dirichlet_epsilon})")
 
     # Push initial progress to live dashboard (show we're in self-play phase)
     if live_dashboard is not None:
@@ -2341,31 +1392,110 @@ def run_parallel_selfplay(
             total_games=actual_total_games,
             moves=0, sims=0, evals=0,
             elapsed_time=0.1,
-            buffer_size=replay_buffer.size(),
+            buffer_size=total_buffer_size(),
             phase="selfplay"
         )
 
     # =========================================================================
-    # CUDA Graph Optimization for Inference (Multi-Bucket)
-    # =========================================================================
-    # CUDA Graph Optimization for Inference (Always Pad to Max)
+    # CUDA Graph Optimization: Two-Sided Graph with Eager Fallback
     # =========================================================================
     # CUDA Graphs capture a sequence of GPU operations and replay them with
     # minimal CPU overhead. For fixed-batch-size inference, this eliminates
     # kernel launch overhead (~5-10ms savings per batch).
     #
-    # Strategy: Single CUDA graph at eval_batch size. All incoming batches are
-    # padded to this size for consistent GPU utilization. Modern GPUs are so
-    # fast that the padding compute is negligible compared to the benefit of
-    # consistent large-batch GPU utilization and memory coalescing.
+    # Strategy: Four CUDA graphs at geometric sizes + eager fallback:
+    # - Large graph at input_batch_size for high-throughput when batches are full
+    # - Medium graph at input_batch_size//2 for batches in the upper-mid range
+    # - Small graph at 128 for mid-range batches
+    # - Mini graph at 64 for small batches (graph always wins)
+    # - Eager fallback when batch is below crossover threshold for its tier
+    #
+    # All sizes are in input terms (before mirror doubling in forward()).
+    # Calibration measures eager vs graph performance to find optimal crossovers.
 
-    gpu_batch_size = args.eval_batch
+    gpu_batch_size = args.input_batch_size
+
+    # Run calibration to determine optimal graph sizes and thresholds
+    def _use_default_calibration(gpu_batch_size):
+        """Return default CUDA graph tier sizes when calibration is skipped/failed."""
+        if gpu_batch_size <= 64:
+            mini = max(8, gpu_batch_size // 4)
+            small = max(mini + 1, gpu_batch_size // 2)
+            return mini, small, 0, small, 0, mini + 1, 0
+        else:
+            mini = 64
+            small = mini * 2
+            medium = max(small + 1, gpu_batch_size // 2)
+            return mini, small, medium, gpu_batch_size * 7 // 8, 0, mini, small
+
+    if device == "cuda" and args.workers > 1:
+        print("\nCalibrating CUDA graphs...")
+        calibration_start = time.time()
+        calibration = calibrate_cuda_graphs(network, device, args.input_batch_size)
+        calibration_time = time.time() - calibration_start
+
+        r_sq = calibration.get('r_squared', 0)
+        avg_cv = calibration.get('avg_cv', 1.0)
+
+        if r_sq < 0.5 or avg_cv > 0.15:
+            print(f"  WARNING: Low reliability (R²={r_sq:.3f}, CV={avg_cv*100:.1f}%), retrying in 15s...")
+            time.sleep(15)
+            calibration = calibrate_cuda_graphs(network, device, args.input_batch_size)
+            r_sq = calibration.get('r_squared', 0)
+            avg_cv = calibration.get('avg_cv', 1.0)
+
+        if r_sq < 0.5:
+            print(f"  Calibration unreliable after retry (R²={r_sq:.3f}), using defaults")
+            (mini_graph_size, small_graph_size, medium_graph_size,
+             large_graph_threshold, mini_threshold, small_threshold,
+             medium_threshold) = _use_default_calibration(gpu_batch_size)
+        else:
+            mini_graph_size = calibration['mini_graph_size']
+            small_graph_size = calibration['small_graph_size']
+            medium_graph_size = calibration['medium_graph_size']
+            large_graph_threshold = calibration['large_graph_threshold']
+            mini_threshold = calibration.get('mini_threshold', 0)
+            small_threshold = calibration.get('small_threshold', 0)
+            medium_threshold = calibration.get('medium_threshold', 0)
+            print(f"  Calibration completed in {calibration_time:.1f}s\n")
+    else:
+        (mini_graph_size, small_graph_size, medium_graph_size,
+         large_graph_threshold, mini_threshold, small_threshold,
+         medium_threshold) = _use_default_calibration(gpu_batch_size)
+
     use_cuda_graph = (device == "cuda")
-    cuda_graph = None
-    static_obs = None
-    static_mask = None
-    static_policy_out = None
-    static_value_out = None
+
+    # Large graph (full eval_batch)
+    cuda_graph_large = None
+    static_obs_large = None
+    static_mask_large = None
+    static_policy_large = None
+    static_value_large = None
+    static_wdl_large = None
+
+    # Medium graph (eval_batch // 2)
+    cuda_graph_medium = None
+    static_obs_medium = None
+    static_mask_medium = None
+    static_policy_medium = None
+    static_value_medium = None
+    static_wdl_medium = None
+
+    # Small graph (128)
+    cuda_graph_small = None
+    static_obs_small = None
+    static_mask_small = None
+    static_policy_small = None
+    static_value_small = None
+    static_wdl_small = None
+
+    # Mini graph (64 - smallest tier)
+    cuda_graph_mini = None
+    static_obs_mini = None
+    static_mask_mini = None
+    static_policy_mini = None
+    static_value_mini = None
+    static_wdl_mini = None
 
     # Free fragmented GPU memory before allocating static CUDA Graph buffers
     if device == "cuda":
@@ -2373,89 +1503,205 @@ def run_parallel_selfplay(
 
     if use_cuda_graph:
         try:
-            # Pre-allocate static GPU buffers at full eval_batch size
-            static_obs = torch.zeros(gpu_batch_size, INPUT_CHANNELS, 8, 8, device='cuda')
-            static_mask = torch.zeros(gpu_batch_size, POLICY_SIZE, device='cuda')
+            # ===== Capture LARGE graph (full eval_batch) =====
+            static_obs_large = torch.zeros(gpu_batch_size, INPUT_CHANNELS, 8, 8, device='cuda')
+            static_mask_large = torch.zeros(gpu_batch_size, POLICY_SIZE, device='cuda')
 
             # Warm-up pass (required before graph capture)
             with autocast('cuda'):
-                static_policy_out, static_value_out = network(static_obs, static_mask)
+                static_policy_large, static_value_large, _spl, static_wdl_large = network(static_obs_large, static_mask_large)
 
             # Capture CUDA graph at full batch size
-            cuda_graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(cuda_graph):
+            cuda_graph_large = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cuda_graph_large):
                 with autocast('cuda'):
-                    static_policy_out, static_value_out = network(static_obs, static_mask)
+                    static_policy_large, static_value_large, _spl, static_wdl_large = network(static_obs_large, static_mask_large)
+
+            # ===== Capture MEDIUM graph (eval_batch // 2) =====
+            # Skip if medium would overlap with small (e.g. eval_batch <= 256)
+            if medium_graph_size > small_graph_size:
+                static_obs_medium = torch.zeros(medium_graph_size, INPUT_CHANNELS, 8, 8, device='cuda')
+                static_mask_medium = torch.zeros(medium_graph_size, POLICY_SIZE, device='cuda')
+
+                with autocast('cuda'):
+                    static_policy_medium, static_value_medium, _spm2, static_wdl_medium = network(static_obs_medium, static_mask_medium)
+
+                cuda_graph_medium = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(cuda_graph_medium):
+                    with autocast('cuda'):
+                        static_policy_medium, static_value_medium, _spm2, static_wdl_medium = network(static_obs_medium, static_mask_medium)
+
+            # ===== Capture SMALL graph =====
+            static_obs_small = torch.zeros(small_graph_size, INPUT_CHANNELS, 8, 8, device='cuda')
+            static_mask_small = torch.zeros(small_graph_size, POLICY_SIZE, device='cuda')
+
+            # Warm-up pass
+            with autocast('cuda'):
+                static_policy_small, static_value_small, _sps, static_wdl_small = network(static_obs_small, static_mask_small)
+
+            # Capture CUDA graph at small batch size
+            cuda_graph_small = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cuda_graph_small):
+                with autocast('cuda'):
+                    static_policy_small, static_value_small, _sps, static_wdl_small = network(static_obs_small, static_mask_small)
+
+            # ===== Capture MINI graph =====
+            static_obs_mini = torch.zeros(mini_graph_size, INPUT_CHANNELS, 8, 8, device='cuda')
+            static_mask_mini = torch.zeros(mini_graph_size, POLICY_SIZE, device='cuda')
+
+            # Warm-up pass
+            with autocast('cuda'):
+                static_policy_mini, static_value_mini, _spm, static_wdl_mini = network(static_obs_mini, static_mask_mini)
+
+            # Capture CUDA graph at mini batch size
+            cuda_graph_mini = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cuda_graph_mini):
+                with autocast('cuda'):
+                    static_policy_mini, static_value_mini, _spm, static_wdl_mini = network(static_obs_mini, static_mask_mini)
 
             # Calculate buffer memory usage
             bytes_per_pos = (INPUT_CHANNELS * 8 * 8 + POLICY_SIZE * 2 + 1) * 4  # obs + mask + policy + value
-            total_mem_mb = gpu_batch_size * bytes_per_pos / (1024 * 1024)
-            print(f"  CUDA Graph captured for batch_size={gpu_batch_size} (always-pad mode), buffer memory: {total_mem_mb:.1f} MB")
+            graph_sizes_total = gpu_batch_size + small_graph_size + mini_graph_size
+            if cuda_graph_medium is not None:
+                graph_sizes_total += medium_graph_size
+            total_mem_mb = graph_sizes_total * bytes_per_pos / (1024 * 1024)
+
+            medium_str = f", medium={medium_graph_size}" if cuda_graph_medium is not None else ""
+            print(f"  CUDA Graphs captured: large={gpu_batch_size}{medium_str}, small={small_graph_size}, mini={mini_graph_size}")
+            medium_route = f", batch<={medium_graph_size}(>={medium_threshold})->medium" if cuda_graph_medium is not None else ""
+            print(f"  Routing: batch>{large_graph_threshold}->large{medium_route}, batch<={small_graph_size}(>={small_threshold})->small, batch<={mini_graph_size}(>={mini_threshold})->mini, else->eager")
+            print(f"  Total buffer memory: {total_mem_mb:.1f} MB")
         except Exception as e:
             print(f"  CUDA Graph capture failed ({e}), falling back to eager mode")
             use_cuda_graph = False
-            cuda_graph = None
+            cuda_graph_large = None
+            cuda_graph_medium = None
+            cuda_graph_small = None
+            cuda_graph_mini = None
 
     # CUDA graph fire tracking (mutable dict for closure capture)
     cuda_graph_stats = {
-        'graph_fires': 0,       # Times CUDA graph fast path was used
-        'eager_fires': 0,       # Times eager fallback was used
+        'large_graph_fires': 0,   # Times large CUDA graph was used
+        'medium_graph_fires': 0,  # Times medium CUDA graph was used
+        'small_graph_fires': 0,   # Times small CUDA graph was used
+        'mini_graph_fires': 0,    # Times mini CUDA graph was used
+        'eager_fires': 0,         # Times eager fallback was used
         'total_infer_time_ms': 0.0,  # Cumulative inference time
+        # Per-path time tracking for time-distribution pie chart
+        'large_graph_time_ms': 0.0,
+        'medium_graph_time_ms': 0.0,
+        'small_graph_time_ms': 0.0,
+        'mini_graph_time_ms': 0.0,
+        'eager_time_ms': 0.0,
+    }
+
+    # Batch size histogram for distribution analysis
+    # This helps determine optimal CUDA graph sizes for future optimization
+    batch_size_histogram = {
+        'counts': {},           # batch_size -> count
+        'samples': [],          # List of (timestamp, batch_size) for time analysis
+        'sample_limit': 10000,  # Keep last N samples to avoid memory bloat
     }
 
     # Create evaluator callback that will be called from C++ GPU thread
     # Signature: (observations, legal_masks, batch_size, out_policies, out_values) -> None
     # Observations arrive in NCHW format (C++ does the transpose now)
     # Output buffers are writable numpy views over C++ memory (zero-copy)
-    @torch.no_grad()
+    @torch.inference_mode()
     def neural_evaluator(obs_array: np.ndarray, mask_array: np.ndarray, batch_size: int,
                          out_policies: np.ndarray = None, out_values: np.ndarray = None):
         """Neural network evaluator callback for C++ coordinator."""
         infer_start = time.perf_counter()
 
-        if use_cuda_graph and cuda_graph is not None:
-            # Always use CUDA graph by padding to full batch size
-            cuda_graph_stats['graph_fires'] += 1
+        # Track batch size distribution for analysis
+        batch_size_histogram['counts'][batch_size] = batch_size_histogram['counts'].get(batch_size, 0) + 1
+        if len(batch_size_histogram['samples']) < batch_size_histogram['sample_limit']:
+            batch_size_histogram['samples'].append((time.time(), batch_size))
 
-            # Copy actual data to beginning of static buffers
-            # Padding positions retain zeros (harmless - results ignored)
-            static_obs[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]))
-            static_mask[:batch_size].copy_(torch.from_numpy(mask_array[:batch_size]))
+        # Route batch to the tightest-fitting graph (smallest first) using crossover thresholds
+        path_taken = 'eager'
 
-            # Replay full-size graph (GPU efficiently processes entire batch)
-            cuda_graph.replay()
+        if use_cuda_graph and batch_size <= mini_graph_size and batch_size >= mini_threshold and cuda_graph_mini is not None:
+            # MINI GRAPH PATH: tiny batches — tightest fit
+            path_taken = 'mini'
+            cuda_graph_stats['mini_graph_fires'] += 1
 
-            # Extract only valid results (ignore padding)
-            policies = static_policy_out[:batch_size]
-            values = static_value_out[:batch_size]
+            static_obs_mini[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]))
+            static_mask_mini[:batch_size].copy_(torch.from_numpy(mask_array[:batch_size]))
+            cuda_graph_mini.replay()
+            policies = static_policy_mini[:batch_size]
+            wdl_logits = static_wdl_mini[:batch_size]
+
+        elif use_cuda_graph and batch_size <= small_graph_size and batch_size >= small_threshold and cuda_graph_small is not None:
+            # SMALL GRAPH PATH: batch fits in small graph
+            path_taken = 'small'
+            cuda_graph_stats['small_graph_fires'] += 1
+
+            static_obs_small[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]))
+            static_mask_small[:batch_size].copy_(torch.from_numpy(mask_array[:batch_size]))
+            cuda_graph_small.replay()
+            policies = static_policy_small[:batch_size]
+            wdl_logits = static_wdl_small[:batch_size]
+
+        elif use_cuda_graph and batch_size <= medium_graph_size and batch_size >= medium_threshold and cuda_graph_medium is not None:
+            # MEDIUM GRAPH PATH: mid-range batches
+            path_taken = 'medium'
+            cuda_graph_stats['medium_graph_fires'] += 1
+
+            static_obs_medium[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]))
+            static_mask_medium[:batch_size].copy_(torch.from_numpy(mask_array[:batch_size]))
+            cuda_graph_medium.replay()
+            policies = static_policy_medium[:batch_size]
+            wdl_logits = static_wdl_medium[:batch_size]
+
+        elif use_cuda_graph and batch_size > large_graph_threshold and cuda_graph_large is not None:
+            # LARGE GRAPH PATH: near-full batches — minimal padding waste
+            path_taken = 'large'
+            cuda_graph_stats['large_graph_fires'] += 1
+
+            static_obs_large[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]))
+            static_mask_large[:batch_size].copy_(torch.from_numpy(mask_array[:batch_size]))
+            cuda_graph_large.replay()
+            policies = static_policy_large[:batch_size]
+            wdl_logits = static_wdl_large[:batch_size]
+
         else:
-            # Fallback: eager inference (no CUDA graph)
+            # EAGER PATH: batch doesn't qualify for any graph tier
             cuda_graph_stats['eager_fires'] += 1
             obs_tensor = torch.from_numpy(obs_array[:batch_size]).float().to(device)
             mask_tensor = torch.from_numpy(mask_array[:batch_size]).float().to(device)
 
             if device == "cuda":
                 with autocast('cuda'):
-                    policies, values = network(obs_tensor, mask_tensor)
+                    policies, _, _, wdl_logits = network(obs_tensor, mask_tensor)
             else:
-                policies, values = network(obs_tensor, mask_tensor)
+                policies, _, _, wdl_logits = network(obs_tensor, mask_tensor)
 
-        # Track inference time (synchronize for accurate timing on GPU)
+        # Convert raw WDL logits to probabilities (softmax exactly once — no double softmax!)
+        wdl_probs = F.softmax(wdl_logits.float(), dim=1)
+
+        # Per-call inference timing: synchronize to get accurate GPU time
+        # Cost is ~5µs/call, negligible at 50-200 calls/sec
         if device == "cuda":
             torch.cuda.synchronize()
-        cuda_graph_stats['total_infer_time_ms'] += (time.perf_counter() - infer_start) * 1000
+        elapsed_ms = (time.perf_counter() - infer_start) * 1000
+        cuda_graph_stats['total_infer_time_ms'] += elapsed_ms
+        cuda_graph_stats['total_calls'] = cuda_graph_stats.get('total_calls', 0) + 1
+        time_key = f'{path_taken}_graph_time_ms' if path_taken != 'eager' else 'eager_time_ms'
+        cuda_graph_stats[time_key] = cuda_graph_stats.get(time_key, 0) + elapsed_ms
 
         # Write results directly to C++ output buffers (zero-copy)
+        # out_values is now (batch_size, 3) for WDL probabilities
         policies_np = policies[:batch_size].cpu().numpy().astype(np.float32)
-        values_np = values[:batch_size].squeeze(-1).cpu().numpy().astype(np.float32)
+        wdl_np = wdl_probs[:batch_size].cpu().numpy().astype(np.float32)
 
         if out_policies is not None and out_values is not None:
             np.copyto(out_policies[:batch_size], policies_np)
-            np.copyto(out_values[:batch_size], values_np)
+            np.copyto(out_values[:batch_size], wdl_np)
             return None
         else:
             # Legacy fallback
-            return policies_np, values_np
+            return policies_np, wdl_np
 
     # Create progress callback that prints to console and optionally pushes to dashboard
     last_console_report = [selfplay_start]
@@ -2494,13 +1740,15 @@ def run_parallel_selfplay(
             else:
                 eta_str = "calculating..."
 
+            comp = replay_buffer.get_composition()
+            buf_str = f"Buffer: {replay_buffer.size():,} (W={comp['wins']} D={comp['draws']} L={comp['losses']})"
             print(f"    \u23f1 {format_duration(elapsed)} | "
                   f"Games: {games}/{actual_total_games} | "
                   f"Moves: {moves_per_sec:.1f}/s | "
                   f"Sims: {sims_per_sec:,.0f}/s | "
                   f"NN: {evals_per_sec:,.0f}/s | "
                   f"Batch: {avg_batch:.0f} | "
-                  f"Buffer: {replay_buffer.size():,} | "
+                  f"{buf_str} | "
                   f"ETA: {eta_str}")
 
             if failures > 0:
@@ -2508,11 +1756,55 @@ def run_parallel_selfplay(
 
             last_console_report[0] = now
 
+        # Batch size distribution logging (every 5 minutes)
+        batch_percentiles = {'p25': 0, 'p50': 0, 'p75': 0, 'p90': 0, 'min': 0, 'max': 0}
+        counts = batch_size_histogram['counts']
+        if counts:
+            total = sum(counts.values())
+            sorted_sizes = sorted(counts.keys())
+
+            # Calculate percentiles by walking through sorted sizes
+            cumsum = 0
+            p25 = p50 = p75 = p90 = sorted_sizes[-1]
+            for size in sorted_sizes:
+                cumsum += counts[size]
+                pct = cumsum / total
+                if pct >= 0.25 and p25 == sorted_sizes[-1]:
+                    p25 = size
+                if pct >= 0.50 and p50 == sorted_sizes[-1]:
+                    p50 = size
+                if pct >= 0.75 and p75 == sorted_sizes[-1]:
+                    p75 = size
+                if pct >= 0.90 and p90 == sorted_sizes[-1]:
+                    p90 = size
+
+            batch_percentiles = {
+                'p25': p25, 'p50': p50, 'p75': p75, 'p90': p90,
+                'min': sorted_sizes[0], 'max': sorted_sizes[-1]
+            }
+
+        # Generate binned histogram for dashboard (20 bins)
+        batch_histogram_data = []
+        if counts and len(counts) > 0:
+            min_size = min(counts.keys())
+            max_size = max(counts.keys())
+            if max_size > min_size:
+                num_bins = min(20, len(counts))
+                bin_width = max(1, (max_size - min_size) // num_bins)
+                bins = {}
+                for size, count in counts.items():
+                    bin_center = min(max_size, min_size + ((size - min_size) // bin_width) * bin_width + bin_width // 2)
+                    bins[bin_center] = bins.get(bin_center, 0) + count
+                # Convert to sorted list of [bin_center, count]
+                batch_histogram_data = sorted([[k, v] for k, v in bins.items()])
+
         # Live dashboard push (if enabled)
         if live_dashboard is not None:
-            # Calculate GPU stats for dashboard
-            total_fires = cuda_graph_stats['graph_fires'] + cuda_graph_stats['eager_fires']
-            graph_fire_rate = cuda_graph_stats['graph_fires'] / total_fires if total_fires > 0 else 0.0
+            # Calculate GPU stats for dashboard (combining all graph fires)
+            graph_fires = (cuda_graph_stats['large_graph_fires'] + cuda_graph_stats['medium_graph_fires'] +
+                           cuda_graph_stats['small_graph_fires'] + cuda_graph_stats['mini_graph_fires'])
+            total_fires = graph_fires + cuda_graph_stats['eager_fires']
+            graph_fire_rate = graph_fires / total_fires if total_fires > 0 else 0.0
             avg_infer_ms = cuda_graph_stats['total_infer_time_ms'] / total_fires if total_fires > 0 else 0.0
             gpu_mem_mb = torch.cuda.memory_allocated() / (1024*1024) if device == "cuda" else 0.0
 
@@ -2524,11 +1816,14 @@ def run_parallel_selfplay(
                 sims=live_stats.get('total_simulations', 0),
                 evals=live_stats.get('total_nn_evals', 0),
                 elapsed_time=max(elapsed, 0.1),
-                buffer_size=replay_buffer.size(),
+                buffer_size=total_buffer_size(),
                 phase="selfplay",
                 white_wins=live_stats.get('white_wins', 0),
                 black_wins=live_stats.get('black_wins', 0),
                 draws=live_stats.get('draws', 0),
+                standard_wins=live_stats.get('standard_wins', 0),
+                opponent_wins=live_stats.get('opponent_wins', 0),
+                asymmetric_draws=live_stats.get('asymmetric_draws', 0),
                 timeout_evals=live_stats.get('mcts_failures', 0),
                 pool_exhaustion=live_stats.get('pool_exhaustion_count', 0),
                 submission_drops=live_stats.get('submission_drops', 0),
@@ -2539,18 +1834,52 @@ def run_parallel_selfplay(
                 batch_fill_ratio=live_stats.get('batch_fill_ratio', 0.0),
                 root_retries=live_stats.get('root_retries', 0),
                 stale_flushed=live_stats.get('stale_results_flushed', 0),
-                # GPU metrics
-                cuda_graph_fires=cuda_graph_stats['graph_fires'],
+                # GPU metrics (separate counts for pie chart)
+                cuda_graph_fires=graph_fires,
+                large_graph_fires=cuda_graph_stats['large_graph_fires'],
+                medium_graph_fires=cuda_graph_stats['medium_graph_fires'],
+                small_graph_fires=cuda_graph_stats['small_graph_fires'],
+                mini_graph_fires=cuda_graph_stats['mini_graph_fires'],
                 eager_fires=cuda_graph_stats['eager_fires'],
                 graph_fire_rate=graph_fire_rate,
                 avg_infer_time_ms=avg_infer_ms,
                 gpu_memory_used_mb=gpu_mem_mb,
-                cuda_graph_enabled=(use_cuda_graph and cuda_graph is not None),
+                cuda_graph_enabled=(use_cuda_graph and (cuda_graph_large is not None or cuda_graph_medium is not None or cuda_graph_small is not None or cuda_graph_mini is not None)),
+                # Tree depth metrics
+                max_search_depth=live_stats.get('max_search_depth', 0),
+                min_search_depth=live_stats.get('min_search_depth', 0),
+                avg_search_depth=live_stats.get('avg_search_depth', 0.0),
+                # Active game move counts
+                min_current_moves=live_stats.get('min_current_moves', 0),
+                max_current_moves=live_stats.get('max_current_moves', 0),
                 # Queue status metrics
                 queue_fill_pct=live_stats.get('queue_fill_pct', 0.0),
                 gpu_wait_ms=live_stats.get('gpu_wait_ms', 0.0),
                 worker_wait_ms=live_stats.get('worker_wait_ms', 0.0),
                 buffer_swaps=live_stats.get('buffer_swaps', 0),
+                # Batch size distribution percentiles
+                batch_p25=batch_percentiles.get('p25', 0),
+                batch_p50=batch_percentiles.get('p50', 0),
+                batch_p75=batch_percentiles.get('p75', 0),
+                batch_p90=batch_percentiles.get('p90', 0),
+                batch_min=batch_percentiles.get('min', 0),
+                batch_max=batch_percentiles.get('max', 0),
+                # Batch histogram for visualization
+                batch_histogram=batch_histogram_data,
+                large_graph_threshold=large_graph_threshold,
+                medium_graph_size=medium_graph_size,
+                small_graph_size=small_graph_size,
+                mini_graph_size=mini_graph_size,
+                # Crossover thresholds for each tier
+                medium_threshold=medium_threshold,
+                small_threshold=small_threshold,
+                mini_threshold=mini_threshold,
+                # Per-path inference time (for time-distribution pie chart)
+                large_graph_time_ms=cuda_graph_stats['large_graph_time_ms'],
+                medium_graph_time_ms=cuda_graph_stats['medium_graph_time_ms'],
+                small_graph_time_ms=cuda_graph_stats['small_graph_time_ms'],
+                mini_graph_time_ms=cuda_graph_stats['mini_graph_time_ms'],
+                eager_time_ms=cuda_graph_stats['eager_time_ms'],
             )
 
     # Run generation with interrupt support (allows Ctrl+C to stop)
@@ -2576,8 +1905,17 @@ def run_parallel_selfplay(
         metrics.white_wins = result.get('white_wins', 0)
         metrics.black_wins = result.get('black_wins', 0)
         metrics.draws = result.get('draws', 0)
+        metrics.standard_wins = result.get('standard_wins', 0)
+        metrics.opponent_wins = result.get('opponent_wins', 0)
+        metrics.asymmetric_draws = result.get('asymmetric_draws', 0)
         metrics.total_simulations = result.get('total_simulations', 0)
         metrics.total_nn_evals = result.get('total_nn_evals', 0)
+        metrics.draws_repetition = result.get('draws_repetition', 0)
+        metrics.draws_stalemate = result.get('draws_stalemate', 0)
+        metrics.draws_fifty_move = result.get('draws_fifty_move', 0)
+        metrics.draws_insufficient = result.get('draws_insufficient', 0)
+        metrics.draws_max_moves = result.get('draws_max_moves', 0)
+        metrics.draws_early_repetition = result.get('draws_early_repetition', 0)
 
         # Display diagnostic metrics for parallel pipeline health
         mcts_failures = result.get('mcts_failures', 0)
@@ -2596,6 +1934,25 @@ def run_parallel_selfplay(
 
         print(f"  Parallel stats: {metrics.total_nn_evals:,} NN evals ({nn_evals_per_move:.1f}/move), "
               f"avg_batch={avg_batch:.1f}, batches={total_batches:,}")
+
+        # Print final batch size distribution summary
+        counts = batch_size_histogram['counts']
+        if counts:
+            total = sum(counts.values())
+            sorted_sizes = sorted(counts.keys())
+            cumsum = 0
+            p25 = p50 = p75 = p90 = sorted_sizes[-1]
+            for size in sorted_sizes:
+                cumsum += counts[size]
+                pct = cumsum / total
+                if pct >= 0.25 and p25 == sorted_sizes[-1]: p25 = size
+                if pct >= 0.50 and p50 == sorted_sizes[-1]: p50 = size
+                if pct >= 0.75 and p75 == sorted_sizes[-1]: p75 = size
+                if pct >= 0.90 and p90 == sorted_sizes[-1]: p90 = size
+            top5 = sorted(counts.items(), key=lambda x: -x[1])[:5]
+            print(f"  📊 Batch distribution (n={total}): P25={p25}, P50={p50}, P75={p75}, P90={p90}, "
+                  f"range=[{sorted_sizes[0]}, {sorted_sizes[-1]}]")
+            print(f"     Top 5: {', '.join(f'{s}({c})' for s, c in top5)}")
 
         if mcts_failures > 0 or pool_exhaustion > 0 or partial_subs > 0 or root_retries > 0:
             print(f"  Pipeline issues: {mcts_failures} MCTS failures ({failure_rate:.1f}%), "
@@ -2620,16 +1977,26 @@ def run_parallel_selfplay(
 
     metrics.selfplay_time = time.time() - selfplay_start
     metrics.avg_game_length = metrics.total_moves / max(metrics.num_games, 1)
+    metrics.risk_beta = risk_beta
 
     # Only estimate if we don't have real stats from the C++ coordinator
     # (parallel mode provides real stats, sequential mode needs estimates)
     if metrics.total_simulations == 0:
         metrics.total_simulations = metrics.total_moves * args.simulations
     if metrics.total_nn_evals == 0:
-        # Rough estimate for sequential mode
-        metrics.total_nn_evals = metrics.total_simulations // (args.search_batch // 2)
+        # Sequential mode: each simulation = one NN eval (search_batch=1 for PUCT)
+        metrics.total_nn_evals = metrics.total_simulations
 
-    return metrics
+    # Extract sample game for PGN export (if available)
+    sample_game = None
+    try:
+        sg = coordinator.get_sample_game()
+        if sg.get("has_game", False):
+            sample_game = sg
+    except Exception:
+        pass
+
+    return metrics, sample_game
 
 
 # =============================================================================
@@ -2643,19 +2010,31 @@ def train_iteration(
     batch_size: int,
     epochs: int,
     device: str,
-    scaler: GradScaler
+    scaler: GradScaler,
 ) -> dict:
     """Train for one iteration using C++ ReplayBuffer."""
     network.train()
+
+    # Check model weights for NaN/inf before training (catches corrupted checkpoints)
+    for name, p in network.named_parameters():
+        if torch.isnan(p).any() or torch.isinf(p).any():
+            return {
+                'loss': float('nan'), 'policy_loss': float('nan'),
+                'value_loss': float('nan'), 'num_batches': 0,
+                'error': f'NaN/inf in parameter: {name}'
+            }
 
     total_loss = 0
     total_policy_loss = 0
     total_value_loss = 0
     num_batches = 0
+    total_grad_norm = 0.0
+    max_grad_norm = 0.0
+    nan_skip_count = 0
 
     for epoch in range(epochs):
         # Sample batch from C++ ReplayBuffer
-        obs, policies, values = replay_buffer.sample(batch_size)
+        obs, policies, values, wdl_targets, soft_values = replay_buffer.sample(batch_size)
 
         # Convert to PyTorch tensors
         # obs is (batch, 7808) flat, need to reshape to (batch, 122, 8, 8)
@@ -2664,26 +2043,57 @@ def train_iteration(
 
         obs_tensor = torch.from_numpy(obs).to(device)
         policy_target = torch.from_numpy(policies).to(device)
-        value_target = torch.from_numpy(values).unsqueeze(1).to(device)
+        value_target = torch.from_numpy(values).to(device)  # (batch,)
+        mcts_wdl_target = torch.from_numpy(wdl_targets).to(device)  # (batch, 3)
 
         optimizer.zero_grad()
 
         with autocast('cuda', enabled=(device == "cuda")):
             # Forward pass (no mask during training - targets already masked)
-            policy_pred, value_pred = network(obs_tensor)
+            policy_pred, value_pred, policy_logits, wdl_logits = network(obs_tensor)
 
-            # Policy loss (cross-entropy)
-            policy_loss = -torch.sum(policy_target * torch.log(policy_pred + 1e-8)) / policy_pred.size(0)
+            # Policy loss: NaN-safe cross-entropy (handles 0 * -inf = NaN edge case)
+            policy_loss = -torch.sum(
+                torch.nan_to_num(policy_target * F.log_softmax(policy_logits, dim=1), nan=0.0)
+            ) / policy_logits.size(0)
 
-            # Value loss (MSE)
-            value_loss = F.mse_loss(value_pred, value_target)
+            # Value loss: soft WDL cross-entropy with pure game outcome targets
+            # Build outcome WDL from scalar game result: win→[1,0,0], draw→[0,1,0], loss→[0,0,1]
+            outcome_wdl = torch.zeros_like(mcts_wdl_target)  # (batch, 3)
+            outcome_wdl[:, 0] = (value_target > 0.5).float()    # win
+            outcome_wdl[:, 1] = ((value_target >= -0.5) & (value_target <= 0.5)).float()  # draw
+            outcome_wdl[:, 2] = (value_target < -0.5).float()   # loss
+
+            # Soft cross-entropy: NaN-safe (handles 0 * -inf = NaN edge case)
+            value_loss = -torch.sum(
+                torch.nan_to_num(outcome_wdl * F.log_softmax(wdl_logits, dim=1), nan=0.0)
+            ) / wdl_logits.size(0)
 
             # Total loss
             loss = policy_loss + value_loss
 
-        # Backward pass with mixed precision
+        # Skip batch if loss is NaN/inf (corrupted weights or bad data)
+        if torch.isnan(loss) or torch.isinf(loss):
+            nan_skip_count += 1
+            if nan_skip_count <= 3:
+                print(f"  WARNING: NaN/inf loss in batch {num_batches + nan_skip_count}")
+                if torch.isnan(policy_logits).any().item():
+                    print(f"    Model producing NaN logits (weights corrupted)")
+            optimizer.zero_grad()
+            continue
+
+        # Backward pass with mixed precision (GradScaler handles inf detection)
         scaler.scale(loss).backward()
-        scaler.step(optimizer)
+        scaler.unscale_(optimizer)
+
+        # Compute grad norm for monitoring (no clipping — avoids inf/inf = NaN trap)
+        with torch.no_grad():
+            grad_norms = [p.grad.norm(2).item() for p in network.parameters() if p.grad is not None]
+            grad_norm_val = (sum(g**2 for g in grad_norms)) ** 0.5
+        total_grad_norm += grad_norm_val
+        max_grad_norm = max(max_grad_norm, grad_norm_val)
+
+        scaler.step(optimizer)   # internally skips if unscale_ found inf
         scaler.update()
 
         total_loss += loss.item()
@@ -2691,12 +2101,24 @@ def train_iteration(
         total_value_loss += value_loss.item()
         num_batches += 1
 
-    return {
+    if num_batches == 0:
+        return {
+            'loss': float('nan'), 'policy_loss': float('nan'),
+            'value_loss': float('nan'), 'num_batches': 0,
+            'nan_skip_count': nan_skip_count,
+            'error': f'All {nan_skip_count} batches produced NaN'
+        }
+
+    result = {
         'loss': total_loss / num_batches,
         'policy_loss': total_policy_loss / num_batches,
         'value_loss': total_value_loss / num_batches,
         'num_batches': num_batches,
+        'grad_norm_avg': total_grad_norm / num_batches,
+        'grad_norm_max': max_grad_norm,
+        'nan_skip_count': nan_skip_count,
     }
+    return result
 
 
 def main():
@@ -2720,11 +2142,8 @@ Examples:
     # Resume from run directory (finds latest checkpoint)
     uv run python alphazero-cpp/scripts/train.py --resume checkpoints/f192-b15_2024-02-03_14-30-00
 
-    # Resume with buffer loading (buffer always saved; --load-buffer loads on startup)
-    uv run python alphazero-cpp/scripts/train.py --resume checkpoints/f192-b15_2024-02-03_14-30-00 --load-buffer
-
-    # Disable visualization and evaluation
-    uv run python alphazero-cpp/scripts/train.py --no-visualization --no-eval
+    # Disable visualization
+    uv run python alphazero-cpp/scripts/train.py --no-visualization
         """
     )
 
@@ -2734,41 +2153,62 @@ Examples:
     parser.add_argument("--games-per-iter", type=int, default=50,
                         help="Self-play games per iteration (default: 50)")
 
-    # MCTS parameters
+    # MCTS parameters (shared by both search algorithms)
     parser.add_argument("--simulations", type=int, default=800,
                         help="MCTS simulations per move (default: 800)")
-    parser.add_argument("--search-batch", type=int, default=1,
-                        help="Leaves per MCTS iteration per worker (default: 1, optimal for cross-game batching)")
-    parser.add_argument("--c-puct", type=float, default=1.5,
-                        help="MCTS exploration constant (default: 1.5)")
+    parser.add_argument("--search-algorithm", type=str, default="gumbel",
+                        choices=["gumbel", "puct"],
+                        help="Root search algorithm: 'gumbel' (Gumbel Top-k Sequential Halving, default) "
+                             "or 'puct' (standard AlphaZero PUCT+Dirichlet). "
+                             "search_batch is auto-derived: gumbel→gumbel_top_k, puct→1")
+    parser.add_argument("--c-explore", type=float, default=1.5,
+                        help="MCTS exploration constant for tree traversal (default: 1.5)")
+    parser.add_argument("--fpu-base", type=float, default=0.3,
+                        help="Dynamic FPU reduction. penalty = fpu_base * sqrt(1 - prior) (default: 0.3)")
     parser.add_argument("--temperature-moves", type=int, default=30,
                         help="Moves with temperature=1 for exploration (default: 30)")
 
-    # Parallel self-play (automatically enabled when workers > 1)
-    parser.add_argument("--workers", type=int, default=1,
-                        help="Self-play workers. 1=sequential, >1=parallel with cross-game batching (default: 1)")
-    parser.add_argument("--eval-batch", type=int, default=None,
-                        help="Max positions per GPU call (default: workers × search-batch, rounded to 32)")
-    parser.add_argument("--gpu-batch-timeout-ms", type=int, default=20,
-                        help="GPU batch collection timeout in ms (default: 20)")
+    # PUCT-specific (ignored when --search-algorithm gumbel)
     parser.add_argument("--dirichlet-alpha", type=float, default=0.3,
                         help="Dirichlet noise alpha for root exploration (default: 0.3)")
     parser.add_argument("--dirichlet-epsilon", type=float, default=0.25,
                         help="Dirichlet noise weight for root exploration (default: 0.25)")
+
+    # Gumbel-specific (ignored when --search-algorithm puct)
+    parser.add_argument("--gumbel-top-k", type=int, default=16,
+                        help="Initial m for Gumbel Sequential Halving; also sets search_batch (default: 16)")
+    parser.add_argument("--gumbel-c-visit", type=float, default=50.0,
+                        help="Gumbel sigma() visit constant (default: 50.0)")
+    parser.add_argument("--gumbel-c-scale", type=float, default=1.0,
+                        help="Gumbel sigma() scale factor (default: 1.0)")
+
+    # Parallel self-play
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Self-play workers. 1=sequential, >1=parallel with cross-game batching (default: 1)")
+    parser.add_argument("--gpu-batch-timeout-ms", type=int, default=20,
+                        help="GPU batch collection timeout in ms (default: 20)")
     parser.add_argument("--worker-timeout-ms", type=int, default=2000,
                         help="Worker wait time for NN results in ms (default: 2000)")
     parser.add_argument("--queue-capacity", type=int, default=0,
-                        help="Eval queue capacity. 0=auto-calculate from workers*search_batch*8 (default: 0)")
+                        help="Eval queue capacity. 0=auto-calculate (default: 0)")
     parser.add_argument("--root-eval-retries", type=int, default=3,
                         help="Max retries for root NN evaluation before falling back to uniform (default: 3)")
-    parser.add_argument("--draw-score", type=float, default=0.0,
-                        help="Draw value from White's perspective. -0.5 = penalize White draws (default: 0.0)")
+
+    # Risk / ERM
+    parser.add_argument("--risk-beta", type=float, default=0.0,
+                        help="ERM risk sensitivity. >0 risk-seeking, <0 risk-averse, 0=neutral. Range [-3,3] (default: 0.0)")
+    parser.add_argument("--opponent-risk", type=str, default=None,
+                        help="Per-game opponent risk range MIN:MAX (e.g. '0.5:2.0'). "
+                             "MIN can equal MAX for a fixed opponent risk. "
+                             "Each game: one side uses --risk-beta, the other samples from U(min,max).")
 
     # Network parameters
     parser.add_argument("--filters", type=int, default=192,
                         help="Network filters (default: 192)")
     parser.add_argument("--blocks", type=int, default=15,
                         help="Residual blocks (default: 15)")
+    parser.add_argument("--se-reduction", type=int, default=16,
+                        help="SE block reduction ratio (default: 16)")
 
     # Training parameters
     parser.add_argument("--train-batch", type=int, default=256,
@@ -2777,8 +2217,13 @@ Examples:
                         help="Learning rate (default: 0.001)")
     parser.add_argument("--epochs", type=int, default=5,
                         help="Training epochs per iteration (default: 5)")
+    # --no-wdl removed: WDL is always enabled
     parser.add_argument("--buffer-size", type=int, default=100000,
                         help="Replay buffer size (default: 100000)")
+    parser.add_argument("--max-fillup-factor", type=int, default=3,
+                        help="Max multiplier for extra fill-up games (default: 3). "
+                             "Fill-up plays at most N * games_per_iter extra games. "
+                             "Set to 0 to disable fill-up entirely.")
 
     # Device and paths
     parser.add_argument("--device", type=str, default="cuda",
@@ -2787,25 +2232,33 @@ Examples:
                         help="Base checkpoint directory (default: checkpoints)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume from checkpoint path (.pt file) or run directory")
-    parser.add_argument("--save-interval", type=int, default=5,
-                        help="Save checkpoint every N iterations (default: 5)")
+    parser.add_argument("--save-interval", type=int, default=1,
+                        help="Save checkpoint every N iterations (default: 1)")
     parser.add_argument("--progress-interval", type=float, default=30.0,
                         help="Print progress statistics every N seconds (default: 30)")
 
-    # Buffer loading (buffer is always saved; this controls loading)
-    parser.add_argument("--load-buffer", nargs='?', const='', default=None,
-                        help="Load replay buffer on startup. No arg: check run dir. With path: load from path.")
-
-    # Visualization and evaluation
+    # Visualization and output
     parser.add_argument("--no-visualization", action="store_true",
                         help="Disable summary.html generation (default: enabled)")
-    parser.add_argument("--no-eval", action="store_true",
-                        help="Skip evaluation before checkpoint save (default: enabled)")
+    parser.add_argument("--no-sample-games", action="store_true",
+                        help="Disable saving sample game PGN after each iteration (default: enabled)")
     parser.add_argument("--live", action="store_true",
                         help="Enable LIVE web dashboard with real-time updates (requires flask)")
     parser.add_argument("--dashboard-port", type=int, default=5000,
                         help="Port for live dashboard server (default: 5000)")
+    parser.add_argument("--claude", action="store_true",
+                        help="Enable Claude Code agent integration (writes claude_log.jsonl to run_dir)")
+    parser.add_argument("--claude-timeout", type=int, default=600,
+                        help="Seconds to wait for Claude review before auto-continuing (default: 600). "
+                             "Set to 0 to disable blocking (async mode).")
+
     args = parser.parse_args()
+
+    # Derive search_batch from search algorithm (no longer user-facing)
+    if args.search_algorithm == "gumbel":
+        args.search_batch = args.gumbel_top_k
+    else:  # puct
+        args.search_batch = 1
 
     # Install last-resort crash hook to ensure errors are visible
     def _crash_hook(exc_type, exc_value, exc_tb):
@@ -2815,11 +2268,40 @@ Examples:
         sys.stderr.flush()
     sys.excepthook = _crash_hook
 
-    # Auto-compute eval-batch if not specified
-    if args.eval_batch is None:
-        args.eval_batch = ((args.workers * args.search_batch + 31) // 32) * 32
-        args.eval_batch = max(args.eval_batch, 32)  # Minimum 32
-        print(f"  Auto-setting eval-batch={args.eval_batch} (workers × search_batch, rounded to 32)")
+    # Parse --opponent-risk MIN:MAX
+    if args.opponent_risk:
+        parts = args.opponent_risk.split(":")
+        if len(parts) != 2:
+            parser.error("--opponent-risk must be MIN:MAX (e.g. '0.5:2.0' or '1.0:1.0')")
+        args.opponent_risk_min = float(parts[0])
+        args.opponent_risk_max = float(parts[1])
+        if args.opponent_risk_min > args.opponent_risk_max:
+            parser.error("--opponent-risk MIN must be <= MAX")
+        if args.opponent_risk_min == args.opponent_risk_max:
+            # Add epsilon so C++ min < max check passes; sampled value is effectively MIN
+            args.opponent_risk_max = args.opponent_risk_min + 1e-8
+    else:
+        args.opponent_risk_min = 0.0
+        args.opponent_risk_max = 0.0
+
+    # Force save_interval=1 in Claude mode (every iteration gets a checkpoint)
+    if args.claude and args.save_interval != 1:
+        print(f"  [Claude] Overriding save_interval={args.save_interval} -> 1 (checkpoint every iteration)")
+        args.save_interval = 1
+
+    # Auto-compute eval_batch (GPU-effective batch size)
+    # AlphaZeroNet.forward() doubles via horizontal mirror equivariance,
+    # so effective GPU batch = input_positions × mirror_factor.
+    mirror_factor = 2 if hasattr(AlphaZeroNet, '_mirror_input') else 1
+    input_batch_size = ((args.workers * args.search_batch + 31) // 32) * 32
+    input_batch_size = max(input_batch_size, 32)
+    args.eval_batch = input_batch_size * mirror_factor  # GPU-effective
+    args.input_batch_size = input_batch_size             # for C++ queue / CUDA graphs
+    if mirror_factor > 1:
+        print(f"  eval_batch={args.eval_batch} GPU-effective "
+              f"({input_batch_size} input × {mirror_factor} mirror)")
+    else:
+        print(f"  eval_batch={args.eval_batch} (workers × search_batch, rounded to 32)")
 
     # Validate parameter relationships for parallel mode
     if args.workers > 1:
@@ -2834,10 +2316,13 @@ Examples:
     else:
         device = args.device
 
-    # Enable cuDNN optimizations for faster convolutions
+    # Enable cuDNN and TF32 optimizations for faster convolutions/matmuls
     if device == "cuda":
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
 
     # ==========================================================================
     # Run Directory Setup
@@ -2845,7 +2330,6 @@ Examples:
     # Determine run directory: either resume from existing or create new
     start_iter = 0
     metrics_history = {"iterations": [], "config": {}}
-    eval_history = {"evaluations": []}
 
     if args.resume:
         # Resume from existing run
@@ -2858,23 +2342,16 @@ Examples:
             sys.exit(1)
         print(f"Resuming from: {run_dir}", flush=True)
 
-        # Load existing metrics and evaluation history
+        # Load existing metrics history
         print("  Loading metrics history...", end=" ", flush=True)
         metrics_history = load_metrics_history(run_dir)
         print(f"done ({len(metrics_history['iterations'])} iterations)", flush=True)
-
-        print("  Loading eval history...", end=" ", flush=True)
-        eval_history = load_eval_history(run_dir)
-        print(f"done ({len(eval_history['evaluations'])} evaluations)", flush=True)
     else:
         # Create new run directory
         os.makedirs(args.save_dir, exist_ok=True)
         run_dir = create_run_directory(args.save_dir, args.filters, args.blocks)
         checkpoint_path = None
         print(f"Created run directory: {run_dir}")
-
-    # Buffer path is inside run directory (if persistence enabled)
-    buffer_path = os.path.join(run_dir, "replay_buffer.rpbf")
 
     # Store config in metrics history
     config = {
@@ -2898,60 +2375,59 @@ Examples:
     print(f"Device:              {device}" + (f" ({torch.cuda.get_device_name(0)})" if device == "cuda" else ""))
     print(f"Network:             {args.filters} filters x {args.blocks} blocks")
     print(f"Input channels:      {INPUT_CHANNELS}")
-    print(f"MCTS:                {args.simulations} sims, search_batch={args.search_batch}, c_puct={args.c_puct}")
+    print(f"MCTS:                {args.simulations} sims, c_explore={args.c_explore}, fpu_base={args.fpu_base}")
+    if args.search_algorithm == "gumbel":
+        print(f"Root search:         Gumbel Top-k SH (top_k={args.gumbel_top_k}, c_visit={args.gumbel_c_visit}, c_scale={args.gumbel_c_scale})")
+    else:
+        print(f"Root search:         PUCT + Dirichlet (alpha={args.dirichlet_alpha}, eps={args.dirichlet_epsilon})")
     if args.workers > 1:
-        print(f"Self-play:           Parallel ({args.workers} workers, eval_batch={args.eval_batch})")
+        print(f"Self-play:           Parallel ({args.workers} workers, "
+              f"eval_batch={args.eval_batch} GPU-effective, input={args.input_batch_size})")
     else:
         print(f"Self-play:           Sequential")
     print(f"Training:            {args.iterations} iters x {args.games_per_iter} games")
     print(f"                     train_batch={args.train_batch}, lr={args.lr}, epochs={args.epochs}")
-    print(f"Buffer:              {args.buffer_size} positions (always saved" + (", loading enabled)" if args.load_buffer is not None else ")"))
+    print(f"Value head:          WDL (soft cross-entropy), risk_beta={args.risk_beta}")
+    if args.opponent_risk:
+        print(f"Opponent risk:       {args.opponent_risk}")
+    print(f"Buffer:              {args.buffer_size} positions")
     print(f"Checkpoints:         model_iter_*.pt (every {args.save_interval} iters)")
     print(f"Visualization:       {'disabled' if args.no_visualization else 'summary.html'}")
-    print(f"Evaluation:          {'disabled' if args.no_eval else 'enabled (vs_random + endgame)'}")
     print(f"Progress reports:    Every {args.progress_interval:.0f} seconds")
     print("=" * 70)
 
     # Create network
-    network = AlphaZeroNet(num_filters=args.filters, num_blocks=args.blocks, input_channels=INPUT_CHANNELS)
+    network = AlphaZeroNet(num_filters=args.filters, num_blocks=args.blocks,
+                           input_channels=INPUT_CHANNELS, wdl=True,
+                           se_reduction=args.se_reduction)
     network = network.to(device)
 
     num_params = sum(p.numel() for p in network.parameters())
     print(f"Network parameters:  {num_params:,}")
 
-    # Create optimizer and scaler
-    optimizer = optim.Adam(network.parameters(), lr=args.lr, weight_decay=1e-4)
+    # Log initial WDL behavior (sanity check for fresh networks)
+    with torch.no_grad():
+        dummy = torch.randn(1, INPUT_CHANNELS, 8, 8, device=device)
+        _, _, _, wdl = network(dummy)
+        wdl_p = F.softmax(wdl, dim=1)
+        print(f"  Initial WDL distribution: {wdl_p.cpu().numpy().round(3)}")
+
+    # Create optimizer with weight decay excluded from BN and bias parameters.
+    # BN gamma/beta and all bias params are 1D and shouldn't be L2-penalized —
+    # penalizing the 1-filter BN bottleneck in the value head caused WDL collapse.
+    no_decay_keywords = ['bn', 'bias']
+    decay_params = [p for n, p in network.named_parameters()
+                    if not any(kw in n for kw in no_decay_keywords)]
+    no_decay_params = [p for n, p in network.named_parameters()
+                       if any(kw in n for kw in no_decay_keywords)]
+    optimizer = optim.Adam([
+        {'params': decay_params, 'weight_decay': 1e-4},
+        {'params': no_decay_params, 'weight_decay': 0.0},
+    ], lr=args.lr)
     scaler = GradScaler('cuda', enabled=(device == "cuda"))
 
     # Create C++ ReplayBuffer
     replay_buffer = alphazero_cpp.ReplayBuffer(capacity=args.buffer_size)
-
-    # Load existing replay buffer if --load-buffer specified
-    if args.load_buffer is not None:
-        # Determine load path
-        if args.load_buffer == '':
-            # No path specified, use run directory
-            load_path = buffer_path
-        elif os.path.isdir(args.load_buffer):
-            # Directory specified, look for buffer file inside
-            load_path = os.path.join(args.load_buffer, "replay_buffer.rpbf")
-        else:
-            # Direct file path specified
-            load_path = args.load_buffer
-
-        if os.path.exists(load_path):
-            file_size_mb = os.path.getsize(load_path) / (1024 * 1024)
-            print(f"\nLoading replay buffer: {load_path} ({file_size_mb:.1f} MB)...", flush=True)
-            import time as _time
-            _load_start = _time.time()
-            if replay_buffer.load(load_path):
-                stats = replay_buffer.get_stats()
-                _load_elapsed = _time.time() - _load_start
-                print(f"  Loaded {stats['size']:,} samples in {_load_elapsed:.1f}s", flush=True)
-            else:
-                print("  Failed to load replay buffer, starting fresh", flush=True)
-        else:
-            print(f"\nWARNING: Replay buffer not found at {load_path}, starting fresh", flush=True)
 
     # Resume from checkpoint (load model weights)
     if checkpoint_path and os.path.exists(checkpoint_path):
@@ -2961,11 +2437,31 @@ Examples:
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         print("done", flush=True)
         print("  Loading model weights...", end=" ", flush=True)
-        network.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint['model_state_dict']
+        ckpt_wdl = checkpoint.get('config', {}).get('wdl', False)
+
+        if not ckpt_wdl:
+            # Migrate scalar value head → WDL: win=old, draw=zeros, loss=-old
+            old_w = state_dict['value_head.fc2.weight']  # (1, 256)
+            old_b = state_dict['value_head.fc2.bias']    # (1,)
+            new_w = torch.zeros(3, old_w.shape[1])
+            new_w[0] = old_w[0]       # win
+            new_w[2] = -old_w[0]      # loss (negated)
+            new_b = torch.zeros(3)
+            new_b[0] = old_b[0]
+            new_b[2] = -old_b[0]
+            state_dict['value_head.fc2.weight'] = new_w
+            state_dict['value_head.fc2.bias'] = new_b
+            print("migrated scalar→WDL...", end=" ", flush=True)
+
+        network.load_state_dict(state_dict)
         print("done", flush=True)
-        print("  Loading optimizer state...", end=" ", flush=True)
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        print("done", flush=True)
+        if not ckpt_wdl:
+            print("  Skipping optimizer state (incompatible after scalar→WDL migration)")
+        else:
+            print("  Loading optimizer state...", end=" ", flush=True)
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print("done", flush=True)
         start_iter = checkpoint.get('iteration', 0)
 
         # Emergency checkpoints saved mid-iteration — re-run that iteration
@@ -2975,17 +2471,27 @@ Examples:
             print(f"Emergency checkpoint detected — will re-train iteration {start_iter + 1}")
         print(f"Resumed from iteration {start_iter}")
 
-        # Truncate metrics/eval history to discard records from reverted iterations
-        metrics_removed, eval_removed = truncate_history_to_iteration(
-            metrics_history, eval_history, start_iter
-        )
-        if metrics_removed > 0 or eval_removed > 0:
+        # Try to load replay buffer from .rpbf file
+        import glob as glob_mod
+        rpbf_files = sorted(glob_mod.glob(os.path.join(run_dir, "buffer_iter_*.rpbf")))
+        if rpbf_files:
+            latest_rpbf = rpbf_files[-1]
+            print(f"  Loading replay buffer: {latest_rpbf}...", end=" ", flush=True)
+            if replay_buffer.load(latest_rpbf):
+                comp = replay_buffer.get_composition()
+                print(f"done ({replay_buffer.size()} samples, "
+                      f"W={comp['wins']} D={comp['draws']} L={comp['losses']})")
+            else:
+                print("FAILED (starting with empty buffer)")
+        else:
+            print("  No replay buffer file found (starting with empty buffer)")
+
+        # Truncate metrics history to discard records from reverted iterations
+        metrics_removed = truncate_history_to_iteration(metrics_history, start_iter)
+        if metrics_removed > 0:
             print(f"  Truncated metrics: kept {len(metrics_history['iterations'])} of "
                   f"{len(metrics_history['iterations']) + metrics_removed} records")
-            print(f"  Truncated evals:   kept {len(eval_history['evaluations'])} of "
-                  f"{len(eval_history['evaluations']) + eval_removed} records")
             save_metrics_history(run_dir, metrics_history)
-            save_eval_history(run_dir, eval_history)
 
     # Create evaluator and self-play (only needed for sequential mode)
     evaluator = None
@@ -2996,9 +2502,8 @@ Examples:
             evaluator=evaluator,
             num_simulations=args.simulations,
             mcts_batch_size=args.search_batch,
-            c_puct=args.c_puct,
+            c_puct=args.c_explore,  # C++ binding kwarg stays c_puct
             temperature_moves=args.temperature_moves,
-            draw_score=args.draw_score
         )
 
     # Metrics tracker (for console output)
@@ -3006,16 +2511,130 @@ Examples:
     metrics_tracker = MetricsTracker()
     print("done", flush=True)
 
-    # Visual dashboard (optional - saves to HTML files in run_dir)
-    # Note: The old dashboard is deprecated; we now generate summary.html directly
-    print("Initializing dashboard...", end=" ", flush=True)
-    dashboard = TrainingDashboard(
-        output_dir=run_dir,  # Dashboard files go in run directory
-        update_interval=1
-    )
-    print("done", flush=True)
-
     # Live dashboard (optional - real-time web server)
+    def collect_dashboard_params():
+        """Collect current training parameters for dashboard display."""
+        return {
+            'lr': args.lr, 'train_batch': args.train_batch, 'epochs': args.epochs,
+            'simulations': args.simulations, 'c_explore': args.c_explore,
+            'risk_beta': args.risk_beta, 'temperature_moves': args.temperature_moves,
+            'dirichlet_alpha': args.dirichlet_alpha,
+            'dirichlet_epsilon': args.dirichlet_epsilon, 'fpu_base': args.fpu_base,
+            'opponent_risk_min': args.opponent_risk_min,
+            'opponent_risk_max': args.opponent_risk_max,
+            'games_per_iter': args.games_per_iter,
+            'max_fillup_factor': args.max_fillup_factor,
+            'save_interval': args.save_interval,
+            'search_algorithm': args.search_algorithm,
+            'gumbel_top_k': args.gumbel_top_k,
+            'gumbel_c_visit': args.gumbel_c_visit,
+            'gumbel_c_scale': args.gumbel_c_scale,
+        }
+
+    # Parameter type/range spec for control file validation (shared with dashboard)
+    PARAM_SPEC = {
+        'lr': (float, 1e-6, 1.0),
+        'train_batch': (int, 16, 8192),
+        'epochs': (int, 1, 100),
+        'simulations': (int, 50, 10000),
+        'c_explore': (float, 0.1, 10.0),
+        'risk_beta': (float, -3.0, 3.0),
+        'temperature_moves': (int, 0, 200),
+        'dirichlet_alpha': (float, 0.01, 2.0),
+        'dirichlet_epsilon': (float, 0.0, 1.0),
+        'fpu_base': (float, 0.0, 2.0),
+        'opponent_risk_min': (float, -3.0, 3.0),
+        'opponent_risk_max': (float, -3.0, 3.0),
+        'games_per_iter': (int, 1, 10000),
+        'max_fillup_factor': (int, 0, 100),
+        'save_interval': (int, 1, 1000),
+        'gumbel_top_k': (int, 1, 64),
+        'gumbel_c_visit': (float, 1.0, 1000.0),
+        'gumbel_c_scale': (float, 0.01, 10.0),
+    }
+
+    def log_current_settings():
+        """Print all current training settings in structured format for LLM consumption."""
+        print(f"\n{'='*70}")
+        print(f"SETTINGS (iteration {iteration + 1}/{args.iterations})")
+        print(f"{'='*70}")
+        print(f"  Search:    simulations={args.simulations}, c_explore={args.c_explore:g}, "
+              f"fpu_base={args.fpu_base:g}")
+        print(f"  Explore:   dirichlet_alpha={args.dirichlet_alpha:g}, "
+              f"dirichlet_epsilon={args.dirichlet_epsilon:g}, temperature_moves={args.temperature_moves}")
+        print(f"  Risk:      risk_beta={args.risk_beta:g}")
+        print(f"  Training:  lr={args.lr:.2e}, train_batch={args.train_batch}, epochs={args.epochs}")
+        print(f"  Self-play: games_per_iter={args.games_per_iter}, workers={args.workers}, "
+              f"max_fillup_factor={args.max_fillup_factor}")
+        if args.opponent_risk_min != 0.0 or args.opponent_risk_max != 0.0:
+            print(f"  Opponent:  risk={args.opponent_risk or f'{args.opponent_risk_min:g}:{args.opponent_risk_max:g}'}")
+        print(f"{'='*70}")
+
+    def poll_control_file(phase_label):
+        """Check for parameter updates from external LLM tuner via control file.
+
+        Protocol: Claude Code writes to param_updates.json.tmp then renames to
+        param_updates.json for atomic delivery (prevents partial-read race).
+        """
+        control_path = os.path.join(run_dir, "param_updates.json")
+        if not os.path.exists(control_path):
+            return
+        try:
+            with open(control_path, 'r') as f:
+                data = json.load(f)
+            # Delete after successful parse to prevent re-processing
+            os.remove(control_path)
+        except json.JSONDecodeError as e:
+            # File might be mid-write (non-atomic); skip and retry next poll
+            print(f"  [LLM@{phase_label}] Skipping malformed control file: {e}")
+            return
+        except OSError as e:
+            print(f"  [LLM@{phase_label}] Error reading control file: {e}")
+            return
+
+        reason = data.pop('_reason', '')
+        # Skip all keys starting with '_' (metadata)
+        param_data = {k: v for k, v in data.items() if not k.startswith('_')}
+        if not param_data:
+            return
+
+        print(f"\n  [LLM@{phase_label}] Parameter update from control file:")
+        if reason:
+            print(f"  [LLM@{phase_label}] Reason: {reason}")
+        for key, value in param_data.items():
+            if key not in PARAM_SPEC:
+                print(f"  [LLM@{phase_label}] WARNING: Unknown parameter '{key}', skipped")
+                continue
+            # Type-cast and clamp to valid range
+            ptype, pmin, pmax = PARAM_SPEC[key]
+            try:
+                typed_value = ptype(value)
+                clamped = max(pmin, min(pmax, typed_value))
+            except (ValueError, TypeError) as e:
+                print(f"  [LLM@{phase_label}] WARNING: {key}={value} invalid ({e}), skipped")
+                continue
+            old = getattr(args, key)
+            setattr(args, key, clamped)
+            if key == 'lr':
+                for pg in optimizer.param_groups:
+                    pg['lr'] = clamped
+            if clamped != typed_value:
+                print(f"  [LLM@{phase_label}] {key}: {old} -> {clamped} (clamped from {typed_value})")
+            else:
+                print(f"  [LLM@{phase_label}] {key}: {old} -> {clamped}")
+
+        # Update dashboard if running
+        if live_dashboard is not None:
+            live_dashboard.set_current_params(collect_dashboard_params())
+
+        # Log parameter change to Claude JSONL
+        if claude_iface is not None:
+            claude_iface._append_jsonl({
+                "type": "param_change",
+                "changes": {k: getattr(args, k) for k in param_data if k in PARAM_SPEC},
+                "reason": reason,
+            })
+
     live_dashboard = None
     if args.live:
         print("\nInitializing LIVE dashboard server...", flush=True)
@@ -3024,6 +2643,7 @@ Examples:
             live_dashboard = LiveDashboardServer(port=args.dashboard_port)
             if live_dashboard.start(total_iterations=args.iterations, open_browser=True):
                 print(f"  Real-time updates via WebSocket", flush=True)
+                live_dashboard.set_current_params(collect_dashboard_params())
             else:
                 live_dashboard = None
         except ImportError as e:
@@ -3031,12 +2651,39 @@ Examples:
             print(f"  Install requirements: pip install flask flask-socketio", flush=True)
             live_dashboard = None
 
+    claude_iface = None
+    if args.claude:
+        try:
+            from claude_interface import ClaudeInterface
+            claude_iface = ClaudeInterface(run_dir, resume=bool(args.resume))
+            claude_iface.write_header(args, {
+                'input_channels': INPUT_CHANNELS,
+                'num_filters': args.filters,
+                'num_blocks': args.blocks,
+                'num_actions': POLICY_SIZE,
+                'se_reduction': args.se_reduction,
+            }, start_iter)
+            print(f"  Claude Code integration: {os.path.join(run_dir, 'claude_log.jsonl')}")
+        except ImportError as e:
+            print(f"  WARNING: Could not import claude_interface: {e}")
+            claude_iface = None
+
     print("\n" + "=" * 60, flush=True)
     print("INITIALIZATION COMPLETE - Starting training...", flush=True)
     print("=" * 60 + "\n", flush=True)
 
+    # Print run directory and control file paths for LLM tuner
+    print(f"\n{'*'*70}")
+    print(f"Run directory: {run_dir}")
+    print(f"Control file:  {os.path.join(run_dir, 'param_updates.json')}")
+    print(f"Stop file:     {os.path.join(run_dir, 'stop')}")
+    if claude_iface is not None:
+        print(f"Review file:   {os.path.join(run_dir, 'awaiting_review')}")
+    print(f"{'*'*70}\n")
+
     # Install graceful shutdown handler
     shutdown_handler.install_handler()
+    shutdown_handler.stop_file_path = os.path.join(run_dir, "stop")
 
     # Emergency save function
     def emergency_save(iteration_num: int, reason: str):
@@ -3060,6 +2707,8 @@ Examples:
                 'value_filters': 1,
                 'value_hidden': 256,
                 'simulations': args.simulations,
+                'wdl': True,
+                'se_reduction': args.se_reduction,
             },
             'backend': 'cpp',
             'version': '2.0',
@@ -3067,17 +2716,75 @@ Examples:
         }, emergency_path)
         print(f"  Saved checkpoint: {emergency_path}")
 
-        # Save replay buffer (always save for emergency recovery)
-        if replay_buffer.save(buffer_path):
-            stats = replay_buffer.get_stats()
-            print(f"  Saved replay buffer: {buffer_path} ({stats['size']:,} samples)")
-
         # Save metrics history
         save_metrics_history(run_dir, metrics_history)
-        save_eval_history(run_dir, eval_history)
         print(f"  Saved metrics to: {run_dir}")
 
+        # Save Claude resume summary (if enabled)
+        if claude_iface is not None:
+            try:
+                resume_path = claude_iface.write_resume_summary(
+                    args, iteration_num, args.iterations,
+                    buffer_stats=get_buffer_stats(),
+                    shutdown_reason=reason,
+                )
+                print(f"  Saved Claude resume summary: {resume_path}")
+                claude_iface._append_jsonl({
+                    "type": "shutdown",
+                    "iteration": iteration_num,
+                    "reason": reason,
+                    "timestamp": datetime.now().isoformat(),
+                })
+            except Exception as e:
+                print(f"  WARNING: Could not save Claude resume state: {e}")
+
         print(f"{'=' * 70}\n")
+
+    def get_total_buffer_size():
+        return replay_buffer.size()
+
+    def get_buffer_stats():
+        """Get buffer statistics for Claude resume summary."""
+        comp = replay_buffer.get_composition()
+        return {
+            "total_size": replay_buffer.size(),
+            "capacity": replay_buffer.capacity(),
+            "wins": comp["wins"],
+            "draws": comp["draws"],
+            "losses": comp["losses"],
+        }
+
+    def check_training_ready():
+        """Check if buffer has enough samples for training."""
+        return replay_buffer.size() > 0
+
+    def fillup_reason():
+        """Return a human-readable reason why check_training_ready() is False."""
+        return f"buffer empty ({replay_buffer.size()} samples)"
+
+    # Save initial (random) model as iter0 for fresh runs
+    if start_iter == 0:
+        iter0_path = os.path.join(run_dir, "model_iter_000.pt")
+        torch.save({
+            'iteration': 0,
+            'model_state_dict': network.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'config': {
+                'input_channels': INPUT_CHANNELS,
+                'num_filters': args.filters,
+                'num_blocks': args.blocks,
+                'num_actions': POLICY_SIZE,
+                'policy_filters': 2,
+                'value_filters': 1,
+                'value_hidden': 256,
+                'simulations': args.simulations,
+                'wdl': True,
+                'se_reduction': args.se_reduction,
+            },
+            'backend': 'cpp',
+            'version': '2.0'
+        }, iter0_path)
+        print(f"Saved initial model: {iter0_path}")
 
     # Training loop (wrapped in try/except to catch and report any crash)
     iteration = start_iter  # Track for emergency save on crash
@@ -3091,7 +2798,76 @@ Examples:
             emergency_save(iteration, "Shutdown requested before iteration")
             break
 
+        # Apply any parameter changes from the live dashboard
+        def apply_dashboard_updates(phase_label):
+            if live_dashboard is None:
+                return
+            updates, meta = live_dashboard.poll_updates()
+            if not updates:
+                return
+            for key, value in updates.items():
+                old = getattr(args, key, None)
+                setattr(args, key, value)
+                # LR special case: update optimizer param groups directly
+                if key == 'lr':
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = value
+                key_meta = meta.get(key, {})
+                reason = key_meta.get('reason', '')
+                reason_str = f" | {reason}" if reason else ""
+                print(f"    [Dashboard@{phase_label}] {key}: {old} -> {value}{reason_str}")
+            live_dashboard.set_current_params(collect_dashboard_params())
+            live_dashboard.socketio.emit('params_applied', {
+                'iteration': iteration + 1,
+                'applied': list(updates.keys()),
+                'phase': phase_label,
+            })
+
+        def check_export_request():
+            if live_dashboard is None:
+                return
+            if not live_dashboard.poll_export_request():
+                return
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"model_export_iter{iteration + 1:03d}_{timestamp}.pt"
+            export_path = os.path.join(run_dir, filename)
+            try:
+                torch.save({
+                    'iteration': iteration + 1,
+                    'model_state_dict': network.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'config': {
+                        'input_channels': INPUT_CHANNELS,
+                        'num_filters': args.filters,
+                        'num_blocks': args.blocks,
+                        'num_actions': POLICY_SIZE,
+                        'policy_filters': 2,
+                        'value_filters': 1,
+                        'value_hidden': 256,
+                        'simulations': args.simulations,
+                        'wdl': True,
+                        'se_reduction': args.se_reduction,
+                    },
+                    'backend': 'cpp',
+                    'version': '2.0'
+                }, export_path)
+                print(f"  [Export] Saved: {export_path}")
+                live_dashboard.socketio.emit('export_complete', {
+                    'status': 'saved', 'filename': filename
+                })
+            except Exception as e:
+                print(f"  [Export] FAILED: {e}")
+                live_dashboard.socketio.emit('export_complete', {
+                    'status': 'error', 'error': str(e)
+                })
+
+        log_current_settings()
+        poll_control_file('self-play')
+        apply_dashboard_updates('self-play')
+        check_export_request()
+
         # Self-play phase
+        replay_buffer.set_iteration(iteration + 1)  # Tag samples with current iteration
         print(f"Iteration {iteration + 1}/{args.iterations}")
         print(f"  Self-play: generating {args.games_per_iter} games...")
 
@@ -3101,13 +2877,13 @@ Examples:
             # ================================================================
             # Uses ParallelSelfPlayCoordinator for high GPU utilization
             # All games run concurrently, NN evals batched across games
-            parallel_metrics = run_parallel_selfplay(
+            parallel_metrics, sample_game = run_parallel_selfplay(
                 network=network,
                 replay_buffer=replay_buffer,
                 device=device,
                 args=args,
                 iteration=iteration + 1,  # 1-indexed for display
-                live_dashboard=live_dashboard
+                live_dashboard=live_dashboard,
             )
             metrics.num_games = parallel_metrics.num_games
             metrics.total_moves = parallel_metrics.total_moves
@@ -3116,8 +2892,77 @@ Examples:
             metrics.white_wins = parallel_metrics.white_wins
             metrics.black_wins = parallel_metrics.black_wins
             metrics.draws = parallel_metrics.draws
+            metrics.draws_repetition = parallel_metrics.draws_repetition
+            metrics.draws_stalemate = parallel_metrics.draws_stalemate
+            metrics.draws_fifty_move = parallel_metrics.draws_fifty_move
+            metrics.draws_insufficient = parallel_metrics.draws_insufficient
+            metrics.draws_max_moves = parallel_metrics.draws_max_moves
+            metrics.draws_early_repetition = parallel_metrics.draws_early_repetition
+            metrics.standard_wins = parallel_metrics.standard_wins
+            metrics.opponent_wins = parallel_metrics.opponent_wins
+            metrics.asymmetric_draws = parallel_metrics.asymmetric_draws
             metrics.selfplay_time = parallel_metrics.selfplay_time
-            metrics.avg_game_length = parallel_metrics.avg_game_length
+            metrics.risk_beta = parallel_metrics.risk_beta
+
+            # Fill-up: play additional batches if buffer not ready (capped)
+            fillup_rounds = 0
+            while not check_training_ready() and not shutdown_handler.should_stop():
+                if fillup_rounds >= args.max_fillup_factor:
+                    print(f"  WARNING: Buffer not ready after {fillup_rounds} extra rounds "
+                          f"({fillup_rounds * args.games_per_iter} games), training with available data")
+                    break
+                print(f"  Buffer fill-up: {fillup_reason()}, playing {args.games_per_iter} more games...")
+                extra_metrics, _ = run_parallel_selfplay(
+                    network=network,
+                    replay_buffer=replay_buffer,
+                    device=device,
+                    args=args,
+                    iteration=iteration + 1,
+                    live_dashboard=live_dashboard,
+                )
+                metrics.num_games += extra_metrics.num_games
+                metrics.total_moves += extra_metrics.total_moves
+                metrics.total_simulations += extra_metrics.total_simulations
+                metrics.total_nn_evals += extra_metrics.total_nn_evals
+                metrics.white_wins += extra_metrics.white_wins
+                metrics.black_wins += extra_metrics.black_wins
+                metrics.draws += extra_metrics.draws
+                metrics.draws_repetition += extra_metrics.draws_repetition
+                metrics.draws_stalemate += extra_metrics.draws_stalemate
+                metrics.draws_fifty_move += extra_metrics.draws_fifty_move
+                metrics.draws_insufficient += extra_metrics.draws_insufficient
+                metrics.draws_max_moves += extra_metrics.draws_max_moves
+                metrics.draws_early_repetition += extra_metrics.draws_early_repetition
+                metrics.standard_wins += extra_metrics.standard_wins
+                metrics.opponent_wins += extra_metrics.opponent_wins
+                metrics.asymmetric_draws += extra_metrics.asymmetric_draws
+                metrics.selfplay_time += extra_metrics.selfplay_time
+                fillup_rounds += 1
+
+            metrics.avg_game_length = metrics.total_moves / max(metrics.num_games, 1)
+
+            # Save sample game as PGN
+            if not args.no_sample_games and sample_game is not None:
+                save_sample_game_pgn(
+                    run_dir, iteration + 1,
+                    sample_game["moves"],
+                    sample_game["result"],
+                    sample_game["num_moves"]
+                )
+
+            # Print sample game to console for LLM consumption
+            if sample_game is not None:
+                result = sample_game.get("result", "?")
+                n_moves = sample_game.get("num_moves", 0)
+                reason = sample_game.get("result_reason", "")
+                reason_str = f" ({reason})" if reason else ""
+                moves = sample_game.get("moves", [])
+                if len(moves) <= 30:
+                    move_str = " ".join(moves)
+                else:
+                    move_str = " ".join(moves[:20]) + f" ... ({len(moves)-25} moves) ... " + " ".join(moves[-5:])
+                print(f"  Sample Game: {result} in {n_moves} moves{reason_str}")
+                print(f"    Moves: {move_str}")
         else:
             # ================================================================
             # SEQUENTIAL SELF-PLAY (Original)
@@ -3126,6 +2971,7 @@ Examples:
             network.eval()
             selfplay_start = time.time()
             games_completed = 0
+            seq_sample_game = None  # Track a sample game for PGN export
 
             # Initialize progress reporter for this iteration
             progress = ProgressReporter(interval=args.progress_interval)
@@ -3134,14 +2980,39 @@ Examples:
             last_live_update = time.time()
             live_update_interval = 5.0  # seconds
 
-            for game_idx in range(args.games_per_iter):
+            game_idx = 0
+            filling_buffer = False
+            max_fillup_games = args.games_per_iter * args.max_fillup_factor
+            while True:
+                if game_idx >= args.games_per_iter:
+                    if check_training_ready():
+                        break
+                    if game_idx >= args.games_per_iter + max_fillup_games:
+                        print(f"  WARNING: Buffer not ready after {game_idx} games "
+                              f"(cap: {max_fillup_games} extra), training with available data")
+                        break
+                    if not filling_buffer:
+                        filling_buffer = True
+                        print(f"  Buffer fill-up: {fillup_reason()}, playing additional games...")
                 # Check for shutdown between games
                 if shutdown_handler.should_stop():
                     print(f"  Stopping after {game_idx} games (shutdown requested)")
                     break
 
-                obs_list, policy_list, result, num_moves, total_sims, total_evals = self_play.play_game()
+                obs_list, policy_list, result, num_moves, total_sims, total_evals, moves_uci, result_reason = self_play.play_game()
                 games_completed += 1
+
+                # Track sample game (prefer decisive games)
+                is_decisive = (result != 0)
+                if seq_sample_game is None or (not seq_sample_game["is_decisive"] and is_decisive):
+                    result_str = "1-0" if result > 0 else "0-1" if result < 0 else "1/2-1/2"
+                    seq_sample_game = {
+                        "moves": moves_uci,
+                        "result": result_str,
+                        "result_reason": result_reason,
+                        "num_moves": num_moves,
+                        "is_decisive": is_decisive
+                    }
 
                 # Add game data to C++ ReplayBuffer
                 # Flatten observations for storage: (122, 8, 8) -> (7808,)
@@ -3149,31 +3020,44 @@ Examples:
                 for i, (obs, policy) in enumerate(zip(obs_list, policy_list)):
                     obs_flat = obs.flatten().astype(np.float32)  # (7808,)
                     white_to_move = (i % 2 == 0)
-                    if result > 0:  # White won
+                    if result == 1.0:  # White won
                         value = 1.0 if white_to_move else -1.0
-                    elif result < 0:  # Black won
+                    elif result == -1.0:  # Black won
                         value = -1.0 if white_to_move else 1.0
-                    else:  # Draw
-                        value = args.draw_score if white_to_move else -args.draw_score
+                    else:  # Draw — pure training label (risk_beta is search-time only)
+                        value = 0.0
                     replay_buffer.add_sample(obs_flat, policy.astype(np.float32), float(value))
 
                 metrics.total_moves += num_moves
                 metrics.total_simulations += total_sims
                 metrics.total_nn_evals += total_evals
 
-                if result > 0:
+                if result == 1.0:
                     metrics.white_wins += 1
-                elif result < 0:
+                elif result == -1.0:
                     metrics.black_wins += 1
                 else:
                     metrics.draws += 1
+                    # Draw breakdown (sequential path)
+                    if result_reason == "repetition":
+                        metrics.draws_repetition += 1
+                        if num_moves < 60:
+                            metrics.draws_early_repetition += 1
+                    elif result_reason == "stalemate":
+                        metrics.draws_stalemate += 1
+                    elif result_reason == "fifty_move":
+                        metrics.draws_fifty_move += 1
+                    elif result_reason == "insufficient":
+                        metrics.draws_insufficient += 1
+                    elif result_reason == "max_moves":
+                        metrics.draws_max_moves += 1
 
                 # Update progress tracker
                 progress.update(num_moves, total_sims, total_evals)
 
                 # Print periodic progress report (every 30 seconds)
                 if progress.should_report():
-                    progress.report(args.games_per_iter, replay_buffer.size())
+                    progress.report(max(args.games_per_iter, game_idx + 1), get_total_buffer_size())
 
                 # Push live dashboard update every 5 seconds
                 now = time.time()
@@ -3182,65 +3066,118 @@ Examples:
                     live_dashboard.push_progress(
                         iteration=iteration + 1,
                         games_completed=games_completed,
-                        total_games=args.games_per_iter,
+                        total_games=max(args.games_per_iter, game_idx + 1),
                         moves=progress.total_moves,
                         sims=progress.total_sims,
                         evals=progress.total_evals,
                         elapsed_time=elapsed_selfplay,
-                        buffer_size=replay_buffer.size(),
+                        buffer_size=get_total_buffer_size(),
                         phase="selfplay"
                     )
                     last_live_update = now
 
+                game_idx += 1
+
             metrics.num_games = games_completed
             metrics.selfplay_time = time.time() - selfplay_start
             metrics.avg_game_length = metrics.total_moves / max(metrics.num_games, 1)
+
+            # Save sample game as PGN (sequential path)
+            if not args.no_sample_games and seq_sample_game is not None:
+                save_sample_game_pgn(
+                    run_dir, iteration + 1,
+                    seq_sample_game["moves"],
+                    seq_sample_game["result"],
+                    seq_sample_game["num_moves"]
+                )
+
+            # Print sample game to console for LLM consumption
+            if seq_sample_game is not None:
+                result = seq_sample_game.get("result", "?")
+                n_moves = seq_sample_game.get("num_moves", 0)
+                moves = seq_sample_game.get("moves", [])
+                if len(moves) <= 30:
+                    move_str = " ".join(moves)
+                else:
+                    move_str = " ".join(moves[:20]) + f" ... ({len(moves)-25} moves) ... " + " ".join(moves[-5:])
+                print(f"  Sample Game: {result} in {n_moves} moves")
+                print(f"    Moves: {move_str}")
+
+            # Make sample_game available for claude logging
+            sample_game = seq_sample_game
+
+        # Create selfplay_done safety lock (before training begins)
+        selfplay_done_path = None
+        if claude_iface is not None and args.claude_timeout > 0:
+            selfplay_done_path = os.path.join(run_dir, "selfplay_done")
+            with open(selfplay_done_path, 'w') as f:
+                f.write(str(iteration + 1))
+                f.flush()
+                os.fsync(f.fileno())
 
         # Handle shutdown after self-play
         if shutdown_handler.should_stop():
             emergency_save(iteration + 1, f"Shutdown after self-play ({metrics.num_games} games)")
             break
 
-        # Training phase
-        min_samples = args.train_batch
-        if replay_buffer.size() >= min_samples:
-            print(f"  Training: {args.epochs} epochs on {replay_buffer.size()} positions...")
+        # Training phase — fill-up may have been capped, so check for empty buffer
+        if not shutdown_handler.should_stop():
+            total_buf = get_total_buffer_size()
+            if total_buf == 0:
+                print("  Skipping training (buffer empty)")
+            else:
+                comp = replay_buffer.get_composition()
+                print(f"  Training: {args.epochs} epochs on {total_buf} positions "
+                      f"(W={comp['wins']} D={comp['draws']} L={comp['losses']})...")
 
-            # Update live dashboard to show training phase
-            if live_dashboard is not None:
-                live_dashboard.push_progress(
-                    iteration=iteration + 1,
-                    games_completed=metrics.num_games,
-                    total_games=metrics.num_games,
-                    moves=metrics.total_moves,
-                    sims=metrics.total_simulations,
-                    evals=metrics.total_nn_evals,
-                    elapsed_time=metrics.selfplay_time,
-                    buffer_size=replay_buffer.size(),
-                    phase="training"
+                # Update live dashboard to show training phase
+                if live_dashboard is not None:
+                    live_dashboard.push_progress(
+                        iteration=iteration + 1,
+                        games_completed=metrics.num_games,
+                        total_games=metrics.num_games,
+                        moves=metrics.total_moves,
+                        sims=metrics.total_simulations,
+                        evals=metrics.total_nn_evals,
+                        elapsed_time=metrics.selfplay_time,
+                        buffer_size=get_total_buffer_size(),
+                        phase="training"
+                    )
+
+                poll_control_file('training')
+                apply_dashboard_updates('training')
+                check_export_request()
+
+                train_start = time.time()
+
+                train_metrics = train_iteration(
+                    network, optimizer, replay_buffer,
+                    args.train_batch, args.epochs, device, scaler,
                 )
 
-            train_start = time.time()
+                metrics.train_time = time.time() - train_start
+                metrics.loss = train_metrics['loss']
+                metrics.policy_loss = train_metrics['policy_loss']
+                metrics.value_loss = train_metrics['value_loss']
+                metrics.num_train_batches = train_metrics['num_batches']
+                metrics.grad_norm_avg = train_metrics.get('grad_norm_avg', 0.0)
+                metrics.grad_norm_max = train_metrics.get('grad_norm_max', 0.0)
 
-            train_metrics = train_iteration(
-                network, optimizer, replay_buffer,
-                args.train_batch, args.epochs, device, scaler
-            )
+                if 'error' in train_metrics:
+                    print(f"  Training ERROR: {train_metrics['error']}")
+                else:
+                    grad_str = ""
+                    if metrics.grad_norm_avg > 0:
+                        grad_str = f", grad_norm={metrics.grad_norm_avg:.2f}/{metrics.grad_norm_max:.2f}"
+                    nan_skip = train_metrics.get('nan_skip_count', 0)
+                    nan_str = f" [NaN skipped {nan_skip}]" if nan_skip > 0 else ""
+                    print(f"  Training complete: loss={metrics.loss:.4f} "
+                          f"(policy={metrics.policy_loss:.4f}, value={metrics.value_loss:.4f}{grad_str}{nan_str}) "
+                          f"in {metrics.train_time:.1f}s")
 
-            metrics.train_time = time.time() - train_start
-            metrics.loss = train_metrics['loss']
-            metrics.policy_loss = train_metrics['policy_loss']
-            metrics.value_loss = train_metrics['value_loss']
-            metrics.num_train_batches = train_metrics['num_batches']
-
-            print(f"  Training complete: loss={metrics.loss:.4f} "
-                  f"(policy={metrics.policy_loss:.4f}, value={metrics.value_loss:.4f}) "
-                  f"in {metrics.train_time:.1f}s")
-        else:
-            print(f"  Skipping training (buffer={replay_buffer.size()} < min={min_samples})")
-
-        metrics.buffer_size = replay_buffer.size()
+        metrics.buffer_size = get_total_buffer_size()
         metrics.total_time = time.time() - iter_start
+        check_export_request()
 
         # Track metrics for console output
         metrics_tracker.add_iteration(metrics)
@@ -3260,12 +3197,69 @@ Examples:
             "white_wins": metrics.white_wins,
             "black_wins": metrics.black_wins,
             "draws": metrics.draws,
+            "draws_repetition": metrics.draws_repetition,
+            "draws_early_repetition": metrics.draws_early_repetition,
+            "draws_stalemate": metrics.draws_stalemate,
+            "draws_fifty_move": metrics.draws_fifty_move,
+            "draws_insufficient": metrics.draws_insufficient,
+            "draws_max_moves": metrics.draws_max_moves,
             "avg_game_length": metrics.avg_game_length,
             "buffer_size": metrics.buffer_size,
+            "buffer_composition": replay_buffer.get_composition(),
             "selfplay_time": metrics.selfplay_time,
             "train_time": metrics.train_time,
             "total_time": metrics.total_time,
         })
+
+        # Log iteration to Claude JSONL (if enabled)
+        if claude_iface is not None:
+            claude_iface.log_iteration(
+                iteration=iteration + 1,
+                total_iterations=args.iterations,
+                params=collect_dashboard_params(),
+                metrics=metrics,
+                sample_game=sample_game,
+            )
+
+        # Synchronous Claude review handshake (--claude with non-zero timeout)
+        # Dual-signal: selfplay_done (created earlier) + awaiting_review (created now)
+        # Training blocks until BOTH are deleted by the reviewing agent.
+        if claude_iface is not None and args.claude_timeout > 0:
+            awaiting_path = os.path.join(run_dir, "awaiting_review")
+            with open(awaiting_path, 'w') as f:
+                f.write(str(iteration + 1))
+                f.flush()
+                os.fsync(f.fileno())
+
+            print(f"  Awaiting Claude review... (delete both selfplay_done AND awaiting_review to continue)")
+            wait_start = time.time()
+            timeout = args.claude_timeout
+            while True:
+                time.sleep(1.0)
+                selfplay_exists = selfplay_done_path is not None and os.path.exists(selfplay_done_path)
+                review_exists = os.path.exists(awaiting_path)
+                if not selfplay_exists and not review_exists:
+                    break
+                if shutdown_handler.should_stop():
+                    for p in [selfplay_done_path, awaiting_path]:
+                        if p:
+                            try:
+                                os.remove(p)
+                            except OSError:
+                                pass
+                    break
+                if time.time() - wait_start > timeout:
+                    print(f"  Claude review timeout ({timeout}s) — auto-continuing")
+                    for p in [selfplay_done_path, awaiting_path]:
+                        if p:
+                            try:
+                                os.remove(p)
+                            except OSError:
+                                pass
+                    break
+
+            # Apply any parameter changes Claude wrote during review
+            poll_control_file('claude-review')
 
         # Save checkpoint and training metrics BEFORE evaluation (at save_interval)
         save_checkpoint_now = (iteration + 1) % args.save_interval == 0 or iteration == args.iterations - 1
@@ -3286,55 +3280,30 @@ Examples:
                     'value_filters': 1,
                     'value_hidden': 256,
                     'simulations': args.simulations,
+                    'wdl': True,
+                    'se_reduction': args.se_reduction,
                 },
                 'backend': 'cpp',
                 'version': '2.0'
             }, checkpoint_save_path)
             print(f"  Saved checkpoint: {checkpoint_save_path}")
 
+            # Save replay buffer
+            buffer_path = os.path.join(run_dir, f"buffer_iter_{iteration + 1:03d}.rpbf")
+            if replay_buffer.save(buffer_path):
+                comp = replay_buffer.get_composition()
+                buf_mb = os.path.getsize(buffer_path) / (1024 * 1024) if os.path.exists(buffer_path) else 0
+                print(f"  Saved replay buffer: {buffer_path} ({buf_mb:.1f} MB, "
+                      f"W={comp['wins']} D={comp['draws']} L={comp['losses']})")
+            else:
+                print(f"  WARNING: Failed to save replay buffer to {buffer_path}")
+
             # Save training metrics JSON
             save_metrics_history(run_dir, metrics_history)
             print(f"  Saved training metrics: {os.path.join(run_dir, 'training_metrics.json')}")
 
-        # Run evaluation every iteration (unless disabled)
-        if not args.no_eval:
-            print(f"  Evaluating...")
-            eval_start = time.time()
-            eval_results = evaluate_checkpoint(
-                network, device,
-                simulations=args.simulations,
-                search_batch=max(args.search_batch, 32),
-                c_puct=args.c_puct
-            )
-            eval_time = time.time() - eval_start
-
-            # Display evaluation results
-            vs_random = eval_results.get("vs_random", {})
-            endgame = eval_results.get("endgame", {})
-            print(f"    vs Random: {vs_random.get('wins', 0)}/5 wins ({vs_random.get('win_rate', 0)*100:.0f}%)")
-            print(f"    Endgame:   {endgame.get('score', 0)}/{endgame.get('total', 5)} puzzles, "
-                  f"{endgame.get('move_score', 0)}/{endgame.get('total_moves', 7)} moves "
-                  f"({endgame.get('move_accuracy', 0)*100:.0f}%)")
-            print(f"    Eval time: {eval_time:.1f}s")
-
-            # Store in metrics for dashboard
-            metrics.eval_win_rate = vs_random.get('win_rate', 0.0)
-            metrics.eval_endgame_score = endgame.get('score', 0)
-            metrics.eval_endgame_total = endgame.get('total', 5)
-            metrics.eval_endgame_move_accuracy = endgame.get('move_accuracy', 0.0)
-
-            # Append to evaluation history
-            eval_history["evaluations"].append({
-                "iteration": iteration + 1,
-                "timestamp": datetime.now().isoformat(),
-                **eval_results
-            })
-
-            # Save evaluation history
-            save_eval_history(run_dir, eval_history)
-
-            # Generate summary.html after evaluation (at save_interval)
-            if save_checkpoint_now and not args.no_visualization:
+            # Generate summary.html (at save_interval)
+            if not args.no_visualization:
                 summary_path = generate_summary_html(run_dir, config)
                 print(f"  Updated summary: {summary_path}")
 
@@ -3362,16 +3331,13 @@ Examples:
                         'value_filters': 1,
                         'value_hidden': 256,
                         'simulations': args.simulations,
+                        'wdl': True,
+                        'se_reduction': args.se_reduction,
                     },
                     'backend': 'cpp',
                     'version': '2.0'
                 }, final_path)
                 print(f"  Saved final checkpoint: {final_path}")
-
-            # Save replay buffer (always save for potential resume)
-            if replay_buffer.save(buffer_path):
-                stats = replay_buffer.get_stats()
-                print(f"  Saved replay buffer: {buffer_path} ({stats['size']:,} samples)")
 
             print()
 
@@ -3403,11 +3369,28 @@ Examples:
         print("=" * 70)
         print(f"  Run directory: {run_dir}")
         print(f"  Resume with: --resume {run_dir}")
-        print(f"  Replay buffer saved: {buffer_path}")
     else:
         metrics_tracker.print_final_summary(args)
 
     if not shutdown_handler.should_stop():
+        # Write Claude resume summary on normal completion
+        if claude_iface is not None:
+            try:
+                resume_path = claude_iface.write_resume_summary(
+                    args, args.iterations, args.iterations,
+                    buffer_stats=get_buffer_stats(),
+                    shutdown_reason="Training complete",
+                )
+                print(f"  Saved Claude resume summary: {resume_path}")
+                claude_iface._append_jsonl({
+                    "type": "shutdown",
+                    "iteration": args.iterations,
+                    "reason": "Training complete",
+                    "timestamp": datetime.now().isoformat(),
+                })
+            except Exception as e:
+                print(f"  WARNING: Could not save Claude resume state: {e}")
+
         print(f"\n{'=' * 70}")
         print(f"TRAINING COMPLETE")
         print(f"{'=' * 70}")
@@ -3415,7 +3398,6 @@ Examples:
         print(f"  Final checkpoint:  {os.path.join(run_dir, 'model_final.pt')}")
         if not args.no_visualization:
             print(f"  Training summary:  {os.path.join(run_dir, 'summary.html')}")
-        print(f"  Replay buffer:     {buffer_path}")
         print(f"{'=' * 70}")
 
 
