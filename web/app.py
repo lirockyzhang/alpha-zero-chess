@@ -86,13 +86,11 @@ class CppEncodingEvaluator:
         if fen is None:
             raise ValueError("CppEncodingEvaluator requires FEN string")
 
-        # Use C++ encoding: returns (8, 8, 122) HWC format
+        # Use C++ encoding: returns (8, 8, 122) NHWC format
         obs_hwc = alphazero_cpp.encode_position(fen, history_fens or [])
-        # Convert to (122, 8, 8) CHW format
-        obs_chw = np.transpose(obs_hwc, (2, 0, 1))
 
-        # Convert to tensors
-        obs_tensor = torch.from_numpy(obs_chw).float().unsqueeze(0).to(self.device)
+        # Convert to tensors — permute is zero-copy metadata swap for channels_last
+        obs_tensor = torch.from_numpy(obs_hwc).unsqueeze(0).permute(0, 3, 1, 2).float().to(self.device)
         mask_tensor = torch.from_numpy(legal_mask).float().unsqueeze(0).to(self.device)
 
         with torch.no_grad():
@@ -230,6 +228,8 @@ class ChessWebInterface:
             self.input_channels = 119
 
         network = network.to(self.device)
+        if self.device == "cuda":
+            network = network.to(memory_format=torch.channels_last)
         network.eval()
 
         print(f"Model loaded: {num_filters} filters, {num_blocks} blocks, {self.input_channels} input channels")
@@ -554,7 +554,6 @@ class ChessWebInterface:
 
         # Get initial evaluation (with position history for proper 122-channel encoding)
         obs_hwc = alphazero_cpp.encode_position(fen, history)
-        obs_chw = np.transpose(obs_hwc, (2, 0, 1))
 
         legal_mask = np.zeros(4672, dtype=np.float32)
         for move in board.legal_moves:
@@ -562,8 +561,8 @@ class ChessWebInterface:
             if 0 <= idx < 4672:
                 legal_mask[idx] = 1.0
 
-        # Get root evaluation
-        obs_tensor = torch.from_numpy(obs_chw).float().unsqueeze(0).to(self.device)
+        # Get root evaluation — permute is zero-copy for channels_last
+        obs_tensor = torch.from_numpy(obs_hwc).unsqueeze(0).permute(0, 3, 1, 2).float().to(self.device)
         mask_tensor = torch.from_numpy(legal_mask).float().unsqueeze(0).to(self.device)
 
         with torch.no_grad():
@@ -591,11 +590,10 @@ class ChessWebInterface:
             if num_leaves == 0:
                 break
 
-            # Convert to NCHW and evaluate
-            obs_nchw = np.transpose(obs_batch[:num_leaves], (0, 3, 1, 2))
             masks = mask_batch[:num_leaves]
 
-            obs_t = torch.from_numpy(obs_nchw).float().to(self.device)
+            # permute NHWC → channels_last NCHW (zero-copy metadata swap)
+            obs_t = torch.from_numpy(obs_batch[:num_leaves]).permute(0, 3, 1, 2).float().to(self.device)
             mask_t = torch.from_numpy(masks).float().to(self.device)
 
             with torch.no_grad():

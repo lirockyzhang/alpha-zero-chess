@@ -213,7 +213,7 @@ All 18 parameters from the PARAM_SPEC (type-checked and clamped by the training 
 | `temperature_moves` | int | [0, 200] | Moves with exploration temperature = 1 |
 | `dirichlet_alpha` | float | [0.01, 2.0] | Root noise magnitude. 0.3 standard for chess. **PUCT only** — ignored when using Gumbel |
 | `dirichlet_epsilon` | float | [0.0, 1.0] | Root noise weight. 0.25 standard. **PUCT only** — ignored when using Gumbel |
-| `gumbel_top_k` | int | [1, 64] | Initial top-m actions for Sequential Halving. 16 default. Also sets `search_batch`. **Gumbel only** |
+| `gumbel_top_k` | int | [1, 64] | Initial top-m actions for Sequential Halving. 16 default. Also recalculates `search_batch`, `input_batch_size`, and `eval_batch`. CUDA graphs rebuild automatically. **Gumbel only** |
 | `gumbel_c_visit` | float | [1.0, 1000.0] | Sigma normalization constant (controls value-vs-prior balance). 50.0 default. **Gumbel only** |
 | `gumbel_c_scale` | float | [0.01, 10.0] | Sigma scale factor. 1.0 default. **Gumbel only** |
 | `risk_beta` | float | [-3.0, 3.0] | ERM risk sensitivity. 0 = neutral, >0 = risk-seeking |
@@ -230,8 +230,7 @@ To change them, stop training and restart with `--resume`:
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `--search-algorithm` | str | Root search algorithm: `gumbel` (default, Gumbel Top-k Sequential Halving) or `puct` (classic AlphaZero PUCT+Dirichlet). `search_batch` is auto-derived: gumbel→`gumbel_top_k`, puct→1. |
-| `--gumbel-top-k` | int | Initial m for Sequential Halving (default 16). Also sets `search_batch` in Gumbel mode. |
+| `--search-algorithm` | str | Root search algorithm: `gumbel` (default, Gumbel Top-k Sequential Halving) or `puct` (classic AlphaZero PUCT+Dirichlet). `search_batch` is auto-derived: gumbel→`gumbel_top_k`, puct→1. Note: `gumbel_top_k` itself is hot-reloadable (see Tunable Parameters). |
 | `--filters` / `--blocks` | int | Network architecture (cannot change mid-training) |
 | `--se-reduction` | int | SE (Squeeze-and-Excitation) block reduction ratio (default 16). Each residual block contains an SE block that computes channel attention: `filters → filters/r → filters`. Lower r = more capacity/slower, higher r = less capacity/faster. Standard values: 4, 8, 16, 32. Cannot change mid-training. |
 | `--buffer-size` | int | Replay buffer capacity |
@@ -360,6 +359,43 @@ Repeat this synchronous loop:
 If no issues detected, just delete both signal files immediately.
 Training will not proceed until **both** `selfplay_done` and `awaiting_review`
 are deleted (or until `--claude-timeout` expires).
+
+### 8a. Using `monitor_iteration.py` (recommended for Claude Code)
+
+Instead of manually polling for `awaiting_review` and reading the JSONL log,
+use the monitor script which handles both steps and outputs a formatted summary:
+
+```bash
+# Launch in background — blocks until awaiting_review appears, then prints summary
+uv run python alphazero-cpp/scripts/monitor_iteration.py <run_dir> --timeout 3600 &
+
+# Or auto-detect the most recent run directory:
+uv run python alphazero-cpp/scripts/monitor_iteration.py --latest --timeout 3600 &
+```
+
+**Exit codes:**
+- `0` — Success: metrics summary printed to stdout
+- `1` — Error: missing directory, missing log file, etc.
+- `2` — Timeout: `awaiting_review` did not appear within `--timeout` seconds
+
+**Output format:** The script prints a structured text summary including:
+- Loss breakdown (total, policy, value, gradient norms)
+- Game outcomes with draw type breakdown
+- Buffer size, LR, risk_beta
+- Timing (self-play, training, total)
+- Alerts (if any)
+- Trend lines (last 5 iterations: loss, draw rate, game length)
+- Sample game (result, reason, first 200 chars of moves)
+- Action instructions (which files to delete to resume)
+
+**Claude Code integration loop:**
+1. Launch training: `uv run python alphazero-cpp/scripts/train.py --claude --claude-timeout 3600 ...`
+2. Launch monitor in background: `uv run python alphazero-cpp/scripts/monitor_iteration.py --latest`
+3. When monitor exits (code 0), read its output
+4. Analyze the summary, decide on parameter changes
+5. If changes needed, write `param_updates.json` atomically
+6. Delete both signal files: `rm <run_dir>/selfplay_done <run_dir>/awaiting_review`
+7. Launch monitor again for the next iteration (goto step 2)
 
 ---
 

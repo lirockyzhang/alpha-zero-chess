@@ -589,12 +589,13 @@ public:
             // Acquire GIL before calling Python from C++ thread
             py::gil_scoped_acquire acquire;
 
-            // Zero-copy numpy wrapping: observations are already NCHW from C++ transpose
+            // Zero-copy numpy wrapping: observations are NHWC from C++ (no transpose)
+            // Python uses torch.permute(0,3,1,2) for zero-cost channels_last layout
             // Use capsule with no-op destructor to prevent Python from freeing C++ memory
             py::array_t<float> obs_array(
-                {batch_size, 122, 8, 8},
-                {122 * 8 * 8 * (int)sizeof(float), 8 * 8 * (int)sizeof(float),
-                 8 * (int)sizeof(float), (int)sizeof(float)},
+                {batch_size, 8, 8, 122},
+                {8 * 8 * 122 * (int)sizeof(float), 8 * 122 * (int)sizeof(float),
+                 122 * (int)sizeof(float), (int)sizeof(float)},
                 const_cast<float*>(observations),
                 py::capsule(observations, [](void*) {})
             );
@@ -975,7 +976,7 @@ PYBIND11_MODULE(alphazero_cpp, m) {
              py::arg("evaluator"),
              "Generate self-play games using cross-game batching.\n"
              "\nevaluator: callable(observations, legal_masks, batch_size) -> (policies, values)\n"
-             "  observations: np.array shape (batch_size, 8, 8, 122)\n"
+             "  observations: np.array shape (batch_size, 8, 8, 122) NHWC layout\n"
              "  legal_masks: np.array shape (batch_size, 4672)\n"
              "  batch_size: int, number of positions to evaluate\n"
              "  Returns: (policies np.array (batch_size, 4672), values np.array (batch_size,))\n"

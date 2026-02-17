@@ -248,6 +248,12 @@ class AlphaZeroNet(nn.Module):
         # Policy mirror permutation for horizontal equivariance
         self.register_buffer('policy_mirror', _build_policy_mirror())
 
+        # Enable channels_last memory format for native cuDNN NHWC kernels.
+        # This avoids internal NCHW→NHWC transposes that cuDNN would otherwise do.
+        # FC layers auto-convert from channels_last to contiguous (only affects
+        # the small head tensors, not the trunk convolutions).
+        self.to(memory_format=torch.channels_last)
+
     def _trunk(self, x):
         """Shared trunk: input conv + residual tower."""
         return self.residual_tower(self.input_conv(x))

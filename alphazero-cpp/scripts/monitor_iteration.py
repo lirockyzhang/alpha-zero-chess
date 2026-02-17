@@ -204,7 +204,7 @@ def format_summary(entries: list[dict], run_dir: str) -> str:
     awaiting_path = os.path.join(run_dir, "awaiting_review")
     lines.append(f"\n{'='*70}")
     lines.append(f"ACTION REQUIRED:")
-    lines.append(f"  1. Analyze metrics above (see llm_tuner_prompt.md for decision guide)")
+    lines.append(f"  1. Analyze metrics above (see llm_operation_manual.md for decision guide)")
     lines.append(f"  2. If changes needed: write {os.path.join(run_dir, 'param_updates.json')}")
     lines.append(f"  3. Delete BOTH signal files to resume training:")
     lines.append(f"     rm \"{selfplay_done_path}\" \"{awaiting_path}\"")

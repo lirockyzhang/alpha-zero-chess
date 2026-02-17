@@ -24,6 +24,13 @@ constexpr size_t MAX_WORKERS = 128;            // Maximum concurrent workers
 constexpr size_t DEFAULT_MAX_BATCH = 512;      // Default max batch size
 constexpr size_t DEFAULT_QUEUE_CAPACITY = 8192; // Request queue capacity (increased from 4096 to prevent exhaustion)
 
+// Cache-line-padded atomic flag to prevent false sharing in slot_ready_ array.
+// Without padding, adjacent atomics share a 64-byte cache line, causing
+// cross-core cache bouncing when different worker threads set their flags.
+struct alignas(64) PaddedAtomicFlag {
+    std::atomic<uint8_t> value{0};
+};
+
 // EvalRequest has been replaced by StagedRequest (see below)
 // Workers now write directly into pre-allocated staging buffers
 
@@ -218,7 +225,7 @@ public:
 
     // Get raw pointers to batch buffers (for torch.from_blob)
     uintptr_t get_batch_obs_ptr() const {
-        return reinterpret_cast<uintptr_t>(batch_obs_nchw_buffer_);
+        return reinterpret_cast<uintptr_t>(batch_obs_buffer_);
     }
     uintptr_t get_batch_mask_ptr() const {
         return reinterpret_cast<uintptr_t>(batch_mask_buffer_);
@@ -250,9 +257,9 @@ private:
 
     // Per-slot ready flags: workers set after memcpy completes (lock-free signaling)
     // GPU thread spin-waits on these before reading staging data
-    // NOTE: Using unique_ptr<atomic[]> instead of vector<atomic> because
-    // std::atomic has deleted copy/move constructors, incompatible with std::vector on MSVC
-    std::unique_ptr<std::atomic<uint8_t>[]> slot_ready_;  // queue_capacity entries
+    // Each flag is padded to 64 bytes (cache line) to prevent false sharing
+    // between worker threads writing to adjacent slots
+    std::unique_ptr<PaddedAtomicFlag[]> slot_ready_;  // queue_capacity entries
 
     // Request metadata queue (lightweight — only metadata, no observation data)
     std::vector<StagedRequest> staged_requests_;
@@ -264,9 +271,9 @@ private:
     bool needs_compaction_{false};
 
     // Batch buffers (aligned/pinned for GPU)
-    // NOTE: batch_obs_buffer_ (NHWC intermediate) removed — fused transpose
-    // reads directly from staging_obs_buffer_ into batch_obs_nchw_buffer_
-    float* batch_obs_nchw_buffer_; // max_batch_size x OBS_SIZE (NCHW for GPU)
+    // batch_obs_buffer_ holds NHWC data (same layout as staging), passed
+    // directly to Python where torch.permute gives channels_last tensors
+    float* batch_obs_buffer_; // max_batch_size x OBS_SIZE (NHWC layout)
     float* batch_mask_buffer_;     // max_batch_size x POLICY_SIZE
     float* batch_policy_buffers_[2]; // Double-buffered: GPU writes [current], workers read [previous]
     float* batch_value_buffer_;    // max_batch_size

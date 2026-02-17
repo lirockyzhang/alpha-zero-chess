@@ -667,8 +667,9 @@ class BatchedEvaluator:
 
     @torch.inference_mode()
     def evaluate(self, obs: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, float]:
-        """Evaluate single position."""
-        obs_tensor = torch.from_numpy(obs).float().unsqueeze(0).to(self.device)
+        """Evaluate single position. obs is NHWC (8, 8, 122)."""
+        # permute: (8,8,122) → unsqueeze → (1,8,8,122) → permute → (1,122,8,8) channels_last
+        obs_tensor = torch.from_numpy(obs).unsqueeze(0).permute(0, 3, 1, 2).float().to(self.device)
         mask_tensor = torch.from_numpy(mask).float().unsqueeze(0).to(self.device)
 
         if self.use_amp:
@@ -681,8 +682,8 @@ class BatchedEvaluator:
 
     @torch.inference_mode()
     def evaluate_batch(self, obs_batch: np.ndarray, mask_batch: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Evaluate batch of positions."""
-        obs_tensor = torch.from_numpy(obs_batch).float().to(self.device)
+        """Evaluate batch of positions. obs_batch is NHWC (N, 8, 8, 122)."""
+        obs_tensor = torch.from_numpy(obs_batch).permute(0, 3, 1, 2).float().to(self.device)
         mask_tensor = torch.from_numpy(mask_batch).float().to(self.device)
 
         if self.use_amp:
@@ -726,7 +727,7 @@ class CppSelfPlay:
         """Play a single self-play game.
 
         Returns:
-            observations: List of board observations (122, 8, 8) CHW format
+            observations: List of board observations (8, 8, 122) NHWC format
             policies: List of MCTS policies
             result: Game result (1=white wins, -1=black wins, 0=draw)
             num_moves: Number of moves played
@@ -747,7 +748,6 @@ class CppSelfPlay:
 
             # Encode position (returns 8, 8, 122 in NHWC format)
             obs = alphazero_cpp.encode_position(fen)
-            obs_chw = np.transpose(obs, (2, 0, 1))  # Convert to (122, 8, 8) CHW
 
             # Get legal moves and build mask + mapping
             legal_moves = list(board.legal_moves)
@@ -763,7 +763,7 @@ class CppSelfPlay:
                     idx_to_move[idx] = move
 
             # Get root evaluation
-            root_policy, root_value = self.evaluator.evaluate(obs_chw, mask)
+            root_policy, root_value = self.evaluator.evaluate(obs, mask)
             total_evals += 1
 
             # Initialize MCTS search
@@ -775,12 +775,10 @@ class CppSelfPlay:
                 if num_leaves == 0:
                     break
 
-                # Convert NHWC to NCHW for neural network
-                obs_nchw = np.transpose(obs_batch[:num_leaves], (0, 3, 1, 2))
                 masks = mask_batch[:num_leaves]
 
-                # Batch evaluate
-                leaf_policies, leaf_values = self.evaluator.evaluate_batch(obs_nchw, masks)
+                # Batch evaluate (evaluator handles NHWC → permute internally)
+                leaf_policies, leaf_values = self.evaluator.evaluate_batch(obs_batch[:num_leaves], masks)
                 total_evals += num_leaves
 
                 # Update leaves
@@ -801,7 +799,7 @@ class CppSelfPlay:
                 policy = mask / mask.sum()
 
             # Store for training
-            observations.append(obs_chw.copy())
+            observations.append(obs.copy())
             policies.append(policy.copy())
 
             # Select move with temperature
@@ -1043,7 +1041,8 @@ def calibrate_cuda_graphs(
     print("  GPU warmup...", end=" ", flush=True)
     # Extended warmup to reach thermal steady-state (~2 seconds of sustained load)
     # This is critical: calibration on a "cold" GPU gives optimistic timings
-    warmup_obs = torch.zeros(eval_batch, INPUT_CHANNELS, 8, 8, device='cuda')
+    warmup_obs = torch.zeros(eval_batch, INPUT_CHANNELS, 8, 8, device='cuda'
+                             ).to(memory_format=torch.channels_last)
     warmup_mask = torch.zeros(eval_batch, POLICY_SIZE, device='cuda')
     warmup_start = time.time()
     warmup_count = 0
@@ -1062,12 +1061,12 @@ def calibrate_cuda_graphs(
     eager_times = {}  # size -> list of times in ms
 
     for size in test_sizes:
-        obs_np = np.zeros((size, INPUT_CHANNELS, 8, 8), dtype=np.float32)
+        obs_np = np.zeros((size, 8, 8, INPUT_CHANNELS), dtype=np.float32)  # NHWC
         mask_np = np.zeros((size, POLICY_SIZE), dtype=np.float32)
 
-        # Warmup for this size (full pipeline)
+        # Warmup for this size (full pipeline: NHWC numpy → permute → channels_last GPU)
         for _ in range(warmup_iters):
-            obs_t = torch.from_numpy(obs_np).float().to('cuda')
+            obs_t = torch.from_numpy(obs_np).permute(0, 3, 1, 2).float().to('cuda')
             mask_t = torch.from_numpy(mask_np).float().to('cuda')
             with torch.no_grad(), autocast('cuda'):
                 network(obs_t, mask_t)
@@ -1078,7 +1077,7 @@ def calibrate_cuda_graphs(
         for _ in range(measure_iters):
             torch.cuda.synchronize()
             start = time.perf_counter()
-            obs_t = torch.from_numpy(obs_np).float().to('cuda')
+            obs_t = torch.from_numpy(obs_np).permute(0, 3, 1, 2).float().to('cuda')
             mask_t = torch.from_numpy(mask_np).float().to('cuda')
             with torch.no_grad(), autocast('cuda'):
                 network(obs_t, mask_t)
@@ -1129,7 +1128,8 @@ def calibrate_cuda_graphs(
 
     for size in graph_sizes:
         try:
-            obs = torch.zeros(size, INPUT_CHANNELS, 8, 8, device='cuda')
+            obs = torch.zeros(size, INPUT_CHANNELS, 8, 8, device='cuda'
+                             ).to(memory_format=torch.channels_last)
             mask = torch.zeros(size, POLICY_SIZE, device='cuda')
 
             # Warmup pass
@@ -1142,14 +1142,14 @@ def calibrate_cuda_graphs(
                 with torch.no_grad(), autocast('cuda'):
                     network(obs, mask)
 
-            # Prepare numpy source for copy-in measurement
-            # (matches runtime: static_obs[:batch_size].copy_(torch.from_numpy(...)))
-            obs_np = np.zeros((size, INPUT_CHANNELS, 8, 8), dtype=np.float32)
+            # Prepare NHWC numpy source for copy-in measurement
+            # (matches runtime: permute NHWC→channels_last then copy_)
+            obs_np = np.zeros((size, 8, 8, INPUT_CHANNELS), dtype=np.float32)  # NHWC
             mask_np = np.zeros((size, POLICY_SIZE), dtype=np.float32)
 
-            # Warmup replays with copy-in
+            # Warmup replays with copy-in (permute is zero-cost metadata swap)
             for _ in range(warmup_iters):
-                obs.copy_(torch.from_numpy(obs_np))
+                obs.copy_(torch.from_numpy(obs_np).permute(0, 3, 1, 2))
                 mask.copy_(torch.from_numpy(mask_np))
                 graph.replay()
             torch.cuda.synchronize()
@@ -1159,7 +1159,7 @@ def calibrate_cuda_graphs(
             for _ in range(measure_iters):
                 torch.cuda.synchronize()
                 start = time.perf_counter()
-                obs.copy_(torch.from_numpy(obs_np))
+                obs.copy_(torch.from_numpy(obs_np).permute(0, 3, 1, 2))
                 mask.copy_(torch.from_numpy(mask_np))
                 graph.replay()
                 torch.cuda.synchronize()
@@ -1504,7 +1504,8 @@ def run_parallel_selfplay(
     if use_cuda_graph:
         try:
             # ===== Capture LARGE graph (full eval_batch) =====
-            static_obs_large = torch.zeros(gpu_batch_size, INPUT_CHANNELS, 8, 8, device='cuda')
+            static_obs_large = torch.zeros(gpu_batch_size, INPUT_CHANNELS, 8, 8, device='cuda'
+                                           ).to(memory_format=torch.channels_last)
             static_mask_large = torch.zeros(gpu_batch_size, POLICY_SIZE, device='cuda')
 
             # Warm-up pass (required before graph capture)
@@ -1520,7 +1521,8 @@ def run_parallel_selfplay(
             # ===== Capture MEDIUM graph (eval_batch // 2) =====
             # Skip if medium would overlap with small (e.g. eval_batch <= 256)
             if medium_graph_size > small_graph_size:
-                static_obs_medium = torch.zeros(medium_graph_size, INPUT_CHANNELS, 8, 8, device='cuda')
+                static_obs_medium = torch.zeros(medium_graph_size, INPUT_CHANNELS, 8, 8, device='cuda'
+                                                ).to(memory_format=torch.channels_last)
                 static_mask_medium = torch.zeros(medium_graph_size, POLICY_SIZE, device='cuda')
 
                 with autocast('cuda'):
@@ -1532,7 +1534,8 @@ def run_parallel_selfplay(
                         static_policy_medium, static_value_medium, _spm2, static_wdl_medium = network(static_obs_medium, static_mask_medium)
 
             # ===== Capture SMALL graph =====
-            static_obs_small = torch.zeros(small_graph_size, INPUT_CHANNELS, 8, 8, device='cuda')
+            static_obs_small = torch.zeros(small_graph_size, INPUT_CHANNELS, 8, 8, device='cuda'
+                                           ).to(memory_format=torch.channels_last)
             static_mask_small = torch.zeros(small_graph_size, POLICY_SIZE, device='cuda')
 
             # Warm-up pass
@@ -1546,7 +1549,8 @@ def run_parallel_selfplay(
                     static_policy_small, static_value_small, _sps, static_wdl_small = network(static_obs_small, static_mask_small)
 
             # ===== Capture MINI graph =====
-            static_obs_mini = torch.zeros(mini_graph_size, INPUT_CHANNELS, 8, 8, device='cuda')
+            static_obs_mini = torch.zeros(mini_graph_size, INPUT_CHANNELS, 8, 8, device='cuda'
+                                          ).to(memory_format=torch.channels_last)
             static_mask_mini = torch.zeros(mini_graph_size, POLICY_SIZE, device='cuda')
 
             # Warm-up pass
@@ -1605,7 +1609,8 @@ def run_parallel_selfplay(
 
     # Create evaluator callback that will be called from C++ GPU thread
     # Signature: (observations, legal_masks, batch_size, out_policies, out_values) -> None
-    # Observations arrive in NCHW format (C++ does the transpose now)
+    # Observations arrive in NHWC format (batch, 8, 8, 122) — no C++ transpose
+    # torch.permute(0,3,1,2) gives channels_last layout (zero-copy metadata swap)
     # Output buffers are writable numpy views over C++ memory (zero-copy)
     @torch.inference_mode()
     def neural_evaluator(obs_array: np.ndarray, mask_array: np.ndarray, batch_size: int,
@@ -1626,7 +1631,8 @@ def run_parallel_selfplay(
             path_taken = 'mini'
             cuda_graph_stats['mini_graph_fires'] += 1
 
-            static_obs_mini[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]))
+            # permute is zero-copy metadata swap: NHWC → channels_last NCHW
+            static_obs_mini[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]).permute(0, 3, 1, 2))
             static_mask_mini[:batch_size].copy_(torch.from_numpy(mask_array[:batch_size]))
             cuda_graph_mini.replay()
             policies = static_policy_mini[:batch_size]
@@ -1637,7 +1643,7 @@ def run_parallel_selfplay(
             path_taken = 'small'
             cuda_graph_stats['small_graph_fires'] += 1
 
-            static_obs_small[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]))
+            static_obs_small[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]).permute(0, 3, 1, 2))
             static_mask_small[:batch_size].copy_(torch.from_numpy(mask_array[:batch_size]))
             cuda_graph_small.replay()
             policies = static_policy_small[:batch_size]
@@ -1648,7 +1654,7 @@ def run_parallel_selfplay(
             path_taken = 'medium'
             cuda_graph_stats['medium_graph_fires'] += 1
 
-            static_obs_medium[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]))
+            static_obs_medium[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]).permute(0, 3, 1, 2))
             static_mask_medium[:batch_size].copy_(torch.from_numpy(mask_array[:batch_size]))
             cuda_graph_medium.replay()
             policies = static_policy_medium[:batch_size]
@@ -1659,7 +1665,7 @@ def run_parallel_selfplay(
             path_taken = 'large'
             cuda_graph_stats['large_graph_fires'] += 1
 
-            static_obs_large[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]))
+            static_obs_large[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]).permute(0, 3, 1, 2))
             static_mask_large[:batch_size].copy_(torch.from_numpy(mask_array[:batch_size]))
             cuda_graph_large.replay()
             policies = static_policy_large[:batch_size]
@@ -1668,7 +1674,8 @@ def run_parallel_selfplay(
         else:
             # EAGER PATH: batch doesn't qualify for any graph tier
             cuda_graph_stats['eager_fires'] += 1
-            obs_tensor = torch.from_numpy(obs_array[:batch_size]).float().to(device)
+            # permute first (zero-copy), then float conversion respects channels_last
+            obs_tensor = torch.from_numpy(obs_array[:batch_size]).permute(0, 3, 1, 2).float().to(device)
             mask_tensor = torch.from_numpy(mask_array[:batch_size]).float().to(device)
 
             if device == "cuda":
@@ -2038,10 +2045,9 @@ def train_iteration(
 
         # Convert to PyTorch tensors
         # obs is (batch, 7808) flat, need to reshape to (batch, 122, 8, 8)
-        obs = obs.reshape(-1, 8, 8, INPUT_CHANNELS)  # (batch, 8, 8, 122)
-        obs = np.transpose(obs, (0, 3, 1, 2))  # (batch, 122, 8, 8)
-
-        obs_tensor = torch.from_numpy(obs).to(device)
+        obs = obs.reshape(-1, 8, 8, INPUT_CHANNELS)  # (batch, 8, 8, 122) NHWC
+        # permute is zero-copy metadata swap; .to(device) preserves channels_last
+        obs_tensor = torch.from_numpy(obs).permute(0, 3, 1, 2).to(device)
         policy_target = torch.from_numpy(policies).to(device)
         value_target = torch.from_numpy(values).to(device)  # (batch,)
         mcts_wdl_target = torch.from_numpy(wdl_targets).to(device)  # (batch, 3)
@@ -2401,6 +2407,8 @@ Examples:
                            input_channels=INPUT_CHANNELS, wdl=True,
                            se_reduction=args.se_reduction)
     network = network.to(device)
+    if device == "cuda":
+        network = network.to(memory_format=torch.channels_last)
 
     num_params = sum(p.numel() for p in network.parameters())
     print(f"Network parameters:  {num_params:,}")
@@ -2408,6 +2416,8 @@ Examples:
     # Log initial WDL behavior (sanity check for fresh networks)
     with torch.no_grad():
         dummy = torch.randn(1, INPUT_CHANNELS, 8, 8, device=device)
+        if device == "cuda":
+            dummy = dummy.to(memory_format=torch.channels_last)
         _, _, _, wdl = network(dummy)
         wdl_p = F.softmax(wdl, dim=1)
         print(f"  Initial WDL distribution: {wdl_p.cpu().numpy().round(3)}")
@@ -2865,6 +2875,22 @@ Examples:
         poll_control_file('self-play')
         apply_dashboard_updates('self-play')
         check_export_request()
+
+        # Re-derive search_batch and downstream sizes (gumbel_top_k may have changed)
+        old_search_batch = args.search_batch
+        if args.search_algorithm == "gumbel":
+            args.search_batch = args.gumbel_top_k
+        else:
+            args.search_batch = 1
+        if args.search_batch != old_search_batch:
+            mirror_factor = 2 if hasattr(AlphaZeroNet, '_mirror_input') else 1
+            input_batch_size = ((args.workers * args.search_batch + 31) // 32) * 32
+            input_batch_size = max(input_batch_size, 32)
+            args.eval_batch = input_batch_size * mirror_factor
+            args.input_batch_size = input_batch_size
+            print(f"    [Derived] search_batch={args.search_batch}, "
+                  f"input_batch={args.input_batch_size}, "
+                  f"eval_batch={args.eval_batch}")
 
         # Self-play phase
         replay_buffer.set_iteration(iteration + 1)  # Tag samples with current iteration

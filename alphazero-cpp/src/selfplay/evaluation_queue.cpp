@@ -23,7 +23,7 @@ GlobalEvaluationQueue::GlobalEvaluationQueue(size_t max_batch_size, size_t queue
     , queue_capacity_(queue_capacity)
     , staging_obs_buffer_(nullptr)
     , staging_mask_buffer_(nullptr)
-    , batch_obs_nchw_buffer_(nullptr)
+    , batch_obs_buffer_(nullptr)
     , batch_mask_buffer_(nullptr)
     , batch_policy_buffers_{nullptr, nullptr}
     , batch_value_buffer_(nullptr)
@@ -45,10 +45,8 @@ GlobalEvaluationQueue::GlobalEvaluationQueue(size_t max_batch_size, size_t queue
     }
 
     // Initialize per-slot ready flags (all zero = not ready)
-    slot_ready_ = std::make_unique<std::atomic<uint8_t>[]>(queue_capacity);
-    for (size_t i = 0; i < queue_capacity; ++i) {
-        slot_ready_[i].store(0, std::memory_order_relaxed);
-    }
+    // PaddedAtomicFlag default-initializes value to 0
+    slot_ready_ = std::make_unique<PaddedAtomicFlag[]>(queue_capacity);
 
     // Pre-allocate staged request metadata queue
     staged_requests_.reserve(queue_capacity);
@@ -93,23 +91,22 @@ void GlobalEvaluationQueue::allocate_batch_buffers() {
     size_t value_bytes = max_batch_size_ * sizeof(float);
 
     // Allocate aligned memory (64-byte for cache line / GPU compatibility)
-    // NOTE: batch_obs_buffer_ (NHWC intermediate) removed — fused transpose
-    // now reads directly from staging into batch_obs_nchw_buffer_
+    // batch_obs_buffer_ holds NHWC data (same layout as staging)
     #ifdef _WIN32
-    batch_obs_nchw_buffer_ = static_cast<float*>(_aligned_malloc(obs_bytes, 64));
+    batch_obs_buffer_ = static_cast<float*>(_aligned_malloc(obs_bytes, 64));
     batch_mask_buffer_ = static_cast<float*>(_aligned_malloc(mask_bytes, 64));
     batch_policy_buffers_[0] = static_cast<float*>(_aligned_malloc(policy_bytes, 64));
     batch_policy_buffers_[1] = static_cast<float*>(_aligned_malloc(policy_bytes, 64));
     batch_value_buffer_ = static_cast<float*>(_aligned_malloc(value_bytes, 64));
     #else
-    batch_obs_nchw_buffer_ = static_cast<float*>(std::aligned_alloc(64, obs_bytes));
+    batch_obs_buffer_ = static_cast<float*>(std::aligned_alloc(64, obs_bytes));
     batch_mask_buffer_ = static_cast<float*>(std::aligned_alloc(64, mask_bytes));
     batch_policy_buffers_[0] = static_cast<float*>(std::aligned_alloc(64, policy_bytes));
     batch_policy_buffers_[1] = static_cast<float*>(std::aligned_alloc(64, policy_bytes));
     batch_value_buffer_ = static_cast<float*>(std::aligned_alloc(64, value_bytes));
     #endif
 
-    if (!batch_obs_nchw_buffer_ || !batch_mask_buffer_ ||
+    if (!batch_obs_buffer_ || !batch_mask_buffer_ ||
         !batch_policy_buffers_[0] || !batch_policy_buffers_[1] || !batch_value_buffer_) {
         free_batch_buffers();
         throw std::bad_alloc();
@@ -118,20 +115,20 @@ void GlobalEvaluationQueue::allocate_batch_buffers() {
 
 void GlobalEvaluationQueue::free_batch_buffers() {
     #ifdef _WIN32
-    if (batch_obs_nchw_buffer_) _aligned_free(batch_obs_nchw_buffer_);
+    if (batch_obs_buffer_) _aligned_free(batch_obs_buffer_);
     if (batch_mask_buffer_) _aligned_free(batch_mask_buffer_);
     if (batch_policy_buffers_[0]) _aligned_free(batch_policy_buffers_[0]);
     if (batch_policy_buffers_[1]) _aligned_free(batch_policy_buffers_[1]);
     if (batch_value_buffer_) _aligned_free(batch_value_buffer_);
     #else
-    if (batch_obs_nchw_buffer_) std::free(batch_obs_nchw_buffer_);
+    if (batch_obs_buffer_) std::free(batch_obs_buffer_);
     if (batch_mask_buffer_) std::free(batch_mask_buffer_);
     if (batch_policy_buffers_[0]) std::free(batch_policy_buffers_[0]);
     if (batch_policy_buffers_[1]) std::free(batch_policy_buffers_[1]);
     if (batch_value_buffer_) std::free(batch_value_buffer_);
     #endif
 
-    batch_obs_nchw_buffer_ = nullptr;
+    batch_obs_buffer_ = nullptr;
     batch_mask_buffer_ = nullptr;
     batch_policy_buffers_[0] = nullptr;
     batch_policy_buffers_[1] = nullptr;
@@ -229,7 +226,7 @@ int GlobalEvaluationQueue::submit_for_evaluation(
     // release semantics ensure the preceding memcpy is visible to the GPU
     // thread when it does an acquire load on slot_ready_[slot]
     for (int i = 0; i < actual_leaves; ++i) {
-        slot_ready_[first_slot + i].store(1, std::memory_order_release);
+        slot_ready_[first_slot + i].value.store(1, std::memory_order_release);
     }
 
     // Notify OUTSIDE the lock — the GPU thread can immediately acquire
@@ -507,13 +504,13 @@ int GlobalEvaluationQueue::collect_batch(
     // Lock released — workers can submit new leaves during Phase 2
 
     // =====================================================================
-    // Phase 2 (NO lock, OpenMP parallel): Spin-wait + fused transpose + mask copy
+    // Phase 2 (NO lock, OpenMP parallel): Spin-wait + NHWC memcpy + mask copy
     // =====================================================================
     // For each batch entry:
     //   1. Spin-wait on slot_ready_[slot] (typically instant — worker finished
     //      its memcpy long before GPU reached stall detection)
-    //   2. Fused NHWC→NCHW transpose: staging_obs → batch_obs_nchw (skip
-    //      intermediate batch_obs_buffer_, saving 32MB)
+    //   2. Direct NHWC memcpy: staging_obs → batch_obs (no transpose needed,
+    //      Python uses torch.permute for zero-copy channels_last layout)
     //   3. memcpy mask: staging_mask → batch_mask
     //   4. Clear slot_ready_[slot] for reuse
     //
@@ -543,7 +540,7 @@ int GlobalEvaluationQueue::collect_batch(
         {
             int spin_count = 0;
             auto spin_start = std::chrono::steady_clock::now();
-            while (slot_ready_[slot].load(std::memory_order_acquire) == 0) {
+            while (slot_ready_[slot].value.load(std::memory_order_acquire) == 0) {
                 if (++spin_count <= 64) {
                     _mm_pause();  // x86 PAUSE: ~10ns, saves power, prevents pipeline flush
                 } else {
@@ -570,23 +567,19 @@ int GlobalEvaluationQueue::collect_batch(
             // Shutdown requested while waiting — zero out this batch entry
             // to prevent garbage data from reaching the GPU. The result
             // will be discarded anyway since the evaluator loop checks shutdown.
-            std::memset(batch_obs_nchw_buffer_ + static_cast<size_t>(b) * OBS_SIZE,
+            std::memset(batch_obs_buffer_ + static_cast<size_t>(b) * OBS_SIZE,
                         0, OBS_SIZE * sizeof(float));
             std::memset(batch_mask_buffer_ + static_cast<size_t>(b) * POLICY_SIZE,
                         0, POLICY_SIZE * sizeof(float));
             continue;
         }
 
-        // Fused NHWC→NCHW transpose directly from staging to batch output
-        const float* nhwc = staging_obs_buffer_ + static_cast<size_t>(slot) * OBS_SIZE;
-        float* nchw = batch_obs_nchw_buffer_ + static_cast<size_t>(b) * OBS_SIZE;
-        for (int h = 0; h < 8; ++h) {
-            for (int w = 0; w < 8; ++w) {
-                for (int c = 0; c < 122; ++c) {
-                    nchw[c * 64 + h * 8 + w] = nhwc[h * (8 * 122) + w * 122 + c];
-                }
-            }
-        }
+        // Direct NHWC memcpy: staging is already NHWC, batch buffer stays NHWC.
+        // Python receives NHWC and uses torch.permute (zero-copy metadata swap)
+        // to create channels_last tensors for cuDNN's native NHWC kernels.
+        std::memcpy(batch_obs_buffer_ + static_cast<size_t>(b) * OBS_SIZE,
+                    staging_obs_buffer_ + static_cast<size_t>(slot) * OBS_SIZE,
+                    OBS_SIZE * sizeof(float));
 
         // Copy mask directly from staging to batch buffer
         std::memcpy(batch_mask_buffer_ + static_cast<size_t>(b) * POLICY_SIZE,
@@ -595,7 +588,7 @@ int GlobalEvaluationQueue::collect_batch(
 
         // Clear ready flag for slot reuse (relaxed — no ordering needed,
         // slot won't be reused until after compaction under lock)
-        slot_ready_[slot].store(0, std::memory_order_relaxed);
+        slot_ready_[slot].value.store(0, std::memory_order_relaxed);
     }
 
     // Update metrics
@@ -607,7 +600,7 @@ int GlobalEvaluationQueue::collect_batch(
     metrics_.total_batches.fetch_add(1, std::memory_order_relaxed);
     metrics_.total_leaves.fetch_add(batch_size, std::memory_order_relaxed);
 
-    *out_obs_ptr = batch_obs_nchw_buffer_;
+    *out_obs_ptr = batch_obs_buffer_;
     *out_mask_ptr = batch_mask_buffer_;
 
     return static_cast<int>(batch_size);
@@ -706,7 +699,7 @@ void GlobalEvaluationQueue::compact_remaining_locked() {
         {
             int spin_count = 0;
             auto spin_start = std::chrono::steady_clock::now();
-            while (slot_ready_[old_slot].load(std::memory_order_acquire) == 0) {
+            while (slot_ready_[old_slot].value.load(std::memory_order_acquire) == 0) {
                 std::this_thread::yield();
                 if (++spin_count % 1024 == 0) {
                     if (shutdown_.load(std::memory_order_relaxed)) {
@@ -736,8 +729,8 @@ void GlobalEvaluationQueue::compact_remaining_locked() {
                         POLICY_SIZE * sizeof(float));
 
             // Move the ready flag to the new slot position
-            slot_ready_[i].store(1, std::memory_order_relaxed);
-            slot_ready_[old_slot].store(0, std::memory_order_relaxed);
+            slot_ready_[i].value.store(1, std::memory_order_relaxed);
+            slot_ready_[old_slot].value.store(0, std::memory_order_relaxed);
 
             staged_requests_[i].staging_slot = static_cast<int>(i);
         }
@@ -777,7 +770,7 @@ void GlobalEvaluationQueue::reset() {
 
     // Clear all slot ready flags
     for (size_t i = 0; i < queue_capacity_; ++i) {
-        slot_ready_[i].store(0, std::memory_order_relaxed);
+        slot_ready_[i].value.store(0, std::memory_order_relaxed);
     }
 
     // Clear worker results and reset generation counters
