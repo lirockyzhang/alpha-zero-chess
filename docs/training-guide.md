@@ -139,6 +139,14 @@ Parameters are grouped by which phase of training they affect:
 |-----------|---------|-------------|
 | `--buffer-persistence` | False | Save/load replay buffer between runs (default: fresh buffer each run) |
 
+#### Prioritized Experience Replay (PER)
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--priority-exponent` | 0.0 | Priority exponent α (0=uniform/disabled, 0.6=recommended) |
+| `--per-beta` | 0.4 | Initial IS correction exponent β |
+| `--per-beta-final` | 1.0 | Final IS correction exponent β |
+| `--per-beta-warmup` | 0 | Iterations to anneal β (0=anneal over all iterations) |
+
 #### Visualization & Evaluation
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -1143,6 +1151,15 @@ evaluate.py --checkpoint checkpoints/f192-b15_.../model_final.pt --opponent rand
 | Parallel Eval | `--eval-batch` | auto | Auto-computed GPU batch size (workers x search_batch, rounded to 32) |
 | Training | `--train-batch` | 256 | Samples per gradient step |
 
+### New in v3.1
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| Prioritized Experience Replay | `--priority-exponent 0` (disabled) | Loss-proportional sampling with IS correction. Enable with `--priority-exponent 0.6` |
+| IS beta annealing | `--per-beta 0.4` → `--per-beta-final 1.0` | Importance sampling weights anneal to fully debias gradients |
+| Per-sample loss | Enabled when PER active | Training computes per-sample policy+value loss for priority updates |
+| RPBF v3 priorities | Auto | Buffer files include priority section when PER enabled |
+
 ### New in v3.0
 
 | Feature | Default | Description |
@@ -1173,7 +1190,7 @@ evaluate.py --checkpoint checkpoints/f192-b15_.../model_final.pt --opponent rand
 
 ---
 
-**Last Updated**: 2026-02-16
+**Last Updated**: 2026-02-18
 
 
 │ GPU Batch Collection & Evaluation Pipeline Redesign                                                                           │

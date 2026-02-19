@@ -895,3 +895,117 @@ Three root causes have been fixed:
 | Recovery | Draw rate < 70% sustained for 3+ iters after stagnation | 2 (then 3) | Gradual restoration |
 
 **The second run's mistake:** Starting with `epochs=3` allowed value_loss to collapse from 0.95 to 0.38 in just 3 iterations. By the time we intervened (epochs=2 at iter 4, epochs=1 at iter 5), the buffer was already >90% draws. Starting with `epochs=2` would have slowed the collapse and kept the value head more receptive to future decisive games.
+
+### 10o. Buffet Approach — High-Temperature Bootstrap (Experimental)
+
+**Status: THEORY VALIDATED (partial), KEY CONSTRAINT DISCOVERED**
+
+The "Buffet" approach uses extremely high temperature (`temperature_moves=80`) with shallow search (`simulations=64`) to generate diverse, decisive training data from iteration 1. The theory: 80 random moves place the game in wild midgame/endgame positions with material imbalances, which are inherently decisive. See `Road_to_2500.md` for the full training plan.
+
+**Experiment 1: Buffet on draw-biased model (FAILED)**
+
+Applied Buffet parameters (temp=80, sims=64, epochs=1, train_batch=1024) to a model at iteration 20 that had a collapsed value head (value_loss=0.273, buffer 92% draws).
+
+| Metric | Expected (fresh model) | Observed (iter 20 model) |
+|--------|----------------------|-------------------------|
+| Decisive games | 40-60%+ | **1/128 (0.8%)** |
+| Draw rate | <60% | **99%** |
+| Fifty-move draws | ~0 | **117/128** |
+| Value loss after training | >0.5 | **0.098 (further collapse)** |
+| Avg game length | 80-150 | **355.7** |
+
+**Root cause: The Buffet approach requires FRESH random weights.** A draw-biased model defeats the randomization mechanism:
+
+1. After 80 random moves, the model's POLICY takes over for the remaining 200+ moves
+2. The draw-biased VALUE HEAD evaluates all positions as ~0.0 ("draw"), giving MCTS no signal to pursue winning lines
+3. The model is "too smart to lose accidentally" (knows how to avoid checkmate) but "not smart enough to win intentionally" (can't convert material advantages)
+4. Result: games drift aimlessly for 200+ moves until the fifty-move rule triggers
+
+**Experiment 2: Buffet on fresh random model (CONFIRMED — partial)**
+
+Started a new run from random weights with the same Buffet parameters. The very first game to complete was decisive (black win, 132 moves). The run was stopped early for analysis, but the single data point confirms random models DO produce accidental checkmates that the Buffet approach depends on.
+
+**Critical constraint (new):** The Buffet approach is a COLD-START strategy only. It cannot be retroactively applied to a model that has already developed draw bias. If draw death has set in, the only recovery is to start from scratch — no combination of temperature, simulations, epochs, or risk_beta can overcome a deeply entrenched draw-biased value head in this regime.
+
+**Why parameter tuning fails on a draw-collapsed model:**
+
+| Intervention | Why it fails |
+|-------------|-------------|
+| `temperature_moves=80` | Random moves create diverse POSITIONS, but the model's policy still plays for draws after move 80 |
+| `epochs=1` | Reduces draw reinforcement per iteration, but with 99% draw games there's no W/L signal to amplify |
+| `risk_beta=0.5` | ERM needs value variance (`Var(v)`). When value_loss < 0.1, the model predicts "draw" with certainty — zero variance for risk_beta to exploit |
+| `simulations=64` (low) | Shallow search helps random models stay uncertain, but a trained model's value head overrides search uncertainty |
+
+**Recommended protocol:**
+1. If starting a new training run: use Buffet from iteration 1 (temp=80, sims=64, epochs=1)
+2. If current run has value_loss > 0.4 and draw rate < 80%: apply Section 10n epochs schedule
+3. If current run has value_loss < 0.3 and draw rate > 90%: **start fresh** — the model cannot be recovered
+4. The threshold between "recoverable" and "start fresh" is approximately value_loss ≈ 0.3-0.4 combined with buffer draw saturation > 90%
+
+### 10p. Self-Play Timing with Low Simulations
+
+**Observed (from Buffet runs with sims=64, 32 workers, gumbel_top_k=16):**
+
+| Metric | Expected (plan) | Observed |
+|--------|----------------|----------|
+| Self-play time per iter | 10-20 sec | **~20 min** |
+| Games per second | ~6-12 | **~0.1** |
+| Avg game length | 80-150 moves | **320-360 moves** |
+| NN throughput | ~2,200 evals/s | ~2,200 evals/s (confirmed) |
+| Moves per second | ~100+ | **~37** |
+
+**Why self-play is slower than expected:** The plan assumed short games (80-150 moves) with temp=80, but early-training games with random weights are LONG (300+ moves). Each game requires 300+ moves × 64 sims × 16 search_batch leaf evaluations, not the 80-150 moves assumed. The NN throughput is as expected (~2,200 evals/s with large CUDA graph batches of ~415), but the sheer number of moves per game makes each iteration take ~20 minutes instead of 10-20 seconds.
+
+**Implication for the training plan:** Phase 1 iterations take ~20 minutes each (not seconds). With 50 iterations planned, Phase 1 takes ~17 hours. This is still much faster than sims=200 runs (which took 20-40 min per iter with similarly long games), but the "training becomes the bottleneck" prediction was wrong — self-play still dominates.
+
+### 10q. Prioritized Experience Replay (PER)
+
+**What it is:** PER (Schaul et al., 2015) replaces uniform replay buffer sampling with loss-proportional sampling. Positions the model struggles with (high training loss) are sampled more frequently, focusing gradient updates where they matter most.
+
+**Parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--priority-exponent` | 0.0 | Priority exponent α. 0=uniform (disabled), 0.6=recommended |
+| `--per-beta` | 0.4 | Initial IS correction exponent β |
+| `--per-beta-final` | 1.0 | Final IS correction exponent β |
+| `--per-beta-warmup` | 0 | Iterations to anneal β (0=anneal over all iterations) |
+
+**How it works internally:**
+
+1. A **sum-tree** (segment tree) is allocated alongside the replay buffer. Each leaf stores `priority^α` for one buffer sample. Internal nodes store child sums, enabling O(log N) proportional sampling.
+2. **New samples** enter with `max_priority` (the highest priority seen so far), guaranteeing they are drawn at least once for training.
+3. **Self-play workers** call `set_leaf()` (O(1), no lock) when adding samples. A `tree_needs_rebuild_` flag is set.
+4. **Training thread** calls `sample_prioritized()`, which first does a deferred `rebuild()` (O(N) bottom-up fix) if flagged, then performs stratified sampling from the sum-tree.
+5. **Per-sample loss** (policy CE + value CE) is computed during training. After the optimizer step, `update_priorities(indices, losses + ε)` writes fresh priorities into the tree.
+6. **IS (Importance Sampling) weights** correct the gradient bias: `w_i = (N × P(i))^(-β)`, normalized so `max(w) = 1`. β anneals from `--per-beta` to `--per-beta-final` over `--per-beta-warmup` iterations.
+
+**Priority lifecycle:**
+- Sample added → `max_priority` (guaranteed first draw)
+- Drawn into batch → forward pass computes current per-sample loss
+- After backward pass → `update_priorities()` writes fresh loss as new priority
+- Sits in buffer → priority becomes "stale" (reflects old model's loss)
+- Drawn again → priority refreshed with current model's loss
+
+Staleness is acceptable: high-loss samples are drawn more often (stay fresher), low-loss samples change less (staleness matters less), and the circular buffer naturally evicts the oldest samples.
+
+**Zero-overhead guarantee (α=0):**
+When `--priority-exponent 0` (the default), `enable_per()` is never called. The sum-tree is never allocated. `add_sample()` skips one null-pointer check. `sample()` is called instead of `sample_prioritized()`. No IS weights, no `update_priorities()`, no extra memory. RPBF saves as v3 without a priorities section.
+
+**When to enable PER:**
+- After the model has learned basic piece movement (typically iteration 10+)
+- When training loss has plateaued and you want more efficient gradient usage
+- When buffer is large (100K+) and many samples are "easy" for the current model
+
+**When NOT to enable PER:**
+- During initial random-weight phase (all losses are similarly high — no benefit from prioritization)
+- If buffer is very small (<10K) — uniform sampling already covers most positions
+
+**Recommended settings:**
+```bash
+--priority-exponent 0.6 --per-beta 0.4 --per-beta-final 1.0 --per-beta-warmup 0
+```
+
+**RPBF v3 format:** Buffer files saved with PER enabled include a priorities section after metadata (flag in `reserved[0]` bit 0). Loading a file with priorities into a PER-enabled buffer restores the priority distribution. Loading without PER enabled skips the priorities section. Files saved without PER are also valid v3 (no priorities section).
+
+**Memory overhead:** Negligible. A 100K-capacity buffer uses ~1 MB for the sum-tree vs ~3 GB for observations. On disk, priorities add 400 KB per 100K samples.

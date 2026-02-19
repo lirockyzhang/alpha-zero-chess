@@ -355,6 +355,8 @@ class IterationMetrics:
     risk_beta: float = 0.0
     grad_norm_avg: float = 0.0
     grad_norm_max: float = 0.0
+    # PER metrics
+    per_beta: float = 0.0
     # Buffer metrics
     buffer_size: int = 0
     # Timing
@@ -2036,8 +2038,14 @@ def train_iteration(
     epochs: int,
     device: str,
     scaler: GradScaler,
+    per_beta: float = 0.0,
 ) -> dict:
-    """Train for one iteration using C++ ReplayBuffer."""
+    """Train for one iteration using C++ ReplayBuffer.
+
+    When PER is enabled (replay_buffer.per_enabled() and per_beta > 0),
+    uses prioritized sampling with IS weight correction and updates
+    priorities after each gradient step.
+    """
     network.train()
 
     # Check model weights for NaN/inf before training (catches corrupted checkpoints)
@@ -2049,6 +2057,8 @@ def train_iteration(
                 'error': f'NaN/inf in parameter: {name}'
             }
 
+    use_per = replay_buffer.per_enabled() and per_beta > 0
+
     total_loss = 0
     total_policy_loss = 0
     total_value_loss = 0
@@ -2059,7 +2069,13 @@ def train_iteration(
 
     for epoch in range(epochs):
         # Sample batch from C++ ReplayBuffer
-        obs, policies, values, wdl_targets, soft_values = replay_buffer.sample(batch_size)
+        indices = None
+        if use_per:
+            obs, policies, values, wdl_targets, soft_values, indices, is_weights = \
+                replay_buffer.sample_prioritized(batch_size, per_beta)
+            is_weights_tensor = torch.from_numpy(is_weights).to(device)
+        else:
+            obs, policies, values, wdl_targets, soft_values = replay_buffer.sample(batch_size)
 
         # Convert to PyTorch tensors
         # obs is (batch, 7872) flat, need to reshape to (batch, 123, 8, 8)
@@ -2076,10 +2092,11 @@ def train_iteration(
             # Forward pass (no mask during training - targets already masked)
             policy_pred, value_pred, policy_logits, wdl_logits = network(obs_tensor)
 
-            # Policy loss: NaN-safe cross-entropy (handles 0 * -inf = NaN edge case)
-            policy_loss = -torch.sum(
-                torch.nan_to_num(policy_target * F.log_softmax(policy_logits, dim=1), nan=0.0)
-            ) / policy_logits.size(0)
+            # Per-sample policy loss: NaN-safe cross-entropy — shape (batch,)
+            per_sample_policy = -torch.sum(
+                torch.nan_to_num(policy_target * F.log_softmax(policy_logits, dim=1), nan=0.0),
+                dim=1
+            )
 
             # Value loss: soft WDL cross-entropy with pure game outcome targets
             # Build outcome WDL from scalar game result: win→[1,0,0], draw→[0,1,0], loss→[0,0,1]
@@ -2088,13 +2105,24 @@ def train_iteration(
             outcome_wdl[:, 1] = ((value_target >= -0.5) & (value_target <= 0.5)).float()  # draw
             outcome_wdl[:, 2] = (value_target < -0.5).float()   # loss
 
-            # Soft cross-entropy: NaN-safe (handles 0 * -inf = NaN edge case)
-            value_loss = -torch.sum(
-                torch.nan_to_num(outcome_wdl * F.log_softmax(wdl_logits, dim=1), nan=0.0)
-            ) / wdl_logits.size(0)
+            # Per-sample value loss: NaN-safe — shape (batch,)
+            per_sample_value = -torch.sum(
+                torch.nan_to_num(outcome_wdl * F.log_softmax(wdl_logits, dim=1), nan=0.0),
+                dim=1
+            )
 
-            # Total loss
-            loss = policy_loss + value_loss
+            # Per-sample total loss — shape (batch,)
+            per_sample_total = per_sample_policy + per_sample_value
+
+            # Compute weighted or unweighted loss for backprop
+            if use_per:
+                loss = torch.mean(is_weights_tensor * per_sample_total)
+            else:
+                loss = torch.mean(per_sample_total)
+
+            # Unweighted means for logging (comparable regardless of PER)
+            policy_loss = per_sample_policy.mean()
+            value_loss = per_sample_value.mean()
 
         # Skip batch if loss is NaN/inf (corrupted weights or bad data)
         if torch.isnan(loss) or torch.isinf(loss):
@@ -2119,6 +2147,12 @@ def train_iteration(
 
         scaler.step(optimizer)   # internally skips if unscale_ found inf
         scaler.update()
+
+        # PER: update priorities with fresh per-sample losses
+        if use_per and indices is not None:
+            with torch.no_grad():
+                new_priorities = per_sample_total.detach().cpu().numpy() + 1e-6
+            replay_buffer.update_priorities(indices, new_priorities)
 
         total_loss += loss.item()
         total_policy_loss += policy_loss.item()
@@ -2248,6 +2282,17 @@ Examples:
                         help="Max multiplier for extra fill-up games (default: 3). "
                              "Fill-up plays at most N * games_per_iter extra games. "
                              "Set to 0 to disable fill-up entirely.")
+
+    # Prioritized Experience Replay (PER)
+    parser.add_argument("--priority-exponent", type=float, default=0.0,
+                        help="PER priority exponent alpha (default: 0.0 = uniform sampling). "
+                             "Recommended: 0.6. Higher = more aggressive prioritization.")
+    parser.add_argument("--per-beta", type=float, default=0.4,
+                        help="PER IS correction beta start (default: 0.4)")
+    parser.add_argument("--per-beta-final", type=float, default=1.0,
+                        help="PER IS correction beta end (default: 1.0 = full correction)")
+    parser.add_argument("--per-beta-warmup", type=int, default=0,
+                        help="Iterations to anneal beta from start to final (default: 0 = anneal over all iterations)")
 
     # Device and paths
     parser.add_argument("--device", type=str, default="cuda",
@@ -2415,6 +2460,10 @@ Examples:
     if args.opponent_risk:
         print(f"Opponent risk:       {args.opponent_risk}")
     print(f"Buffer:              {args.buffer_size} positions")
+    if args.priority_exponent > 0:
+        print(f"PER:                 alpha={args.priority_exponent:g}, "
+              f"beta={args.per_beta:g}->{args.per_beta_final:g}, "
+              f"warmup={args.per_beta_warmup or 'all'}")
     print(f"Checkpoints:         model_iter_*.pt (every {args.save_interval} iters)")
     print(f"Visualization:       {'disabled' if args.no_visualization else 'summary.html'}")
     print(f"Progress reports:    Every {args.progress_interval:.0f} seconds")
@@ -2456,6 +2505,10 @@ Examples:
 
     # Create C++ ReplayBuffer
     replay_buffer = alphazero_cpp.ReplayBuffer(capacity=args.buffer_size)
+
+    # Enable PER if requested (must be before buffer load so priorities are loaded)
+    if args.priority_exponent > 0:
+        replay_buffer.enable_per(args.priority_exponent)
 
     # Resume from checkpoint (load model weights)
     if checkpoint_path and os.path.exists(checkpoint_path):
@@ -2597,6 +2650,8 @@ Examples:
               f"dirichlet_epsilon={args.dirichlet_epsilon:g}, temperature_moves={args.temperature_moves}")
         print(f"  Risk:      risk_beta={args.risk_beta:g}")
         print(f"  Training:  lr={args.lr:.2e}, train_batch={args.train_batch}, epochs={args.epochs}")
+        if args.priority_exponent > 0:
+            print(f"  PER:       alpha={args.priority_exponent:g}, beta={args.per_beta:g}->{args.per_beta_final:g}")
         print(f"  Self-play: games_per_iter={args.games_per_iter}, workers={args.workers}, "
               f"max_fillup_factor={args.max_fillup_factor}")
         if args.opponent_risk_min != 0.0 or args.opponent_risk_max != 0.0:
@@ -3199,9 +3254,17 @@ Examples:
 
                 train_start = time.time()
 
+                # PER beta annealing
+                current_per_beta = 0.0
+                if args.priority_exponent > 0:
+                    warmup = args.per_beta_warmup if args.per_beta_warmup > 0 else args.iterations
+                    progress = min(1.0, (iteration + 1) / max(warmup, 1))
+                    current_per_beta = args.per_beta + progress * (args.per_beta_final - args.per_beta)
+
                 train_metrics = train_iteration(
                     network, optimizer, replay_buffer,
                     args.train_batch, args.epochs, device, scaler,
+                    per_beta=current_per_beta,
                 )
 
                 metrics.train_time = time.time() - train_start
@@ -3211,6 +3274,7 @@ Examples:
                 metrics.num_train_batches = train_metrics['num_batches']
                 metrics.grad_norm_avg = train_metrics.get('grad_norm_avg', 0.0)
                 metrics.grad_norm_max = train_metrics.get('grad_norm_max', 0.0)
+                metrics.per_beta = current_per_beta
 
                 if 'error' in train_metrics:
                     print(f"  Training ERROR: {train_metrics['error']}")
@@ -3258,6 +3322,7 @@ Examples:
             "selfplay_time": metrics.selfplay_time,
             "train_time": metrics.train_time,
             "total_time": metrics.total_time,
+            "per_beta": metrics.per_beta,
         })
 
         # Log iteration to Claude JSONL (if enabled)
