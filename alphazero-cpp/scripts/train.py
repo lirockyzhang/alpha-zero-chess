@@ -2547,25 +2547,34 @@ Examples:
             print(f"Emergency checkpoint detected — will re-train iteration {start_iter + 1}")
         print(f"Resumed from iteration {start_iter}")
 
-        # Try to load replay buffer from .rpbf file (try newest first, fall back)
-        import glob as glob_mod
-        rpbf_files = sorted(glob_mod.glob(os.path.join(run_dir, "buffer_iter_*.rpbf")))
+        # Try to load replay buffer — new fixed name first, fall back to old per-iteration files
         buffer_loaded = False
-        for rpbf_candidate in reversed(rpbf_files):
-            print(f"  Loading replay buffer: {rpbf_candidate}...", end=" ", flush=True)
-            if replay_buffer.load(rpbf_candidate):
+        buffer_path = os.path.join(run_dir, "replay_buffer.rpbf")
+        if os.path.exists(buffer_path):
+            print(f"  Loading replay buffer: {buffer_path}...", end=" ", flush=True)
+            if replay_buffer.load(buffer_path):
                 comp = replay_buffer.get_composition()
                 print(f"done ({replay_buffer.size()} samples, "
                       f"W={comp['wins']} D={comp['draws']} L={comp['losses']})")
                 buffer_loaded = True
-                break
             else:
-                print("FAILED, trying older buffer...")
+                print("FAILED")
         if not buffer_loaded:
-            if rpbf_files:
-                print("  WARNING: All replay buffer files failed to load (starting with empty buffer)")
-            else:
-                print("  No replay buffer file found (starting with empty buffer)")
+            # Fall back to old per-iteration naming (buffer_iter_NNN.rpbf)
+            import glob as glob_mod
+            rpbf_files = sorted(glob_mod.glob(os.path.join(run_dir, "buffer_iter_*.rpbf")))
+            for rpbf_candidate in reversed(rpbf_files):
+                print(f"  Loading replay buffer: {rpbf_candidate}...", end=" ", flush=True)
+                if replay_buffer.load(rpbf_candidate):
+                    comp = replay_buffer.get_composition()
+                    print(f"done ({replay_buffer.size()} samples, "
+                          f"W={comp['wins']} D={comp['draws']} L={comp['losses']})")
+                    buffer_loaded = True
+                    break
+                else:
+                    print("FAILED, trying older buffer...")
+        if not buffer_loaded:
+            print("  No replay buffer file found (starting with empty buffer)")
 
         # Truncate metrics history to discard records from reverted iterations
         metrics_removed = truncate_history_to_iteration(metrics_history, start_iter)
@@ -2799,6 +2808,9 @@ Examples:
         }, emergency_path)
         print(f"  Saved checkpoint: {emergency_path}")
 
+        # Save replay buffer
+        save_replay_buffer()
+
         # Save metrics history
         save_metrics_history(run_dir, metrics_history)
         print(f"  Saved metrics to: {run_dir}")
@@ -2836,6 +2848,37 @@ Examples:
             "draws": comp["draws"],
             "losses": comp["losses"],
         }
+
+    def save_replay_buffer() -> bool:
+        """Save replay buffer to {run_dir}/replay_buffer.rpbf atomically.
+
+        Writes to system temp dir first, then moves to final path to avoid
+        OneDrive interference. Returns True on success, False on failure.
+        """
+        import tempfile
+        import shutil
+        buffer_path = os.path.join(run_dir, "replay_buffer.rpbf")
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".rpbf", prefix="buffer_")
+        os.close(tmp_fd)
+        try:
+            if replay_buffer.save(tmp_path):
+                shutil.move(tmp_path, buffer_path)
+                comp = replay_buffer.get_composition()
+                buf_mb = os.path.getsize(buffer_path) / (1024 * 1024)
+                print(f"  Saved replay buffer: {buffer_path} ({buf_mb:.1f} MB, "
+                      f"W={comp['wins']} D={comp['draws']} L={comp['losses']})")
+                return True
+            else:
+                print(f"  WARNING: Failed to save replay buffer to {buffer_path}")
+                return False
+        except Exception as e:
+            print(f"  WARNING: Replay buffer save error: {e}")
+            return False
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
     def check_training_ready():
         """Check if buffer has enough samples for training."""
@@ -3214,6 +3257,9 @@ Examples:
                 f.flush()
                 os.fsync(f.fileno())
 
+        # Persist replay buffer after self-play (before training begins)
+        save_replay_buffer()
+
         # Handle shutdown after self-play
         if shutdown_handler.should_stop():
             emergency_save(iteration + 1, f"Shutdown after self-play ({metrics.num_games} games)")
@@ -3393,25 +3439,6 @@ Examples:
             }, checkpoint_save_path)
             print(f"  Saved checkpoint: {checkpoint_save_path}")
 
-            # Save replay buffer (write to system temp dir, then move — avoids OneDrive interference)
-            import tempfile
-            buffer_path = os.path.join(run_dir, f"buffer_iter_{iteration + 1:03d}.rpbf")
-            buffer_tmp_fd, buffer_tmp_path = tempfile.mkstemp(suffix=".rpbf", prefix="buffer_")
-            os.close(buffer_tmp_fd)
-            if replay_buffer.save(buffer_tmp_path):
-                import shutil
-                shutil.move(buffer_tmp_path, buffer_path)
-                comp = replay_buffer.get_composition()
-                buf_mb = os.path.getsize(buffer_path) / (1024 * 1024) if os.path.exists(buffer_path) else 0
-                print(f"  Saved replay buffer: {buffer_path} ({buf_mb:.1f} MB, "
-                      f"W={comp['wins']} D={comp['draws']} L={comp['losses']})")
-            else:
-                print(f"  WARNING: Failed to save replay buffer to {buffer_path}")
-                try:
-                    os.remove(buffer_tmp_path)
-                except OSError:
-                    pass
-
             # Save training metrics JSON
             save_metrics_history(run_dir, metrics_history)
             print(f"  Saved training metrics: {os.path.join(run_dir, 'training_metrics.json')}")
@@ -3425,7 +3452,7 @@ Examples:
         if live_dashboard is not None:
             live_dashboard.push_metrics(metrics)
 
-        # Save final checkpoint and replay buffer (at save_interval)
+        # Save final checkpoint (at save_interval)
         if save_checkpoint_now:
             is_final = (iteration == args.iterations - 1)
 

@@ -431,7 +431,7 @@ uv run python alphazero-cpp/scripts/monitor_iteration.py --latest --timeout 3600
 ### Scenario: Buffer Draw Saturation (after resume or draw-heavy phase)
 **Symptoms**: After `--resume`, high draw rate continuing, buffer composition shows >90% draws (check `get_composition()`), value_loss dropping toward 0
 **Root Cause**: If the buffer is saturated with draw data (either from loading a draw-heavy `.rpbf` file or from sustained draw-only self-play), training reinforces the "always draw" value prediction.
-**Note**: `--resume` now automatically loads the most recent `buffer_iter_*.rpbf` file, preserving all accumulated data. This largely prevents the catastrophic buffer reset that previously occurred. However, if the saved buffer itself was draw-saturated, the problem persists.
+**Note**: `--resume` now automatically loads `replay_buffer.rpbf` from the run directory, preserving all accumulated data. This largely prevents the catastrophic buffer reset that previously occurred. However, if the saved buffer itself was draw-saturated, the problem persists.
 **Fix**:
 1. Check buffer composition: `get_composition()` in the iteration log
 2. If draws > 90% of buffer, set `epochs=1` to minimize draw reinforcement
@@ -507,7 +507,7 @@ These are hard-won lessons from actual training runs. Read carefully before maki
 **Always copy your original launch command and modify it** rather than relying on `--resume` alone.
 
 **Buffer state after resume:**
-- The replay buffer is now automatically saved to `buffer_iter_NNN.rpbf` after each checkpoint and loaded on `--resume`. All accumulated data (observations, policies, values, WDL targets, per-sample metadata) is preserved.
+- The replay buffer is saved to `replay_buffer.rpbf` (single fixed file, overwritten each iteration) after every self-play phase and during emergency saves. On `--resume`, this file is loaded automatically. All accumulated data (observations, policies, values, WDL targets, per-sample metadata) is preserved.
 - After resume, check the logged buffer composition (`wins`/`draws`/`losses` in the iteration log) to verify data was loaded correctly.
 - If the loaded buffer is draw-saturated (>90% draws), set `epochs=1` immediately to minimize draw reinforcement (see Section 9: Buffer Draw Saturation).
 - `max_fillup_factor` may still trigger expanded game generation if the loaded buffer is below capacity.
@@ -774,7 +774,7 @@ When R² is low, the crossover analysis selects degenerate graph sizes (all tier
 
 ### 10l. Buffer Persistence on Resume
 
-**`--resume` now automatically loads the replay buffer.** After each checkpoint, the buffer is saved to `buffer_iter_NNN.rpbf` in the run directory. On resume, the most recent `.rpbf` file is found and loaded, preserving all accumulated training data including per-sample metadata (iteration, game result, termination reason, move number, game length).
+**`--resume` now automatically loads the replay buffer.** The buffer is saved to a single `replay_buffer.rpbf` file (overwritten each iteration) after every self-play phase and during emergency saves (Ctrl+C, crash, stop file). On resume, this file is loaded directly, preserving all accumulated training data including per-sample metadata (iteration, game result, termination reason, move number, game length). For backward compatibility, if `replay_buffer.rpbf` is not found, the loader falls back to the old `buffer_iter_*.rpbf` naming convention.
 
 **What is saved in `.rpbf` files:**
 - All observations, policies, values, WDL targets, and soft values

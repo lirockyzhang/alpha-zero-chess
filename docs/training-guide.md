@@ -15,7 +15,7 @@ checkpoints/f192-b15_2024-02-03_14-30-00/
 ├── training_metrics.json        # Loss, games, moves per iteration
 ├── evaluation_results.json      # vs_random win rate, endgame scores
 ├── summary.html                 # Visual training summary (default)
-└── replay_buffer.rpbf           # Only if --buffer-persistence
+└── replay_buffer.rpbf           # Replay buffer (saved after each self-play phase)
 ```
 
 ```bash
@@ -133,11 +133,6 @@ Parameters are grouped by which phase of training they affect:
 | `--resume` | - | Resume from checkpoint path (.pt file) or run directory |
 | `--save-interval` | 1 | Save every N iterations |
 | `--progress-interval` | 30 | Print performance stats every N seconds |
-
-#### Buffer Persistence
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--buffer-persistence` | False | Save/load replay buffer between runs (default: fresh buffer each run) |
 
 #### Prioritized Experience Replay (PER)
 | Parameter | Default | Description |
@@ -761,7 +756,7 @@ This will:
 2. Start from the next iteration (e.g., iteration 51)
 3. Load `training_metrics.json` and append new metrics
 4. Load `evaluation_results.json` and append new evaluations
-5. Load replay buffer (only if `--buffer-persistence` is set)
+5. Load replay buffer from `replay_buffer.rpbf`
 6. Continue saving to the same run directory
 
 
@@ -771,7 +766,7 @@ The training script supports **graceful shutdown**. When you press Ctrl+C:
 
 1. **Finishes the current game** (doesn't interrupt mid-game)
 2. **Saves an emergency checkpoint** to `{run_dir}/model_iter_XXX_emergency.pt`
-3. **Saves the replay buffer** (only if `--buffer-persistence` is enabled)
+3. **Saves the replay buffer** to `replay_buffer.rpbf`
 4. **Saves training metrics** to `training_metrics.json`
 5. **Prints resume instructions**
 
@@ -919,7 +914,7 @@ checkpoints/f192-b15_YYYY-MM-DD_HH-MM-SS/
 ├── training_metrics.json     # Per-iteration metrics (loss, games, etc.)
 ├── evaluation_results.json   # Evaluation metrics per checkpoint
 ├── summary.html              # Visual summary with charts
-└── replay_buffer.rpbf        # Only if --buffer-persistence
+└── replay_buffer.rpbf        # Replay buffer (saved after each self-play phase)
 ```
 
 ### Viewing the Summary
