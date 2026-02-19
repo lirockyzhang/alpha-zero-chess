@@ -7,7 +7,7 @@ and evaluation. Extracting it ensures checkpoint compatibility between
 train.py and evaluation.py.
 
 Architecture matches AlphaZero paper standard settings:
-- Configurable input channels (default: 122 for extended encoding)
+- Configurable input channels (default: 123 for extended encoding)
 - 2 policy filters (paper standard)
 - 256 value hidden units (paper standard)
 - Residual tower with configurable depth/width
@@ -21,8 +21,8 @@ import torch.nn.functional as F
 # Constants
 # =============================================================================
 
-# 122-channel encoding (8 history * 14 piece planes + 8 repetition + 2 color/castling)
-INPUT_CHANNELS = 122
+# 123-channel encoding (12 piece + 1 color + 1 movecount + 4 castling + 1 noprogress + 8*13 history)
+INPUT_CHANNELS = 123
 POLICY_SIZE = 4672
 
 
@@ -202,7 +202,7 @@ class AlphaZeroNet(nn.Module):
 
     Architecture matches alphazero/neural/network.py exactly for checkpoint compatibility.
     Uses AlphaZero paper standard settings:
-    - 122 input channels (extended encoding)
+    - 123 input channels (extended encoding)
     - 2 policy filters
     - 256 value hidden units
 
@@ -265,12 +265,15 @@ class AlphaZeroNet(nn.Module):
           0.0 (none), 0.33 (queenside only), 0.67 (kingside only), 1.0 (both)
         After h-flip, kingside and queenside swap, so 0.67↔0.33.
         Values 0.0 and 1.0 are symmetric and unchanged.
+
+        Uses in-place write instead of torch.cat along channels to preserve
+        channels_last memory format (torch.flip returns a new tensor, not a view).
         """
-        x_f = torch.flip(x, [3])  # Flip file axis (dim 3 in NCHW)
+        x_f = torch.flip(x, [3])  # Flip file axis (dim 3 in NCHW); new tensor
         ch = x_f[:, 16:17, :, :]
-        needs_swap = ((ch > 0.1) & (ch < 0.9)).float()
-        fixed = needs_swap * (1.0 - ch) + (1.0 - needs_swap) * ch
-        return torch.cat([x_f[:, :16], fixed, x_f[:, 17:]], dim=1)
+        needs_swap = (ch > 0.1) & (ch < 0.9)
+        x_f[:, 16:17, :, :] = torch.where(needs_swap, 1.0 - ch, ch)
+        return x_f
 
     def forward(self, x, mask=None):
         B = x.shape[0]
@@ -278,6 +281,8 @@ class AlphaZeroNet(nn.Module):
         # Batch original + mirrored for a single efficient GPU pass
         x_flip = self._mirror_input(x)
         x_both = torch.cat([x, x_flip], dim=0)  # (2B, C, 8, 8)
+        if x_both.device.type == 'cuda':
+            x_both = x_both.contiguous(memory_format=torch.channels_last)
 
         trunk = self._trunk(x_both)  # (2B, F, 8, 8)
 

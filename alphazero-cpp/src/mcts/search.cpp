@@ -34,6 +34,11 @@ Node* MCTSSearch::init_search(const chess::Board& root_position,
     root_ = pool_.allocate();
     expand(root_, root_position_, root_policy, root_value);
 
+    // Seed root with initial NN evaluation so sqrt(N_parent) > 0.
+    // Without this, batch_size>1 PUCT selections all collapse onto one child
+    // because the exploration term c_puct * P * sqrt(0) / (1+n) = 0.
+    root_->update_root(root_value);
+
     if (config_.use_gumbel) {
         // Gumbel noise replaces Dirichlet noise
         init_gumbel();
@@ -115,12 +120,6 @@ void MCTSSearch::update_leaves(const std::vector<std::vector<float>>& policies,
         if (config_.use_gumbel) advance_gumbel_sim();
     }
 
-    // If we received fewer results than pending evaluations,
-    // remove virtual losses from the remaining paths to prevent tree corruption
-    for (int i = batch_size; i < static_cast<int>(pending_evals_.size()); ++i) {
-        remove_virtual_losses_for_path(pending_evals_[i].node);
-    }
-
     // Clear pending evaluations
     pending_evals_.clear();
     simulations_in_flight_ = 0;
@@ -176,9 +175,6 @@ void MCTSSearch::run_selection_phase(int num_sims) {
 Node* MCTSSearch::select(Node* node, chess::Board& board) {
     int depth = 0;
     while (node->is_expanded() && !node->is_terminal()) {
-        // Add virtual loss to prevent other threads from selecting same path
-        if (config_.use_virtual_loss) node->add_virtual_loss();
-
         Node* best_child = nullptr;
 
         // Gumbel mode: round-robin root child selection (depth 0 only)
@@ -207,11 +203,6 @@ Node* MCTSSearch::select(Node* node, chess::Board& board) {
         node = best_child;
         depth++;
     }
-
-    // Add VL to the leaf/terminal node for symmetry with backpropagate()
-    // and remove_virtual_losses_for_path(), which both remove VL from
-    // every node including the leaf.
-    if (config_.use_virtual_loss) node->add_virtual_loss();
 
     // Update depth tracking
     if (depth > max_depth_) max_depth_ = depth;
@@ -295,10 +286,6 @@ void MCTSSearch::expand(Node* node, const chess::Board& board,
 
 void MCTSSearch::backpropagate(Node* node, float value) {
     while (node != nullptr) {
-        // Remove virtual loss
-        if (config_.use_virtual_loss) node->remove_virtual_loss();
-
-        // Update node value
         if (node->parent == nullptr) {
             // Root node - use release semantics
             node->update_root(value);
@@ -314,8 +301,6 @@ void MCTSSearch::backpropagate(Node* node, float value) {
 
 void MCTSSearch::backpropagate(Node* node, float value, float pw, float pd, float pl) {
     while (node != nullptr) {
-        if (config_.use_virtual_loss) node->remove_virtual_loss();
-
         if (node->parent == nullptr) {
             node->update_root(value);
             // Accumulate WDL at root only (not at intermediate nodes)
@@ -336,7 +321,6 @@ void MCTSSearch::backpropagate(Node* node, float value, float pw, float pd, floa
 float MCTSSearch::puct_score(const Node* parent, const Node* child) const {
     uint32_t parent_visits = parent->visit_count.load(std::memory_order_relaxed);
     uint32_t child_visits = child->visit_count.load(std::memory_order_relaxed);
-    int16_t virtual_loss = child->virtual_loss.load(std::memory_order_relaxed);
 
     // Risk-adjusted Q-value (delegates to q_value() when risk_beta=0)
     float parent_q = parent->q_value_risk(0.0f, config_.fpu_base, config_.risk_beta);
@@ -345,21 +329,11 @@ float MCTSSearch::puct_score(const Node* parent, const Node* child) const {
     // Prior probability
     float prior = child->prior();
 
-    // PUCT formula: Q + c_puct * P * sqrt(N_parent) / (1 + N_child + virtual_loss)
+    // PUCT formula: Q + c_puct * P * sqrt(N_parent) / (1 + N_child)
     float exploration = config_.c_puct * prior * std::sqrt(static_cast<float>(parent_visits))
-                       / (1.0f + child_visits + virtual_loss);
+                       / (1.0f + child_visits);
 
     return q + exploration;
-}
-
-void MCTSSearch::remove_virtual_losses_for_path(Node* node) {
-    if (!config_.use_virtual_loss) return;
-    // Traverse from leaf to root, removing virtual loss from each node
-    // This undoes the virtual losses added during selection
-    while (node != nullptr) {
-        node->remove_virtual_loss();
-        node = node->parent;
-    }
 }
 
 void MCTSSearch::add_dirichlet_noise(Node* root) {
@@ -521,27 +495,16 @@ void MCTSSearch::update_prev_leaves(const std::vector<std::vector<float>>& polic
         if (config_.use_gumbel) advance_gumbel_sim();
     }
 
-    // Remove virtual losses from any extra leaves that didn't get results
-    for (int i = batch_size; i < static_cast<int>(eval_buffer.size()); ++i) {
-        remove_virtual_losses_for_path(eval_buffer[i].node);
-    }
-
     simulations_in_flight_ -= static_cast<int>(eval_buffer.size());
 }
 
 void MCTSSearch::cancel_prev_pending() {
     const auto& eval_buffer = get_evaluation_buffer();
-    for (const auto& eval : eval_buffer) {
-        remove_virtual_losses_for_path(eval.node);
-    }
     simulations_in_flight_ -= static_cast<int>(eval_buffer.size());
 }
 
 void MCTSSearch::cancel_collection_pending() {
     auto& coll_buffer = get_collection_buffer();
-    for (const auto& eval : coll_buffer) {
-        remove_virtual_losses_for_path(eval.node);
-    }
     simulations_in_flight_ -= static_cast<int>(coll_buffer.size());
     coll_buffer.clear();
 }
@@ -644,9 +607,6 @@ void MCTSSearch::init_gumbel() {
     gumbel_.sims_per_action = std::max(1,
         gumbel_.total_budget / (gumbel_.num_phases * active_count));
 
-    // Gumbel uses round-robin root selection — VL is unnecessary and harmful
-    // (biases Q-values when we need clean Q estimates for scoring)
-    config_.use_virtual_loss = false;
 }
 
 Node* MCTSSearch::get_gumbel_target_child() {

@@ -18,7 +18,7 @@ namespace selfplay {
 // Constants
 // ============================================================================
 
-constexpr size_t OBS_SIZE = 8 * 8 * 122;      // 7808 floats per observation
+constexpr size_t OBS_SIZE = 8 * 8 * 123;      // 7872 floats per observation (123 channels)
 constexpr size_t POLICY_SIZE = 4672;           // Policy vector size
 constexpr size_t MAX_WORKERS = 128;            // Maximum concurrent workers
 constexpr size_t DEFAULT_MAX_BATCH = 512;      // Default max batch size
@@ -83,6 +83,7 @@ struct alignas(64) QueueMetrics {
     std::atomic<uint64_t> partial_submissions{0};     // Times queued < requested
     std::atomic<uint64_t> submission_drops{0};        // Total leaves dropped due to pool exhaustion
     std::atomic<uint64_t> pool_resets{0};             // Times pool was reset
+    std::atomic<uint64_t> submission_waits{0};        // Times workers waited for queue space (backpressure)
 
     double avg_batch_size() const {
         uint64_t batches = total_batches.load(std::memory_order_relaxed);
@@ -105,6 +106,7 @@ struct alignas(64) QueueMetrics {
         partial_submissions = 0;
         submission_drops = 0;
         pool_resets = 0;
+        submission_waits = 0;
     }
 };
 
@@ -145,7 +147,8 @@ public:
         const float* observations,      // num_leaves x OBS_SIZE
         const float* legal_masks,       // num_leaves x POLICY_SIZE
         int num_leaves,
-        std::vector<int32_t>& out_request_ids  // Filled with assigned request IDs
+        std::vector<int32_t>& out_request_ids,  // Filled with assigned request IDs
+        int timeout_ms = 0              // 0 = non-blocking, >0 = block until space available (exits only on shutdown)
     );
 
     // Flush all pending results for this worker and increment generation.
@@ -265,10 +268,16 @@ private:
     std::vector<StagedRequest> staged_requests_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
+    std::condition_variable queue_space_cv_;  // Signaled when collect_batch frees staging slots
 
     // Deferred compaction flag: set when staging head > 75% capacity,
     // executed at start of NEXT collect_batch (after all previous slots consumed)
     bool needs_compaction_{false};
+
+    // Cool-down flag: set when staging buffer is full, cleared by GPU thread
+    // after compaction drains queue to ≤50%. Workers sleep on queue_space_cv_
+    // while this is true. Only GPU thread clears it (single-writer).
+    std::atomic<bool> cooldown_active_{false};
 
     // Batch buffers (aligned/pinned for GPU)
     // batch_obs_buffer_ holds NHWC data (same layout as staging), passed

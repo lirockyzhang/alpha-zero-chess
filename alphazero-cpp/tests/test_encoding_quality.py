@@ -30,7 +30,7 @@ def test_position_encoding_quality():
     print(f"✓ Encoding shape: {encoding.shape}")
     print(f"✓ Encoding dtype: {encoding.dtype}")
 
-    # Encoding is NHWC: shape (8, 8, 122).  Access channel c as encoding[:, :, c].
+    # Encoding is NHWC: shape (8, 8, 123).  Access channel c as encoding[:, :, c].
     # Plane layout: 0-5 current pieces, 6-11 opponent pieces, 12-13 repetition, 14 color, ...
 
     # Plane 0: Current player's pawns (white pawns on rank 1, from white's perspective)
@@ -118,7 +118,7 @@ def test_perspective_flip():
     fen_white = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"
     encoding_white = alphazero_cpp.encode_position(fen_white)
 
-    # Encoding is NHWC (8, 8, 122).  From black's perspective the board is flipped.
+    # Encoding is NHWC (8, 8, 123).  From black's perspective the board is flipped.
     black_pawns = encoding_white[:, :, 0]  # Current player's pawns (black)
     white_pawns = encoding_white[:, :, 6]  # Opponent's pawns (white)
 
@@ -182,7 +182,7 @@ def test_batch_encoding():
 
     # Stack into batch
     batch = np.stack(encodings, axis=0)
-    expected_shape = (3, 8, 8, 122)  # NHWC
+    expected_shape = (3, 8, 8, 123)  # NHWC
     print(f"  Batch shape: {batch.shape} (expected: {expected_shape})")
     print(f"  Batch dtype: {batch.dtype}")
     print(f"  Batch is C-contiguous: {batch.flags['C_CONTIGUOUS']}")

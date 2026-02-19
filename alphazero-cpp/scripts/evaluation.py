@@ -84,6 +84,7 @@ class EvalConfig:
     simulations: int = 800
     search_batch: int = 32
     c_puct: float = 1.5
+    risk_beta: float = 0.0
     device: str = "cuda"
     stockfish_path: Optional[str] = None    # Path to binary (None = auto-detect)
     stockfish_elo: Optional[int] = None     # ELO limit (None = full strength)
@@ -115,10 +116,10 @@ class BatchedEvaluator:
         self.device = device
         self.use_amp = use_amp and device == "cuda"
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def evaluate(self, obs: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, float]:
-        """Evaluate single position."""
-        obs_tensor = torch.from_numpy(obs).float().unsqueeze(0).to(self.device)
+        """Evaluate single position. obs is NHWC (8, 8, C)."""
+        obs_tensor = torch.from_numpy(obs).unsqueeze(0).permute(0, 3, 1, 2).float().to(self.device)
         mask_tensor = torch.from_numpy(mask).float().unsqueeze(0).to(self.device)
 
         if self.use_amp:
@@ -129,10 +130,10 @@ class BatchedEvaluator:
 
         return policy[0].cpu().numpy(), float(value[0].item())
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def evaluate_batch(self, obs_batch: np.ndarray, mask_batch: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Evaluate batch of positions."""
-        obs_tensor = torch.from_numpy(obs_batch).float().to(self.device)
+        """Evaluate batch of positions. obs_batch is NHWC (N, 8, 8, C)."""
+        obs_tensor = torch.from_numpy(obs_batch).permute(0, 3, 1, 2).float().to(self.device)
         mask_tensor = torch.from_numpy(mask_batch).float().to(self.device)
 
         if self.use_amp:
@@ -360,7 +361,8 @@ class VsRandomEvaluator(Evaluator):
         start_time = time.time()
 
         results = self._play_games(
-            evaluator, num_games, eval_sims, eval_search_batch, config.c_puct
+            evaluator, num_games, eval_sims, eval_search_batch,
+            config.c_puct, config.risk_beta
         )
 
         elapsed = time.time() - start_time
@@ -394,7 +396,8 @@ class VsRandomEvaluator(Evaluator):
         )
 
     def _play_games(self, evaluator: BatchedEvaluator, num_games: int,
-                    simulations: int, search_batch: int, c_puct: float) -> Dict[str, Any]:
+                    simulations: int, search_batch: int, c_puct: float,
+                    risk_beta: float = 0.0) -> Dict[str, Any]:
         """Play games with batched evaluation across all games."""
 
         class GameState:
@@ -403,26 +406,34 @@ class VsRandomEvaluator(Evaluator):
                 self.board = chess.Board()
                 self.model_plays_white = (game_idx % 2 == 0)
                 self.move_count = 0
+                self.position_history = []  # FEN history for encoder (up to 8 positions)
                 self.mcts = alphazero_cpp.BatchedMCTSSearch(
                     num_simulations=simulations,
                     batch_size=search_batch,
-                    c_puct=c_puct
+                    c_puct=c_puct,
+                    risk_beta=risk_beta
                 )
                 self.result = None
                 self.needs_root_eval = False
                 self.in_mcts_search = False
                 self.current_fen = None
-                self.current_obs_chw = None
+                self.current_obs = None
                 self.current_mask = None
                 self.current_idx_to_move = {}
+
+        def _track_history(g):
+            """Append current board FEN to history (before making a move)."""
+            g.position_history.append(g.board.fen())
+            if len(g.position_history) > 8:
+                g.position_history.pop(0)
 
         games = [GameState(i) for i in range(num_games)]
         active_games = games.copy()
 
         def prepare_move(g: GameState):
             g.current_fen = g.board.fen()
-            obs = alphazero_cpp.encode_position(g.current_fen)
-            g.current_obs_chw = np.transpose(obs, (2, 0, 1))
+            obs = alphazero_cpp.encode_position(g.current_fen, g.position_history)
+            g.current_obs = obs
 
             legal_moves = list(g.board.legal_moves)
             g.current_mask = np.zeros(POLICY_SIZE, dtype=np.float32)
@@ -438,6 +449,7 @@ class VsRandomEvaluator(Evaluator):
             g.in_mcts_search = False
 
         def finish_move(g: GameState):
+            _track_history(g)
             visit_counts = g.mcts.get_visit_counts()
             policy = visit_counts * g.current_mask
             if policy.sum() > 0:
@@ -445,10 +457,14 @@ class VsRandomEvaluator(Evaluator):
                 if action in g.current_idx_to_move:
                     g.board.push(g.current_idx_to_move[action])
                 else:
+                    print(f"\n    WARNING: Game {g.game_idx} move {g.move_count}: "
+                          f"argmax action {action} not in idx_to_move, playing random", flush=True)
                     g.board.push(random.choice(list(g.board.legal_moves)))
             else:
                 legal = list(g.board.legal_moves)
                 if legal:
+                    print(f"\n    WARNING: Game {g.game_idx} move {g.move_count}: "
+                          f"zero visit counts, playing random", flush=True)
                     g.board.push(random.choice(legal))
             g.mcts.reset()
             g.move_count += 1
@@ -456,7 +472,7 @@ class VsRandomEvaluator(Evaluator):
             g.needs_root_eval = False
 
         def check_game_over(g: GameState) -> bool:
-            if g.board.is_game_over() or g.move_count >= 200:
+            if g.board.is_game_over():
                 result = g.board.result()
                 if result == "1-0":
                     g.result = "win" if g.model_plays_white else "loss"
@@ -465,7 +481,18 @@ class VsRandomEvaluator(Evaluator):
                 else:
                     g.result = "draw"
                 return True
+            if g.move_count >= 200:
+                g.result = "draw"
+                return True
             return False
+
+        def random_opponent_move(g: GameState):
+            """Play a random legal move for the opponent."""
+            _track_history(g)
+            legal = list(g.board.legal_moves)
+            if legal:
+                g.board.push(random.choice(legal))
+            g.move_count += 1
 
         # Initialize: advance to first model move for each game
         for g in active_games:
@@ -475,22 +502,19 @@ class VsRandomEvaluator(Evaluator):
                     prepare_move(g)
                     break
                 else:
-                    legal = list(g.board.legal_moves)
-                    if legal:
-                        g.board.push(random.choice(legal))
-                    g.move_count += 1
+                    random_opponent_move(g)
 
         # Main loop: batch evaluations across all active games
         while active_games:
             # 1. Collect games needing root evaluation
             root_eval_games = [g for g in active_games if g.needs_root_eval and g.result is None]
             if root_eval_games:
-                obs_batch = np.stack([g.current_obs_chw for g in root_eval_games])
+                obs_batch = np.stack([g.current_obs for g in root_eval_games])
                 mask_batch = np.stack([g.current_mask for g in root_eval_games])
                 policies, values = evaluator.evaluate_batch(obs_batch, mask_batch)
 
                 for i, g in enumerate(root_eval_games):
-                    g.mcts.init_search(g.current_fen, policies[i].astype(np.float32), float(values[i]))
+                    g.mcts.init_search(g.current_fen, policies[i].astype(np.float32), float(values[i]), g.position_history)
                     g.needs_root_eval = False
                     g.in_mcts_search = True
 
@@ -514,8 +538,7 @@ class VsRandomEvaluator(Evaluator):
                     leaf_counts.append(0)
                     continue
 
-                obs_nchw = np.transpose(obs_batch[:num_leaves], (0, 3, 1, 2))
-                all_obs.append(obs_nchw)
+                all_obs.append(obs_batch[:num_leaves])
                 all_masks.append(mask_batch[:num_leaves])
                 leaf_counts.append(num_leaves)
 
@@ -552,10 +575,7 @@ class VsRandomEvaluator(Evaluator):
                             prepare_move(g)
                             break
                         else:
-                            legal = list(g.board.legal_moves)
-                            if legal:
-                                g.board.push(random.choice(legal))
-                            g.move_count += 1
+                            random_opponent_move(g)
 
             active_games = [g for g in active_games if g.result is None]
 
@@ -608,7 +628,6 @@ class EndgamePuzzleEvaluator(Evaluator):
                 if is_model_turn:
                     current_fen = board.fen()
                     obs = alphazero_cpp.encode_position(current_fen)
-                    obs_chw = np.transpose(obs, (2, 0, 1))
 
                     legal_moves = list(board.legal_moves)
                     mask = np.zeros(POLICY_SIZE, dtype=np.float32)
@@ -620,7 +639,7 @@ class EndgamePuzzleEvaluator(Evaluator):
                             mask[idx] = 1.0
                             idx_to_move[idx] = move
 
-                    policy, value = evaluator.evaluate(obs_chw, mask)
+                    policy, value = evaluator.evaluate(obs, mask)
                     policy = policy * mask
 
                     if policy.sum() > 0:
@@ -722,7 +741,8 @@ class VsStockfishEvaluator(Evaluator):
 
         with StockfishEngine(sf_path, elo=config.stockfish_elo, depth=sf_depth) as sf_engine:
             results = self._play_games(
-                evaluator, sf_engine, num_games, eval_sims, eval_search_batch, config.c_puct
+                evaluator, sf_engine, num_games, eval_sims, eval_search_batch,
+                config.c_puct, config.risk_beta
             )
 
         elapsed = time.time() - start_time
@@ -759,7 +779,7 @@ class VsStockfishEvaluator(Evaluator):
 
     def _play_games(self, evaluator: BatchedEvaluator, sf_engine: StockfishEngine,
                     num_games: int, simulations: int, search_batch: int,
-                    c_puct: float) -> Dict[str, Any]:
+                    c_puct: float, risk_beta: float = 0.0) -> Dict[str, Any]:
         """Play games with batched MCTS for AlphaZero vs Stockfish.
 
         Mirrors VsRandomEvaluator._play_games but uses Stockfish for opponent
@@ -772,26 +792,34 @@ class VsStockfishEvaluator(Evaluator):
                 self.board = chess.Board()
                 self.model_plays_white = (game_idx % 2 == 0)
                 self.move_count = 0
+                self.position_history = []  # FEN history for encoder (up to 8 positions)
                 self.mcts = alphazero_cpp.BatchedMCTSSearch(
                     num_simulations=simulations,
                     batch_size=search_batch,
-                    c_puct=c_puct
+                    c_puct=c_puct,
+                    risk_beta=risk_beta
                 )
                 self.result = None
                 self.needs_root_eval = False
                 self.in_mcts_search = False
                 self.current_fen = None
-                self.current_obs_chw = None
+                self.current_obs = None
                 self.current_mask = None
                 self.current_idx_to_move = {}
+
+        def _track_history(g):
+            """Append current board FEN to history (before making a move)."""
+            g.position_history.append(g.board.fen())
+            if len(g.position_history) > 8:
+                g.position_history.pop(0)
 
         games = [GameState(i) for i in range(num_games)]
         active_games = games.copy()
 
         def prepare_move(g: GameState):
             g.current_fen = g.board.fen()
-            obs = alphazero_cpp.encode_position(g.current_fen)
-            g.current_obs_chw = np.transpose(obs, (2, 0, 1))
+            obs = alphazero_cpp.encode_position(g.current_fen, g.position_history)
+            g.current_obs = obs
 
             legal_moves = list(g.board.legal_moves)
             g.current_mask = np.zeros(POLICY_SIZE, dtype=np.float32)
@@ -807,6 +835,7 @@ class VsStockfishEvaluator(Evaluator):
             g.in_mcts_search = False
 
         def finish_move(g: GameState):
+            _track_history(g)
             visit_counts = g.mcts.get_visit_counts()
             policy = visit_counts * g.current_mask
             if policy.sum() > 0:
@@ -814,10 +843,14 @@ class VsStockfishEvaluator(Evaluator):
                 if action in g.current_idx_to_move:
                     g.board.push(g.current_idx_to_move[action])
                 else:
+                    print(f"\n    WARNING: Game {g.game_idx} move {g.move_count}: "
+                          f"argmax action {action} not in idx_to_move, playing random", flush=True)
                     g.board.push(random.choice(list(g.board.legal_moves)))
             else:
                 legal = list(g.board.legal_moves)
                 if legal:
+                    print(f"\n    WARNING: Game {g.game_idx} move {g.move_count}: "
+                          f"zero visit counts, playing random", flush=True)
                     g.board.push(random.choice(legal))
             g.mcts.reset()
             g.move_count += 1
@@ -825,7 +858,7 @@ class VsStockfishEvaluator(Evaluator):
             g.needs_root_eval = False
 
         def check_game_over(g: GameState) -> bool:
-            if g.board.is_game_over() or g.move_count >= 200:
+            if g.board.is_game_over():
                 result = g.board.result()
                 if result == "1-0":
                     g.result = "win" if g.model_plays_white else "loss"
@@ -834,12 +867,22 @@ class VsStockfishEvaluator(Evaluator):
                 else:
                     g.result = "draw"
                 return True
+            if g.move_count >= 200:
+                g.result = "draw"
+                return True
             return False
 
         def opponent_move(g: GameState):
             """Let Stockfish play the opponent move."""
-            move = sf_engine.get_move(g.board)
-            g.board.push(move)
+            _track_history(g)
+            try:
+                move = sf_engine.get_move(g.board)
+                g.board.push(move)
+            except Exception as e:
+                print(f"\n    WARNING: Stockfish error in game {g.game_idx}: {e}", flush=True)
+                legal = list(g.board.legal_moves)
+                if legal:
+                    g.board.push(random.choice(legal))
             g.move_count += 1
 
         # Initialize: advance to first model move for each game
@@ -857,12 +900,12 @@ class VsStockfishEvaluator(Evaluator):
             # 1. Collect games needing root evaluation
             root_eval_games = [g for g in active_games if g.needs_root_eval and g.result is None]
             if root_eval_games:
-                obs_batch = np.stack([g.current_obs_chw for g in root_eval_games])
+                obs_batch = np.stack([g.current_obs for g in root_eval_games])
                 mask_batch = np.stack([g.current_mask for g in root_eval_games])
                 policies, values = evaluator.evaluate_batch(obs_batch, mask_batch)
 
                 for i, g in enumerate(root_eval_games):
-                    g.mcts.init_search(g.current_fen, policies[i].astype(np.float32), float(values[i]))
+                    g.mcts.init_search(g.current_fen, policies[i].astype(np.float32), float(values[i]), g.position_history)
                     g.needs_root_eval = False
                     g.in_mcts_search = True
 
@@ -886,8 +929,7 @@ class VsStockfishEvaluator(Evaluator):
                     leaf_counts.append(0)
                     continue
 
-                obs_nchw = np.transpose(obs_batch[:num_leaves], (0, 3, 1, 2))
-                all_obs.append(obs_nchw)
+                all_obs.append(obs_batch[:num_leaves])
                 all_masks.append(mask_batch[:num_leaves])
                 leaf_counts.append(num_leaves)
 
@@ -1005,7 +1047,7 @@ def load_checkpoint(checkpoint_path: str, device: str) -> torch.nn.Module:
     policy_filters = config.get('policy_filters', 2)
     value_filters = config.get('value_filters', 1)
     value_hidden = config.get('value_hidden', 256)
-    wdl = config.get('wdl', False)
+    wdl = config.get('wdl', True)
     se_reduction = config.get('se_reduction', 16)
 
     print(f"  Architecture: {num_filters} filters x {num_blocks} blocks (SE r={se_reduction})")
@@ -1144,6 +1186,8 @@ Examples:
                         help="Stockfish ELO rating limit (default: full strength)")
     parser.add_argument("--stockfish-depth", type=int, default=None,
                         help="Stockfish search depth limit (default: 20)")
+    parser.add_argument("--risk-beta", type=float, default=0.0,
+                        help="ERM risk sensitivity: >0 risk-seeking, <0 risk-averse (default: 0.0)")
 
     args = parser.parse_args()
 
@@ -1185,13 +1229,15 @@ Examples:
         simulations=args.simulations,
         search_batch=args.search_batch,
         c_puct=args.c_puct,
+        risk_beta=args.risk_beta,
         device=device,
         stockfish_path=args.stockfish_path,
         stockfish_elo=args.stockfish_elo,
         stockfish_depth=args.stockfish_depth,
     )
 
-    print(f"  MCTS: {config.simulations} sims, batch={config.search_batch}, c_puct={config.c_puct}")
+    risk_str = f", risk_beta={config.risk_beta}" if config.risk_beta != 0.0 else ""
+    print(f"  MCTS: {config.simulations} sims, batch={config.search_batch}, c_puct={config.c_puct}{risk_str}")
     print(f"  Device: {device}")
     print("-" * 60)
 

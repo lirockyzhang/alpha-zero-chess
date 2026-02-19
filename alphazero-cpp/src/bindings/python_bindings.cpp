@@ -65,7 +65,7 @@ private:
 };
 
 // Position encoding for neural network input
-// NHWC layout: (height, width, channels) = (8, 8, 122)
+// NHWC layout: (height, width, channels) = (8, 8, 123)
 py::array_t<float> encode_position(const std::string& fen,
                                     const std::vector<std::string>& history_fens = {}) {
     chess::Board board(fen);
@@ -80,7 +80,7 @@ py::array_t<float> encode_position(const std::string& fen,
     // Use the real position encoder with history
     std::vector<float> encoding = encoding::PositionEncoder::encode(board, position_history);
 
-    // Return as numpy array with NHWC shape (8, 8, 122) - channels last
+    // Return as numpy array with NHWC shape (8, 8, 123) - channels last
     return py::array_t<float>(
         {encoding::PositionEncoder::HEIGHT,
          encoding::PositionEncoder::WIDTH,
@@ -90,7 +90,7 @@ py::array_t<float> encode_position(const std::string& fen,
 }
 
 // Zero-copy position encoding - writes directly to provided buffer
-// NHWC layout: (height, width, channels) = (8, 8, 122)
+// NHWC layout: (height, width, channels) = (8, 8, 123)
 void encode_position_to_buffer(const std::string& fen, py::array_t<float> buffer) {
     chess::Board board(fen);
 
@@ -100,7 +100,7 @@ void encode_position_to_buffer(const std::string& fen, py::array_t<float> buffer
         buf_info.shape[0] != encoding::PositionEncoder::HEIGHT ||
         buf_info.shape[1] != encoding::PositionEncoder::WIDTH ||
         buf_info.shape[2] != encoding::PositionEncoder::CHANNELS) {
-        throw std::runtime_error("Buffer must have NHWC shape (8, 8, 122)");
+        throw std::runtime_error("Buffer must have NHWC shape (8, 8, 123)");
     }
 
     // Write directly to buffer (zero-copy)
@@ -120,7 +120,7 @@ int encode_batch(const std::vector<std::string>& fens, py::array_t<float> buffer
         buf_info.shape[1] != encoding::PositionEncoder::HEIGHT ||
         buf_info.shape[2] != encoding::PositionEncoder::WIDTH ||
         buf_info.shape[3] != encoding::PositionEncoder::CHANNELS) {
-        throw std::runtime_error("Buffer must have NHWC shape (batch_size, 8, 8, 122)");
+        throw std::runtime_error("Buffer must have NHWC shape (batch_size, 8, 8, 123)");
     }
 
     // Encode batch
@@ -350,7 +350,7 @@ public:
             py::list value_list;
 
             for (const auto& state : traj.states) {
-                // Observation: shape (8, 8, 122)
+                // Observation: shape (8, 8, 123)
                 py::array_t<float> obs_array(std::vector<py::ssize_t>{8, 8, encoding::PositionEncoder::CHANNELS});
                 std::memcpy(obs_array.mutable_data(), state.observation.data(),
                            state.observation.size() * sizeof(float));
@@ -519,6 +519,7 @@ public:
         result["partial_submissions"] = qm.partial_submissions.load(std::memory_order_relaxed);
         result["submission_drops"] = drops;
         result["pool_resets"] = qm.pool_resets.load(std::memory_order_relaxed);
+        result["submission_waits"] = qm.submission_waits.load(std::memory_order_relaxed);
         result["total_leaves"] = total_leaves;
 
         // Retry/stale result tracking
@@ -592,10 +593,11 @@ public:
             // Zero-copy numpy wrapping: observations are NHWC from C++ (no transpose)
             // Python uses torch.permute(0,3,1,2) for zero-cost channels_last layout
             // Use capsule with no-op destructor to prevent Python from freeing C++ memory
+            constexpr int CH = encoding::PositionEncoder::CHANNELS;
             py::array_t<float> obs_array(
-                {batch_size, 8, 8, 122},
-                {8 * 8 * 122 * (int)sizeof(float), 8 * 122 * (int)sizeof(float),
-                 122 * (int)sizeof(float), (int)sizeof(float)},
+                {batch_size, 8, 8, CH},
+                {8 * 8 * CH * (int)sizeof(float), 8 * CH * (int)sizeof(float),
+                 CH * (int)sizeof(float), (int)sizeof(float)},
                 const_cast<float*>(observations),
                 py::capsule(observations, [](void*) {})
             );
@@ -686,7 +688,7 @@ public:
                 py::list value_list;
 
                 for (const auto& state : traj.states) {
-                    py::array_t<float> obs_array(std::vector<py::ssize_t>{8, 8, 122});
+                    py::array_t<float> obs_array(std::vector<py::ssize_t>{8, 8, encoding::PositionEncoder::CHANNELS});
                     std::memcpy(obs_array.mutable_data(), state.observation.data(),
                                state.observation.size() * sizeof(float));
                     obs_list.append(obs_array);
@@ -748,6 +750,7 @@ public:
         result["partial_submissions"] = queue_metrics.partial_submissions.load();
         result["submission_drops"] = queue_metrics.submission_drops.load();
         result["pool_resets"] = queue_metrics.pool_resets.load();
+        result["submission_waits"] = queue_metrics.submission_waits.load();
         result["avg_batch_size"] = queue_metrics.avg_batch_size();
         result["total_batches"] = queue_metrics.total_batches.load();
         result["total_leaves"] = queue_metrics.total_leaves.load();
@@ -976,7 +979,7 @@ PYBIND11_MODULE(alphazero_cpp, m) {
              py::arg("evaluator"),
              "Generate self-play games using cross-game batching.\n"
              "\nevaluator: callable(observations, legal_masks, batch_size) -> (policies, values)\n"
-             "  observations: np.array shape (batch_size, 8, 8, 122) NHWC layout\n"
+             "  observations: np.array shape (batch_size, 8, 8, 123) NHWC layout\n"
              "  legal_masks: np.array shape (batch_size, 4672)\n"
              "  batch_size: int, number of positions to evaluate\n"
              "  Returns: (policies np.array (batch_size, 4672), values np.array (batch_size,))\n"
@@ -1083,14 +1086,15 @@ PYBIND11_MODULE(alphazero_cpp, m) {
             }
 
             // Return as numpy arrays
-            py::array_t<float> obs_array(std::vector<size_t>{batch_size, 7808UL});
+            constexpr size_t OBS_FLAT = encoding::PositionEncoder::TOTAL_SIZE;  // 7872
+            py::array_t<float> obs_array(std::vector<size_t>{batch_size, OBS_FLAT});
             py::array_t<float> pol_array(std::vector<size_t>{batch_size, 4672UL});
             py::array_t<float> val_array(std::vector<size_t>{batch_size});
             py::array_t<float> wdl_array(std::vector<size_t>{batch_size, 3UL});
             py::array_t<float> sv_array(std::vector<size_t>{batch_size});
 
             std::memcpy(obs_array.mutable_data(), observations.data(),
-                       batch_size * 7808 * sizeof(float));
+                       batch_size * OBS_FLAT * sizeof(float));
             std::memcpy(pol_array.mutable_data(), policies.data(),
                        batch_size * 4672 * sizeof(float));
             std::memcpy(val_array.mutable_data(), values.data(),

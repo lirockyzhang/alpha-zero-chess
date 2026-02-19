@@ -9,7 +9,7 @@ Tests:
 5. Sequential self-play performance
 6. Parallel self-play performance (cross-game batching)
 
-Updated for 122-channel encoding and new checkpoint format (v2.0).
+Updated for 123-channel encoding and new checkpoint format (v2.0).
 """
 
 import sys
@@ -38,7 +38,7 @@ import chess
 # Neural Network (matches train.py for checkpoint compatibility)
 # =============================================================================
 
-INPUT_CHANNELS = 122
+INPUT_CHANNELS = 123
 POLICY_SIZE = 4672
 
 
@@ -166,7 +166,7 @@ def load_model(checkpoint_path):
         config = checkpoint['config']
         num_filters = config.get('num_filters', 192)
         num_blocks = config.get('num_blocks', 15)
-        input_channels = config.get('input_channels', 122)
+        input_channels = config.get('input_channels', 123)
         policy_filters = config.get('policy_filters', 2)
         value_hidden = config.get('value_hidden', 256)
     else:
@@ -211,7 +211,7 @@ def load_model(checkpoint_path):
     return model, device, input_channels
 
 
-def test_single_game_performance(model, device, input_channels=122, num_simulations=800,
+def test_single_game_performance(model, device, input_channels=123, num_simulations=800,
                                   search_batch=64, c_puct=1.5):
     """Test MCTS performance for a single game with real NN."""
     print(f"\n{'='*70}")
@@ -233,7 +233,7 @@ def test_single_game_performance(model, device, input_channels=122, num_simulati
 
     # Get initial evaluation from NN
     obs = alphazero_cpp.encode_position(fen)
-    # C++ outputs NHWC (8, 8, 122), convert to NCHW logical/NHWC physical format
+    # C++ outputs NHWC (8, 8, 123), convert to NCHW logical/NHWC physical format
     obs_tensor = torch.from_numpy(obs).permute(2, 0, 1).unsqueeze(0).to(device)
     if device.type == 'cuda':
         obs_tensor = obs_tensor.contiguous(memory_format=torch.channels_last)
@@ -319,7 +319,7 @@ def test_single_game_performance(model, device, input_channels=122, num_simulati
 def test_batch_encoding_performance():
     """Test batch encoding performance with OpenMP."""
     print(f"\n{'='*70}")
-    print(f"TEST 2: Batch Encoding Performance (122 channels)")
+    print(f"TEST 2: Batch Encoding Performance (123 channels)")
     print(f"{'='*70}")
 
     # Generate test positions
@@ -370,7 +370,7 @@ def test_batch_encoding_performance():
         print(f"  Per pos:    {encoding_time/batch_size*1000:.3f}ms")
 
 
-def test_multiple_searches(model, device, input_channels=122, num_games=5, num_simulations=400,
+def test_multiple_searches(model, device, input_channels=123, num_games=5, num_simulations=400,
                            search_batch=64, c_puct=1.5):
     """Test multiple MCTS searches to measure consistency."""
     print(f"\n{'='*70}")
@@ -393,7 +393,7 @@ def test_multiple_searches(model, device, input_channels=122, num_games=5, num_s
 
         # Get initial evaluation
         obs = alphazero_cpp.encode_position(fen)
-        # C++ outputs NHWC (8, 8, 122), convert to NCHW for PyTorch
+        # C++ outputs NHWC (8, 8, 123), convert to NCHW for PyTorch
         obs_tensor = torch.from_numpy(obs).permute(2, 0, 1).unsqueeze(0).to(device)
         if device.type == 'cuda':
             obs_tensor = obs_tensor.contiguous(memory_format=torch.channels_last)

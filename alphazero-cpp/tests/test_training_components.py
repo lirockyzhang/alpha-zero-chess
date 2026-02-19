@@ -34,7 +34,7 @@ def test_replay_buffer_basic():
     print(f"OK Initial size: {buffer.size()}, capacity: {buffer.capacity()}")
 
     # Add a single sample
-    obs = np.random.rand(7808).astype(np.float32)  # 8*8*122
+    obs = np.random.rand(7872).astype(np.float32)  # 8*8*123
     pol = np.random.rand(4672).astype(np.float32)
     val = 0.5
 
@@ -43,7 +43,7 @@ def test_replay_buffer_basic():
 
     # Add a batch
     batch_size = 10
-    obs_batch = np.random.rand(batch_size, 7808).astype(np.float32)
+    obs_batch = np.random.rand(batch_size, 7872).astype(np.float32)
     pol_batch = np.random.rand(batch_size, 4672).astype(np.float32)
     val_batch = np.random.rand(batch_size).astype(np.float32)
 
@@ -69,7 +69,7 @@ def test_replay_buffer_sampling():
     # Create and populate a buffer for sampling
     buffer = alphazero_cpp.ReplayBuffer(capacity=1000)
     for _ in range(20):
-        obs = np.random.rand(7808).astype(np.float32)
+        obs = np.random.rand(7872).astype(np.float32)
         pol = np.random.rand(4672).astype(np.float32)
         buffer.add_sample(obs, pol, 0.5)
 
@@ -84,7 +84,7 @@ def test_replay_buffer_sampling():
     print(f"  WDL targets shape: {wdl.shape}")
     print(f"  Soft values shape: {sv.shape}")
 
-    assert obs.shape == (batch_size, 7808)
+    assert obs.shape == (batch_size, 7872)
     assert pol.shape == (batch_size, 4672)
     assert val.shape == (batch_size,)
     assert wdl.shape == (batch_size, 3)
@@ -103,7 +103,7 @@ def test_replay_buffer_overflow():
 
     # Add more samples than capacity
     for i in range(10):
-        obs = np.random.rand(7808).astype(np.float32)
+        obs = np.random.rand(7872).astype(np.float32)
         pol = np.random.rand(4672).astype(np.float32)
         buffer.add_sample(obs, pol, float(i))
 
@@ -144,7 +144,7 @@ def test_trainer():
 
     # Fill buffer
     for i in range(1200):
-        obs = np.random.rand(7808).astype(np.float32)
+        obs = np.random.rand(7872).astype(np.float32)
         pol = np.random.rand(4672).astype(np.float32)
         buffer.add_sample(obs, pol, 0.5)
 

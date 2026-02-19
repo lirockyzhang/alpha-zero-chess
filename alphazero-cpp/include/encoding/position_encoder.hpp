@@ -7,26 +7,26 @@
 namespace encoding {
 
 // AlphaZero position encoding
-// 122 planes total (updated to support 8 FULL historical positions):
-// - 12 planes: piece positions (6 piece types × 2 colors)
-// - 2 planes: repetition counts (currently unused, reserved)
-// - 1 plane: color to move
-// - 1 plane: total move count
-// - 1 plane: castling rights (encoded as 4 bits)
-// - 1 plane: no-progress count (50-move rule)
-// - 104 planes: history (8 previous positions × 13 planes each)
+// 123 planes total:
+// - 12 planes (ch 0-11): piece positions (6 piece types × 2 colors)
+// - 1 plane (ch 12): color to move (always 1.0)
+// - 1 plane (ch 13): total move count (fullmoves / 100, clamped to 1.0)
+// - 4 planes (ch 14-17): castling rights (binary)
+//   - ch 14: current player kingside
+//   - ch 15: current player queenside
+//   - ch 16: opponent kingside
+//   - ch 17: opponent queenside
+// - 1 plane (ch 18): no-progress count (halfmoves / 100, clamped to 1.0)
+// - 104 planes (ch 19-122): history (8 previous positions × 13 planes each)
 //   - Each historical position: 12 piece planes + 1 repetition marker
-//
-// Note: Updated from 119 to 122 channels to fully match AlphaZero paper specification
-// with 8 complete historical positions.
 
 class PositionEncoder {
 public:
     // NHWC (channels-last) layout for Tensor Core performance
-    // Shape: (height, width, channels) = (8, 8, 122)
+    // Shape: (height, width, channels) = (8, 8, 123)
     static constexpr int HEIGHT = 8;
     static constexpr int WIDTH = 8;
-    static constexpr int CHANNELS = 122;
+    static constexpr int CHANNELS = 123;
     static constexpr int TOTAL_SIZE = HEIGHT * WIDTH * CHANNELS;
 
     // Legacy constants for compatibility
@@ -34,7 +34,7 @@ public:
     static constexpr int BOARD_SIZE = HEIGHT;
 
     // Encode position from current player's perspective
-    // Returns flat array of size 122 × 8 × 8 = 7808
+    // Returns flat array of size 123 × 8 × 8 = 7872
     // position_history: Last N positions (up to 8) for history encoding
     static std::vector<float> encode(const chess::Board& board,
                                      const std::vector<chess::Board>& position_history = {});

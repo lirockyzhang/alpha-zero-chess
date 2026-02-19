@@ -150,7 +150,7 @@ Parameters are grouped by which phase of training they affect:
 ### Architecture (AlphaZero Paper Standard)
 
 The training script uses the optimal architecture:
-- **Input channels**: 122 (full AlphaZero encoding)
+- **Input channels**: 123 (full AlphaZero encoding with 4 castling planes)
 - **Policy filters**: 2 (paper standard)
 - **Value hidden**: 256 (paper standard)
 
@@ -1072,7 +1072,7 @@ When workers wait for GPU results and time out (`worker_timeout_ms` exceeded), t
 ## Checkpoint Compatibility
 
 Checkpoints from `alphazero-cpp/scripts/train.py` use:
-- **122-channel input** (C++ encoding)
+- **123-channel input** (C++ encoding with 4 binary castling planes)
 - **AlphaZero paper architecture** (2 policy filters, 256 value hidden)
 - **Compatible with**: Web interface, evaluation script, Python MCTS
 
@@ -1083,11 +1083,15 @@ The checkpoint format includes:
     'model_state_dict': {...},
     'optimizer_state_dict': {...},
     'config': {
-        'input_channels': 122,
+        'input_channels': 123,
         'num_filters': int,
         'num_blocks': int,
+        'num_actions': 4672,
         'policy_filters': 2,
+        'value_filters': 1,
         'value_hidden': 256,
+        'wdl': True,
+        'se_reduction': int,
     },
     'backend': 'cpp',
     'version': '2.0'

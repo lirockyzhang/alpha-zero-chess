@@ -27,7 +27,7 @@ def benchmark_add_sample(buffer_size: int = 10000, num_samples: int = 10000):
     buffer = alphazero_cpp.ReplayBuffer(capacity=buffer_size)
 
     # Pre-generate data
-    obs = np.random.rand(7808).astype(np.float32)
+    obs = np.random.rand(7872).astype(np.float32)
     pol = np.random.rand(4672).astype(np.float32)
     val = 0.5
 
@@ -60,7 +60,7 @@ def benchmark_add_batch(buffer_size: int = 100000, batch_size: int = 256, num_ba
     buffer = alphazero_cpp.ReplayBuffer(capacity=buffer_size)
 
     # Pre-generate batches
-    obs_batch = np.random.rand(batch_size, 7808).astype(np.float32)
+    obs_batch = np.random.rand(batch_size, 7872).astype(np.float32)
     pol_batch = np.random.rand(batch_size, 4672).astype(np.float32)
     val_batch = np.random.rand(batch_size).astype(np.float32)
 
@@ -98,7 +98,7 @@ def benchmark_sample(buffer_size: int = 100000, batch_size: int = 256, num_sampl
 
     print("  Filling buffer...")
     for i in range(buffer_size):
-        obs = np.random.rand(7808).astype(np.float32)
+        obs = np.random.rand(7872).astype(np.float32)
         pol = np.random.rand(4672).astype(np.float32)
         buffer.add_sample(obs, pol, float(i % 100) / 100)
 
@@ -125,7 +125,7 @@ def benchmark_sample(buffer_size: int = 100000, batch_size: int = 256, num_sampl
     print(f"  Time per batch: {elapsed/num_samples*1000:.3f}ms")
 
     # Data throughput
-    bytes_per_sample = (7808 + 4672 + 1) * 4  # floats
+    bytes_per_sample = (7872 + 4672 + 1) * 4  # floats
     throughput_mbps = (total_sampled * bytes_per_sample / elapsed) / (1024**2)
     print(f"  Data throughput: {throughput_mbps:,.1f} MB/s")
 
@@ -142,14 +142,14 @@ def benchmark_threading(buffer_size: int = 100000, num_threads: int = 4, ops_per
     # Pre-fill buffer for sampling
     print("  Filling buffer...")
     for i in range(buffer_size):
-        obs = np.random.rand(7808).astype(np.float32)
+        obs = np.random.rand(7872).astype(np.float32)
         pol = np.random.rand(4672).astype(np.float32)
         buffer.add_sample(obs, pol, 0.5)
 
     def writer_thread(thread_id: int, num_ops: int):
         """Writer thread that adds samples."""
         for i in range(num_ops):
-            obs = np.random.rand(7808).astype(np.float32)
+            obs = np.random.rand(7872).astype(np.float32)
             pol = np.random.rand(4672).astype(np.float32)
             buffer.add_sample(obs, pol, float(thread_id))
 
@@ -228,7 +228,7 @@ def benchmark_memory_usage(buffer_size: int = 100000):
     print(f"Benchmark 6: Memory Usage (capacity={buffer_size:,})")
     print(f"{'='*80}")
 
-    obs_size = 7808 * 4  # floats
+    obs_size = 7872 * 4  # floats
     pol_size = 4672 * 4
     val_size = 4
 
@@ -248,7 +248,7 @@ def main():
     print("="*80)
 
     print("\nConfiguration:")
-    print("  Observation size: 7808 floats (8x8x122)")
+    print("  Observation size: 7872 floats (8x8x123)")
     print("  Policy size: 4672 floats")
     print("  Value size: 1 float")
     print("  Sample size: 49.8 KB per sample")

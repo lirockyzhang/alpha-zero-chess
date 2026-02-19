@@ -53,11 +53,11 @@ The run directory and control files are printed at startup:
 
 ```
 **********************************************************************
-Run directory: checkpoints/run_20260215_103000
-Control file:  checkpoints/run_20260215_103000/param_updates.json
-Stop file:     checkpoints/run_20260215_103000/stop
-Review file:   checkpoints/run_20260215_103000/awaiting_review
-Safety lock:   checkpoints/run_20260215_103000/selfplay_done
+Run directory: checkpoints/f256-b20-se4_2026-02-15_10-30-00
+Control file:  checkpoints/f256-b20-se4_2026-02-15_10-30-00/param_updates.json
+Stop file:     checkpoints/f256-b20-se4_2026-02-15_10-30-00/stop
+Review file:   checkpoints/f256-b20-se4_2026-02-15_10-30-00/awaiting_review
+Safety lock:   checkpoints/f256-b20-se4_2026-02-15_10-30-00/selfplay_done
 **********************************************************************
 ```
 
@@ -651,7 +651,7 @@ When increasing simulations mid-training, follow this protocol:
 
 ### 10i. Fifty-Move Draw Stagnation (Distinct from Repetition Death)
 
-**Discovered during Gumbel proof-of-concept run (f256-b20, 200 sims, search_batch auto-derived from gumbel_top_k=16).**
+**Discovered during Gumbel proof-of-concept run (f256-b20-se4, 200 sims, search_batch auto-derived from gumbel_top_k=16).**
 
 This is a NEW failure mode that is qualitatively different from repetition draw death (Section 10g). The model plays diverse, non-repeating moves but fails to deliver checkmate, causing games to exhaust the fifty-move rule.
 
@@ -712,7 +712,7 @@ Setting `risk_beta=0.5` (ERM risk-seeking) produced only 2 decisive games per it
 
 ### 10j. Gumbel vs PUCT — Empirical Comparison (search_batch Effects)
 
-**Proof-of-concept run parameters:** f256-b20, SE reduction=4, 200 sims, 32 workers, train_batch=1024, 32 games/iter.
+**Proof-of-concept run parameters:** f256-b20-se4, 200 sims, 32 workers, train_batch=1024, 32 games/iter.
 
 | Setting | Previous PUCT Run | Gumbel POC Run |
 |---------|-------------------|----------------|
@@ -786,3 +786,112 @@ When R² is low, the crossover analysis selects degenerate graph sizes (all tier
 - Use composition to detect draw saturation: if draws > 90%, set `epochs=1`
 
 **Historical note:** Prior to this feature, `--resume` created a fresh buffer and all accumulated data was lost. In the proof-of-concept run, this caused value_loss to crash from 0.40 → 0.145 in one iteration when the fresh buffer was filled with draw-heavy data. This failure mode is now prevented by automatic buffer persistence.
+
+### 10m. Max-Moves Draw Pollution (New Failure Amplifier)
+
+**Discovered during second Gumbel run (f256-b20-se4, 200 sims, 32 workers, epochs=3→2→1, 32 games/iter).**
+
+The `max_moves_per_game` constant (hardcoded to 512 plies in `parallel_coordinator.hpp:42` and `game.hpp:87`, not exposed to Python) creates a draw mechanism that does not exist in real chess. When a game reaches 512 plies without a natural termination, it is declared a draw and all 512 positions are labeled as draws in the replay buffer. This artificial mechanism amplifies draw saturation far more aggressively than any natural chess draw mechanism.
+
+**Why max-moves draws are uniquely destructive:**
+
+A single max-moves draw generates up to 512 draw-labeled positions. A typical decisive game lasting 80 moves generates 80 W/L-labeled positions. The per-game buffer pollution ratio:
+
+```
+Max-moves draw:  ~512 draw positions per game
+Decisive game:   ~80  W/L  positions per game
+Amplification:   6.4× more draw data per max-moves draw vs decisive game
+```
+
+With 14-17 max-moves draws per iteration (observed in this run's crisis phase):
+- 17 max-moves draws × 512 = 8,704 draw positions injected per iteration
+- 3 decisive games × 80 = 240 W/L positions per iteration
+- **Effective draw:decisive ratio = 36:1** in the worst iterations
+
+This creates a vicious cycle: the value head trains on overwhelmingly draw data → MCTS evaluates all positions as "draw" → games play aimlessly to the 512 cap → more max-moves draws → more draw data.
+
+**Observed progression (second Gumbel run):**
+
+| Iteration | W | L | D | Draw% | Rep | MaxMov | AvgLen | ValLoss | Intervention |
+|-----------|---|---|---|-------|-----|--------|--------|---------|-------------|
+| 1 | 3 | 0 | 29 | 91% | 14 | 7 | 336 | 0.954 | None (cold start) |
+| 2 | 1 | 3 | 28 | 88% | 7 | 9 | 361 | 0.481 | None |
+| 3 | 4 | 3 | 25 | 78% | 3 | 11 | 394 | 0.383 | None |
+| 4 | 3 | 2 | 27 | 84% | 8 | 8 | 362 | 0.355 | epochs=2 (val < 0.4 + draw > 80%) |
+| 5 | 1 | 1 | 30 | 94% | 4 | 17 | 450 | 0.335 | epochs=1, temp_moves=50 |
+| 6 | 1 | 5 | 26 | 81% | 7 | 8 | 366 | 0.342 | (holding) |
+| 7 | 1 | 5 | 26 | 81% | 8 | 6 | 405 | 0.294 | (holding) |
+| 8 | 1 | 0 | 31 | 97% | 4 | 14 | 436 | 0.368 | (noise — 32 game variance) |
+| 9 | 1 | 2 | 29 | 91% | 4 | 16 | 451 | 0.305 | (holding) |
+| 10 | 2 | 1 | 29 | 91% | 17 | 9 | 347 | 0.321 | Stopped for analysis |
+
+Buffer at shutdown: 126K positions — W=4,364 (3.5%), D=116,509 (92.1%), L=5,558 (4.4%)
+
+**This is a hybrid failure mode.** It does not cleanly match either repetition draw death (Section 10g) or fifty-move stagnation (Section 10i):
+
+| Aspect | Repetition Death (10g) | Fifty-Move Stagnation (10i) | Max-Moves Pollution (this) |
+|--------|----------------------|---------------------------|--------------------------|
+| Dominant draw type | Threefold repetition | Fifty-move rule | Max-moves cap |
+| Game length trend | Collapsing (300→42) | Expanding (300→380) | Oscillating (336→451→347) |
+| Model behavior | Forces safe repetitions | Diverse but can't checkmate | Aimless shuffling with occasional tactics |
+| Value loss trajectory | Monotonic collapse | Drop then recoverable | Steady decline, stuck ~0.3 |
+| Policy learning | Stalled | Stalled | **Continuous improvement** (8.4→7.5) |
+| epochs=1 recovery? | No (after 5+ iters) | **Yes** (1-2 iterations) | Partial (slows but doesn't reverse) |
+
+**Key observation:** Policy loss improved monotonically every iteration (8.40 → 7.49) — the model IS learning better move selection. The value head is the sole bottleneck, trapped by the 92% draw buffer.
+
+**What the model actually learned (from sample game analysis):**
+- Positive: Discovered checkmates, promotions (including underpromotion to knight!), captures, and piece coordination
+- Negative: Hundreds of moves of aimless shuffling (Qe1/Qd1/Qe1, Ra1/Ra2/Ra3) punctuated by occasional tactical finds
+- The model plays like a beginner who can spot tactics but has no positional understanding
+
+**Why epochs=1 + temp=50 was insufficient (unlike Section 10i):**
+
+In the POC run (Section 10i), recovery happened in 1-2 iterations because the value head had fully collapsed (value_loss=0.12), leaving maximum room for recalibration. In this run, value_loss hovered at 0.29-0.37 — a frustrating middle ground where the model is overconfident but not so collapsed that natural variance provides recovery signal. Additionally, the max-moves mechanism was continuously injecting hundreds of new draw positions per iteration (8,700+ in the worst iterations), outpacing the ability of epochs=1 to limit draw reinforcement.
+
+**Structural root cause: `max_moves_per_game=512` is not a real chess rule.** Unlike threefold repetition, fifty-move, stalemate, and insufficient material — which are legitimate chess termination conditions — the 512-ply cap is an arbitrary training heuristic. It creates a draw mechanism the model cannot learn to avoid (the model has no concept of "move 512"), and each max-moves draw floods the buffer with hundreds of artificial draw labels.
+
+**Encoding limitation (fixed):** The halfmove clock (fifty-move rule input) was encoded as `min(1.0, halfmoves / 50.0)`, saturating at 50 half-moves. This has been fixed to `halfmoves / 100.0` (see Resolution below).
+
+**Resolution (applied):**
+
+Three root causes have been fixed:
+
+1. **`max_moves_per_game` default changed from 512 to 10,000** in `parallel_coordinator.hpp:42` and `game.hpp:87`. The 10,000 cap is a safety net only — all real chess termination rules (fifty-move, threefold repetition, stalemate, insufficient material, checkmate) fire long before this. The sequential fallback in `train.py` (lines ~747, ~834) was updated to match.
+2. **Halfmove clock encoding fixed from `/50.0` to `/100.0`** in `position_encoder.cpp` (now channel 18). The fifty-move rule triggers at `halfMoveClock() >= 100`, so normalizing by 100.0 gives the network full resolution across the entire range [0, 100].
+3. **Castling encoding restructured to match AlphaZero paper** (123 channels, up from 122). The old encoding had 2 dead channels (12-13, always zero) and packed only the current player's castling rights into a single scalar (channel 16). The new encoding:
+   - Removes the 2 dead channels
+   - Adds 4 separate binary castling planes (ch 14-17): P1 kingside, P1 queenside, P2 kingside, P2 queenside
+   - Shifts the no-progress count to channel 18 and history planes to channels 19-122
+   - The network can now independently observe each player's castling rights
+
+**Channel layout (123 channels):**
+
+| Channels | Content |
+|----------|---------|
+| 0-11 | Piece planes (6 own + 6 opponent) |
+| 12 | Color to move (constant 1.0) |
+| 13 | Total move count (fullmoves / 100) |
+| 14 | Current player castling kingside (binary) |
+| 15 | Current player castling queenside (binary) |
+| 16 | Opponent castling kingside (binary) |
+| 17 | Opponent castling queenside (binary) |
+| 18 | No-progress count (halfmoves / 100) |
+| 19-122 | History (8 × 13 = 104 planes) |
+
+**Breaking change:** The encoding restructure changes the total channel count (122→123) and the layout of channels 12+, making all existing checkpoints incompatible. This is acceptable — already doing a fresh run due to the halfmove clock fix.
+
+### 10n. Early Epochs Progression
+
+**Learned from both the POC run and the second Gumbel run:** The default starting `epochs=3` may be too aggressive when combined with Gumbel + search_batch=16 (which produces efficient but draw-heavy early games).
+
+**Recommended early-training epochs schedule:**
+
+| Phase | Condition | epochs | Rationale |
+|-------|-----------|--------|-----------|
+| Start | Iteration 1 | 2 | Conservative: avoids rapid value head overfitting on cold-start draw data |
+| Healthy | Draw rate < 80%, value_loss > 0.4 for 3+ iters | 3 | Value head has enough W/L signal to benefit from more training |
+| Stagnation | Draw rate > 80% AND value_loss < 0.4 | 1 | Emergency: minimize draw reinforcement (see 10i, 10m) |
+| Recovery | Draw rate < 70% sustained for 3+ iters after stagnation | 2 (then 3) | Gradual restoration |
+
+**The second run's mistake:** Starting with `epochs=3` allowed value_loss to collapse from 0.95 to 0.38 in just 3 iterations. By the time we intervened (epochs=2 at iter 4, epochs=1 at iter 5), the buffer was already >90% draws. Starting with `epochs=2` would have slowed the collapse and kept the value head more receptive to future decisive games.

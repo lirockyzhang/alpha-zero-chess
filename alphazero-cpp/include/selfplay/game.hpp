@@ -84,7 +84,7 @@ struct SelfPlayConfig {
     float c_puct = 1.5f;                // PUCT exploration constant
     float temperature = 1.0f;           // Temperature for move selection (early game)
     float temp_threshold = 30.0f;       // Move number to switch to greedy selection
-    int max_moves = 512;                // Maximum moves before declaring draw
+    int max_moves = 10000;              // Safety cap (real chess rules terminate games first)
     bool add_dirichlet_noise = true;    // Add Dirichlet noise to root
     float dirichlet_alpha = 0.3f;       // Dirichlet noise alpha
     float dirichlet_epsilon = 0.25f;    // Dirichlet noise weight

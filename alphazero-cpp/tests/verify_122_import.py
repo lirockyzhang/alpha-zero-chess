@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Simple verification that alphazero_cpp loads with 122 channels."""
+"""Simple verification that alphazero_cpp loads with 123 channels."""
 
 import sys
 import os
@@ -29,9 +29,9 @@ def check_and_evaluate(observations, num_leaves):
     obs_array = np.array(observations)
     print(f"  Observation shape: {obs_array.shape}")
 
-    # Check if shape is (batch, 8, 8, 122)
-    if len(obs_array.shape) == 4 and obs_array.shape[3] == 122:
-        print("  [SUCCESS] Observations have 122 channels!")
+    # Check if shape is (batch, 8, 8, 123)
+    if len(obs_array.shape) == 4 and obs_array.shape[3] == 123:
+        print("  [SUCCESS] Observations have 123 channels!")
         success = True
     elif len(obs_array.shape) == 4 and obs_array.shape[3] == 119:
         print("  [FAILURE] Observations still have 119 channels (old version)")
@@ -67,7 +67,7 @@ try:
     games = coordinator.generate_games(check_and_evaluate, num_games=1)
 
     if verification_success:
-        print("\n[VERIFICATION COMPLETE] 122 channels confirmed!")
+        print("\n[VERIFICATION COMPLETE] 123 channels confirmed!")
     else:
         print("\n[VERIFICATION FAILED] Still using 119 channels")
 

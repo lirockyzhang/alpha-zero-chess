@@ -36,9 +36,9 @@ def test_position_encoding():
     encoding = alphazero_cpp.encode_position(fen)
     print(f"✓ Encoding shape: {encoding.shape}")
     print(f"✓ Encoding dtype: {encoding.dtype}")
-    print(f"✓ Expected shape: (8, 8, 122) [NHWC]")
+    print(f"✓ Expected shape: (8, 8, 123) [NHWC]")
 
-    assert encoding.shape == (8, 8, 122), f"Shape mismatch: {encoding.shape} != (8, 8, 122)"
+    assert encoding.shape == (8, 8, 123), f"Shape mismatch: {encoding.shape} != (8, 8, 123)"
     assert encoding.dtype == np.float32, f"Dtype mismatch: {encoding.dtype}"
 
     # Test two-arg form with history FENs
@@ -47,7 +47,7 @@ def test_position_encoding():
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
     ]
     encoding2 = alphazero_cpp.encode_position(fen, history)
-    assert encoding2.shape == (8, 8, 122), f"Two-arg shape mismatch: {encoding2.shape}"
+    assert encoding2.shape == (8, 8, 123), f"Two-arg shape mismatch: {encoding2.shape}"
     print("✓ Two-arg encode_position(fen, history_fens) works")
 
     print("✓ PASS: Position encoding works\n")

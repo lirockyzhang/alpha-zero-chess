@@ -53,7 +53,7 @@ def verify_position_encoding(fen):
     """Verify position can be encoded without errors."""
     try:
         encoding = alphazero_cpp.encode_position(fen)
-        assert encoding.shape == (8, 8, 122), f"Wrong shape: {encoding.shape}"
+        assert encoding.shape == (8, 8, 123), f"Wrong shape: {encoding.shape}"
         return True
     except Exception as e:
         print(f"[ERROR] Failed to encode position {fen}: {e}")
@@ -219,7 +219,7 @@ def test_specific_positions():
         try:
             # Test position encoding
             encoding = alphazero_cpp.encode_position(fen)
-            assert encoding.shape == (8, 8, 122)
+            assert encoding.shape == (8, 8, 123)
 
             # Test move encoding for all legal moves
             board = chess.Board(fen)

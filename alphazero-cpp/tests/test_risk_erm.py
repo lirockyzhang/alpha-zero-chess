@@ -146,7 +146,7 @@ def test_network_always_wdl():
     net = AlphaZeroNet(num_filters=64, num_blocks=2, wdl=True)
     net.eval()
 
-    x = torch.randn(4, 122, 8, 8)
+    x = torch.randn(4, 123, 8, 8)
     mask = torch.ones(4, 4672)
 
     policy, value, policy_logits, wdl_logits = net(x, mask)
@@ -210,7 +210,7 @@ def test_replay_buffer_wdl_storage():
     """ReplayBuffer stores and retrieves WDL targets alongside obs/pol/val."""
     buffer = alphazero_cpp.ReplayBuffer(capacity=100)
 
-    obs = np.random.rand(7808).astype(np.float32)
+    obs = np.random.rand(7872).astype(np.float32)
     pol = np.random.rand(4672).astype(np.float32)
     val = 0.5
     wdl = np.array([0.6, 0.3, 0.1], dtype=np.float32)

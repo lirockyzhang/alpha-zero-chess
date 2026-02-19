@@ -363,7 +363,6 @@ GameTrajectory ParallelSelfPlayCoordinator::play_single_game(
         search_config.risk_beta = (board.sideToMove() == chess::Color::WHITE)
                                   ? risk_white : risk_black;
         search_config.fpu_base = config_.fpu_base;
-        search_config.use_virtual_loss = (config_.mcts_batch_size > 1);
 
         // Gumbel Top-k Sequential Halving config
         search_config.use_gumbel = config_.use_gumbel;
@@ -697,7 +696,8 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
             obs_buffer.data(),
             mask_buffer.data(),
             1,
-            request_ids
+            request_ids,
+            config_.worker_timeout_ms  // Blocking submit (backpressure)
         );
 
         got = eval_queue_.get_results(
@@ -766,7 +766,8 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
             sim_request_ids.clear();
             int queued = eval_queue_.submit_for_evaluation(
                 worker_id, obs_buffer.data(), mask_buffer.data(),
-                num_leaves, sim_request_ids
+                num_leaves, sim_request_ids,
+                config_.worker_timeout_ms  // Blocking submit (backpressure)
             );
 
             if (queued == 0) {
@@ -821,7 +822,8 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
             sim_request_ids.clear();
             int queued = eval_queue_.submit_for_evaluation(
                 worker_id, obs_buffer.data(), mask_buffer.data(),
-                num_leaves, sim_request_ids
+                num_leaves, sim_request_ids,
+                config_.worker_timeout_ms  // Blocking submit (backpressure)
             );
 
             if (queued > 0) {
@@ -874,7 +876,8 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
                 sim_request_ids.clear();
                 int queued = eval_queue_.submit_for_evaluation(
                     worker_id, obs_buffer.data(), mask_buffer.data(),
-                    num_leaves, sim_request_ids
+                    num_leaves, sim_request_ids,
+                    config_.worker_timeout_ms  // Blocking submit (backpressure)
                 );
 
                 if (queued > 0) {

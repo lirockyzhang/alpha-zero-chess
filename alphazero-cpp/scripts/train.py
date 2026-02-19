@@ -7,7 +7,7 @@ This script uses:
 - C++ ReplayBuffer for high-performance data storage
 - CUDA for neural network inference and training
 - 192x15 network architecture (192 filters, 15 residual blocks)
-- 122-channel position encoding
+- 123-channel position encoding
 
 Output Directory Structure:
     Each training run creates an organized directory:
@@ -514,19 +514,20 @@ class MetricsTracker:
 # Run Directory and Resume Helpers
 # =============================================================================
 
-def create_run_directory(base_dir: str, filters: int, blocks: int) -> str:
+def create_run_directory(base_dir: str, filters: int, blocks: int, se_reduction: int = 16) -> str:
     """Create a new organized run directory with timestamp.
 
     Args:
         base_dir: Base checkpoint directory (e.g., "checkpoints")
         filters: Number of network filters
         blocks: Number of residual blocks
+        se_reduction: SE block reduction ratio
 
     Returns:
         Path to the created run directory
     """
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_name = f"f{filters}-b{blocks}_{timestamp}"
+    run_name = f"f{filters}-b{blocks}-se{se_reduction}_{timestamp}"
     run_dir = os.path.join(base_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
 
@@ -615,6 +616,19 @@ def load_metrics_history(run_dir: str) -> Dict[str, Any]:
     return {"iterations": [], "config": {}}
 
 
+def safe_torch_save(obj: dict, path: str):
+    """Save a PyTorch checkpoint atomically via temp file + rename.
+
+    OneDrive (and similar cloud-sync tools) can corrupt torch.save by
+    reading/locking the file mid-write. Writing to a .tmp file first
+    and then renaming avoids this race condition.
+    """
+    tmp_path = path + ".tmp"
+    torch.save(obj, tmp_path)
+    # On Windows, os.replace is atomic if src and dst are on the same volume
+    os.replace(tmp_path, path)
+
+
 def save_metrics_history(run_dir: str, metrics_history: Dict[str, Any]):
     """Save training metrics history to a run directory.
 
@@ -667,8 +681,8 @@ class BatchedEvaluator:
 
     @torch.inference_mode()
     def evaluate(self, obs: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, float]:
-        """Evaluate single position. obs is NHWC (8, 8, 122)."""
-        # permute: (8,8,122) → unsqueeze → (1,8,8,122) → permute → (1,122,8,8) channels_last
+        """Evaluate single position. obs is NHWC (8, 8, 123)."""
+        # permute: (8,8,123) → unsqueeze → (1,8,8,123) → permute → (1,123,8,8) channels_last
         obs_tensor = torch.from_numpy(obs).unsqueeze(0).permute(0, 3, 1, 2).float().to(self.device)
         mask_tensor = torch.from_numpy(mask).float().unsqueeze(0).to(self.device)
 
@@ -682,7 +696,7 @@ class BatchedEvaluator:
 
     @torch.inference_mode()
     def evaluate_batch(self, obs_batch: np.ndarray, mask_batch: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Evaluate batch of positions. obs_batch is NHWC (N, 8, 8, 122)."""
+        """Evaluate batch of positions. obs_batch is NHWC (N, 8, 8, 123)."""
         obs_tensor = torch.from_numpy(obs_batch).permute(0, 3, 1, 2).float().to(self.device)
         mask_tensor = torch.from_numpy(mask_batch).float().to(self.device)
 
@@ -727,7 +741,7 @@ class CppSelfPlay:
         """Play a single self-play game.
 
         Returns:
-            observations: List of board observations (8, 8, 122) NHWC format
+            observations: List of board observations (8, 8, 123) NHWC format
             policies: List of MCTS policies
             result: Game result (1=white wins, -1=black wins, 0=draw)
             num_moves: Number of moves played
@@ -743,10 +757,10 @@ class CppSelfPlay:
         total_sims = 0
         total_evals = 0
 
-        while not board.is_game_over() and move_count < 512:
+        while not board.is_game_over() and move_count < 10000:
             fen = board.fen()
 
-            # Encode position (returns 8, 8, 122 in NHWC format)
+            # Encode position (returns 8, 8, 123 in NHWC format)
             obs = alphazero_cpp.encode_position(fen)
 
             # Get legal moves and build mask + mapping
@@ -830,7 +844,7 @@ class CppSelfPlay:
 
         # Determine result reason for draw breakdown tracking
         if value == 0.0:
-            if move_count >= 512:
+            if move_count >= 10000:
                 result_reason = "max_moves"
             elif board.is_repetition():
                 result_reason = "repetition"
@@ -1336,13 +1350,13 @@ def run_parallel_selfplay(
     actual_total_games = games_per_worker * args.workers
 
     # Auto-calculate optimal queue capacity if not specified
-    # Formula: max(8192, workers * search_batch * 8)
-    # The *8 factor ensures capacity/4 > 2 * workers * search_batch,
-    # preventing pool reset starvation under heavy concurrent submission.
+    # Formula: max(8192, workers * search_batch * 16)
+    # The *16 factor accounts for mirror averaging (2x GPU workload per batch)
+    # and ensures sufficient buffer for backpressure to absorb burst submissions.
     if args.queue_capacity > 0:
         queue_capacity = args.queue_capacity
     else:
-        queue_capacity = max(8192, args.workers * args.search_batch * 8)
+        queue_capacity = max(8192, args.workers * args.search_batch * 16)
 
     risk_beta = args.risk_beta
 
@@ -1609,7 +1623,7 @@ def run_parallel_selfplay(
 
     # Create evaluator callback that will be called from C++ GPU thread
     # Signature: (observations, legal_masks, batch_size, out_policies, out_values) -> None
-    # Observations arrive in NHWC format (batch, 8, 8, 122) — no C++ transpose
+    # Observations arrive in NHWC format (batch, 8, 8, 123) — no C++ transpose
     # torch.permute(0,3,1,2) gives channels_last layout (zero-copy metadata swap)
     # Output buffers are writable numpy views over C++ memory (zero-copy)
     @torch.inference_mode()
@@ -1836,6 +1850,7 @@ def run_parallel_selfplay(
                 submission_drops=live_stats.get('submission_drops', 0),
                 partial_subs=live_stats.get('partial_submissions', 0),
                 pool_resets=live_stats.get('pool_resets', 0),
+                submission_waits=live_stats.get('submission_waits', 0),
                 pool_load=live_stats.get('pool_load', 0.0),
                 avg_batch_size=live_stats.get('avg_batch_size', 0.0),
                 batch_fill_ratio=live_stats.get('batch_fill_ratio', 0.0),
@@ -1930,6 +1945,7 @@ def run_parallel_selfplay(
         partial_subs = result.get('partial_submissions', 0)
         submission_drops = result.get('submission_drops', 0)
         pool_resets = result.get('pool_resets', 0)
+        submission_waits = result.get('submission_waits', 0)
         avg_batch = result.get('avg_batch_size', 0)
         total_batches = result.get('total_batches', 0)
         root_retries = result.get('root_retries', 0)
@@ -1961,10 +1977,12 @@ def run_parallel_selfplay(
                   f"range=[{sorted_sizes[0]}, {sorted_sizes[-1]}]")
             print(f"     Top 5: {', '.join(f'{s}({c})' for s, c in top5)}")
 
-        if mcts_failures > 0 or pool_exhaustion > 0 or partial_subs > 0 or root_retries > 0:
+        if mcts_failures > 0 or pool_exhaustion > 0 or partial_subs > 0 or root_retries > 0 or submission_waits > 0:
             print(f"  Pipeline issues: {mcts_failures} MCTS failures ({failure_rate:.1f}%), "
                   f"pool_exhaustion={pool_exhaustion}, partial_subs={partial_subs}, "
                   f"drops={submission_drops}, resets={pool_resets}")
+            if submission_waits > 0:
+                print(f"  Backpressure: {submission_waits} submission waits (workers waited for queue space)")
             if root_retries > 0 or stale_flushed > 0:
                 print(f"  Retry stats: {root_retries} root retries, {stale_flushed} stale results flushed")
             if failure_rate > 10:
@@ -2044,8 +2062,8 @@ def train_iteration(
         obs, policies, values, wdl_targets, soft_values = replay_buffer.sample(batch_size)
 
         # Convert to PyTorch tensors
-        # obs is (batch, 7808) flat, need to reshape to (batch, 122, 8, 8)
-        obs = obs.reshape(-1, 8, 8, INPUT_CHANNELS)  # (batch, 8, 8, 122) NHWC
+        # obs is (batch, 7872) flat, need to reshape to (batch, 123, 8, 8)
+        obs = obs.reshape(-1, 8, 8, INPUT_CHANNELS)  # (batch, 8, 8, 123) NHWC
         # permute is zero-copy metadata swap; .to(device) preserves channels_last
         obs_tensor = torch.from_numpy(obs).permute(0, 3, 1, 2).to(device)
         policy_target = torch.from_numpy(policies).to(device)
@@ -2355,7 +2373,7 @@ Examples:
     else:
         # Create new run directory
         os.makedirs(args.save_dir, exist_ok=True)
-        run_dir = create_run_directory(args.save_dir, args.filters, args.blocks)
+        run_dir = create_run_directory(args.save_dir, args.filters, args.blocks, args.se_reduction)
         checkpoint_path = None
         print(f"Created run directory: {run_dir}")
 
@@ -2481,20 +2499,25 @@ Examples:
             print(f"Emergency checkpoint detected — will re-train iteration {start_iter + 1}")
         print(f"Resumed from iteration {start_iter}")
 
-        # Try to load replay buffer from .rpbf file
+        # Try to load replay buffer from .rpbf file (try newest first, fall back)
         import glob as glob_mod
         rpbf_files = sorted(glob_mod.glob(os.path.join(run_dir, "buffer_iter_*.rpbf")))
-        if rpbf_files:
-            latest_rpbf = rpbf_files[-1]
-            print(f"  Loading replay buffer: {latest_rpbf}...", end=" ", flush=True)
-            if replay_buffer.load(latest_rpbf):
+        buffer_loaded = False
+        for rpbf_candidate in reversed(rpbf_files):
+            print(f"  Loading replay buffer: {rpbf_candidate}...", end=" ", flush=True)
+            if replay_buffer.load(rpbf_candidate):
                 comp = replay_buffer.get_composition()
                 print(f"done ({replay_buffer.size()} samples, "
                       f"W={comp['wins']} D={comp['draws']} L={comp['losses']})")
+                buffer_loaded = True
+                break
             else:
-                print("FAILED (starting with empty buffer)")
-        else:
-            print("  No replay buffer file found (starting with empty buffer)")
+                print("FAILED, trying older buffer...")
+        if not buffer_loaded:
+            if rpbf_files:
+                print("  WARNING: All replay buffer files failed to load (starting with empty buffer)")
+            else:
+                print("  No replay buffer file found (starting with empty buffer)")
 
         # Truncate metrics history to discard records from reverted iterations
         metrics_removed = truncate_history_to_iteration(metrics_history, start_iter)
@@ -2704,7 +2727,7 @@ Examples:
 
         # Save checkpoint
         emergency_path = os.path.join(run_dir, f"model_iter_{iteration_num:03d}_emergency.pt")
-        torch.save({
+        safe_torch_save({
             'iteration': iteration_num,
             'model_state_dict': network.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -2775,7 +2798,7 @@ Examples:
     # Save initial (random) model as iter0 for fresh runs
     if start_iter == 0:
         iter0_path = os.path.join(run_dir, "model_iter_000.pt")
-        torch.save({
+        safe_torch_save({
             'iteration': 0,
             'model_state_dict': network.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -2842,7 +2865,7 @@ Examples:
             filename = f"model_export_iter{iteration + 1:03d}_{timestamp}.pt"
             export_path = os.path.join(run_dir, filename)
             try:
-                torch.save({
+                safe_torch_save({
                     'iteration': iteration + 1,
                     'model_state_dict': network.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
@@ -3041,10 +3064,10 @@ Examples:
                     }
 
                 # Add game data to C++ ReplayBuffer
-                # Flatten observations for storage: (122, 8, 8) -> (7808,)
+                # Flatten observations for storage: (123, 8, 8) -> (7872,)
                 # Value must be from side-to-move perspective (matches C++ game.hpp::set_outcomes)
                 for i, (obs, policy) in enumerate(zip(obs_list, policy_list)):
-                    obs_flat = obs.flatten().astype(np.float32)  # (7808,)
+                    obs_flat = obs.flatten().astype(np.float32)  # (7872,)
                     white_to_move = (i % 2 == 0)
                     if result == 1.0:  # White won
                         value = 1.0 if white_to_move else -1.0
@@ -3293,7 +3316,7 @@ Examples:
             # Save model checkpoint
             checkpoint_name = f"model_iter_{iteration + 1:03d}.pt"
             checkpoint_save_path = os.path.join(run_dir, checkpoint_name)
-            torch.save({
+            safe_torch_save({
                 'iteration': iteration + 1,
                 'model_state_dict': network.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
@@ -3314,15 +3337,24 @@ Examples:
             }, checkpoint_save_path)
             print(f"  Saved checkpoint: {checkpoint_save_path}")
 
-            # Save replay buffer
+            # Save replay buffer (write to system temp dir, then move — avoids OneDrive interference)
+            import tempfile
             buffer_path = os.path.join(run_dir, f"buffer_iter_{iteration + 1:03d}.rpbf")
-            if replay_buffer.save(buffer_path):
+            buffer_tmp_fd, buffer_tmp_path = tempfile.mkstemp(suffix=".rpbf", prefix="buffer_")
+            os.close(buffer_tmp_fd)
+            if replay_buffer.save(buffer_tmp_path):
+                import shutil
+                shutil.move(buffer_tmp_path, buffer_path)
                 comp = replay_buffer.get_composition()
                 buf_mb = os.path.getsize(buffer_path) / (1024 * 1024) if os.path.exists(buffer_path) else 0
                 print(f"  Saved replay buffer: {buffer_path} ({buf_mb:.1f} MB, "
                       f"W={comp['wins']} D={comp['draws']} L={comp['losses']})")
             else:
                 print(f"  WARNING: Failed to save replay buffer to {buffer_path}")
+                try:
+                    os.remove(buffer_tmp_path)
+                except OSError:
+                    pass
 
             # Save training metrics JSON
             save_metrics_history(run_dir, metrics_history)
@@ -3344,7 +3376,7 @@ Examples:
             # Save final checkpoint alias
             if is_final:
                 final_path = os.path.join(run_dir, "model_final.pt")
-                torch.save({
+                safe_torch_save({
                     'iteration': iteration + 1,
                     'model_state_dict': network.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),

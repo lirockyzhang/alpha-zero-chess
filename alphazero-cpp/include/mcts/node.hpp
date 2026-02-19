@@ -16,18 +16,17 @@ class NodePool;
 // CRITICAL: 64-byte aligned to prevent false sharing between CPU cores
 // Each node fits exactly in one cache line for optimal performance
 //
-// Layout (53 data bytes + 11 explicit padding = 64):
+// Layout (51 data bytes + 13 explicit padding = 64):
 //   [0-7]   parent (8)
 //   [8-15]  first_child (8)
 //   [16-23] next_sibling (8)
 //   [24-31] value_sum_fixed (8)        8-byte aligned, no gap
 //   [32-39] value_sum_sq_fixed (8)     8-byte aligned (variance tracking)
 //   [40-43] visit_count (4)            4-byte aligned
-//   [44-45] virtual_loss (2)           2-byte aligned
-//   [46-49] move (4)                   chess::Move = uint16_t move_ + int16_t score_
-//   [50-51] prior_fixed (2)
-//   [52]    flags (1)
-//   [53-63] padding[11] (11)
+//   [44-47] move (4)                   chess::Move = uint16_t move_ + int16_t score_
+//   [48-49] prior_fixed (2)
+//   [50]    flags (1)
+//   [51-63] padding[13] (13)
 struct alignas(64) Node {
     // Parent node (nullptr for root)
     Node* parent;
@@ -50,9 +49,6 @@ struct alignas(64) Node {
     // Visit count (atomic for thread-safe MCTS)
     std::atomic<uint32_t> visit_count;
 
-    // Virtual loss for parallel MCTS (prevents multiple threads from exploring same path)
-    std::atomic<int16_t> virtual_loss;
-
     // Move that led to this node (from parent's perspective)
     chess::Move move;
 
@@ -64,7 +60,7 @@ struct alignas(64) Node {
     uint8_t flags;
 
     // Padding to reach exactly 64 bytes
-    uint8_t padding[11];
+    uint8_t padding[13];
 
     // Constructor
     Node()
@@ -75,37 +71,28 @@ struct alignas(64) Node {
         , value_sum_sq_fixed(0)
         , move()
         , visit_count(0)
-        , virtual_loss(0)
         , prior_fixed(0)
         , flags(0)
     {
         static_assert(sizeof(Node) == 64, "Node must be exactly 64 bytes for cache-line alignment");
     }
 
-    // Q-value calculation with virtual loss and dynamic FPU (First Play Urgency)
+    // Q-value calculation with dynamic FPU (First Play Urgency)
     // Dynamic FPU: penalty = fpu_base * sqrt(1 - prior)
     //   high-prior moves (prior=0.9) get small penalty: sqrt(0.1) ≈ 0.32
     //   low-prior moves (prior=0.03) get harsh penalty: sqrt(0.97) ≈ 0.98
     // sqrt compression makes medium-prior moves more explorable than linear (1-prior).
     float q_value(float parent_q, float fpu_base = 0.3f) const {
         uint32_t n = visit_count.load(std::memory_order_relaxed);
-        int16_t v = virtual_loss.load(std::memory_order_relaxed);
 
-        // Unvisited node with no virtual loss: use dynamic FPU
-        if (n == 0 && v == 0) {
+        // Unvisited node: use dynamic FPU
+        if (n == 0) {
             return parent_q - fpu_base * std::sqrt(1.0f - prior());
         }
 
-        // Unvisited node with virtual loss: use parent Q-value (Leela approach)
-        if (n == 0 && v > 0) {
-            return parent_q;
-        }
-
-        // Visited node: compute average value including virtual loss
+        // Visited node: compute average value
         int64_t sum = value_sum_fixed.load(std::memory_order_relaxed);
-        float real_value = sum / 10000.0f;
-        float total_value = real_value + v * parent_q;
-        return total_value / (n + v);
+        return sum / (10000.0f * n);
     }
 
     // Risk-adjusted Q-value using Entropic Risk Measure (ERM) approximation:
@@ -120,16 +107,10 @@ struct alignas(64) Node {
         }
 
         uint32_t n = visit_count.load(std::memory_order_relaxed);
-        int16_t vl = virtual_loss.load(std::memory_order_relaxed);
 
-        // Unvisited node with no virtual loss: FPU unchanged (no variance data)
-        if (n == 0 && vl == 0) {
-            return parent_q - fpu_base * std::sqrt(1.0f - prior());
-        }
-
-        // Unvisited node with virtual loss: VL anchor at parent_q
+        // Unvisited node: FPU unchanged (no variance data)
         if (n == 0) {
-            return parent_q;
+            return parent_q - fpu_base * std::sqrt(1.0f - prior());
         }
 
         // Visited node: compute risk-adjusted Q
@@ -142,11 +123,6 @@ struct alignas(64) Node {
         float var = std::max(0.0f, mean_sq - mean * mean);
 
         float q_risk = mean + (beta / 2.0f) * var;
-
-        // Blend with virtual loss (VL contributes parent_q only, no variance)
-        if (vl > 0) {
-            q_risk = (n * q_risk + vl * parent_q) / (n + vl);
-        }
 
         // Clamp to valid range (extreme beta may saturate)
         return std::clamp(q_risk, -1.0f, 1.0f);
@@ -186,16 +162,6 @@ struct alignas(64) Node {
         } else {
             flags &= ~0x02;
         }
-    }
-
-    // Add virtual loss (called when thread starts exploring this path)
-    void add_virtual_loss() {
-        virtual_loss.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    // Remove virtual loss (called when thread finishes exploring this path)
-    void remove_virtual_loss() {
-        virtual_loss.fetch_sub(1, std::memory_order_relaxed);
     }
 
     // Update node with backpropagation value

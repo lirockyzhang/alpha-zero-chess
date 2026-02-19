@@ -10,13 +10,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'build', 'Relea
 import alphazero_cpp
 
 def test_nhwc_shape():
-    """Test that encoding returns NHWC shape (8, 8, 122)."""
+    """Test that encoding returns NHWC shape (8, 8, 123)."""
     fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
     encoding = alphazero_cpp.encode_position(fen)
 
     print(f"Encoding shape: {encoding.shape}")
-    assert encoding.shape == (8, 8, 122), f"Expected (8, 8, 122), got {encoding.shape}"
-    print("[PASS] NHWC shape correct: (8, 8, 122)")
+    assert encoding.shape == (8, 8, 123), f"Expected (8, 8, 123), got {encoding.shape}"
+    print("[PASS] NHWC shape correct: (8, 8, 123)")
 
 def test_nhwc_memory_layout():
     """Test that channels are contiguous in memory (channels-last)."""
@@ -24,8 +24,8 @@ def test_nhwc_memory_layout():
     encoding = alphazero_cpp.encode_position(fen)
 
     # Check strides - for NHWC, innermost dimension should be channels
-    # Expected strides: (8*122*4, 122*4, 4) for float32
-    expected_strides = (8 * 122 * 4, 122 * 4, 4)
+    # Expected strides: (8*123*4, 123*4, 4) for float32
+    expected_strides = (8 * 123 * 4, 123 * 4, 4)
     print(f"Encoding strides: {encoding.strides}")
     print(f"Expected strides: {expected_strides}")
 
@@ -68,7 +68,7 @@ def test_nhwc_zero_copy():
     fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
     # Create buffer with NHWC shape
-    buffer = np.zeros((8, 8, 122), dtype=np.float32)
+    buffer = np.zeros((8, 8, 123), dtype=np.float32)
     buffer_ptr = buffer.__array_interface__['data'][0]
 
     # Encode to buffer
@@ -94,15 +94,15 @@ def test_nhwc_batch_encoding():
 
     # Create batch buffer with NHWC shape
     batch_size = len(fens)
-    batch_buffer = np.zeros((batch_size, 8, 8, 122), dtype=np.float32)
+    batch_buffer = np.zeros((batch_size, 8, 8, 123), dtype=np.float32)
 
     # Encode each position
     for i, fen in enumerate(fens):
         alphazero_cpp.encode_position_to_buffer(fen, batch_buffer[i])
 
     # Verify shapes
-    assert batch_buffer.shape == (batch_size, 8, 8, 122), \
-        f"Expected batch shape ({batch_size}, 8, 8, 122), got {batch_buffer.shape}"
+    assert batch_buffer.shape == (batch_size, 8, 8, 123), \
+        f"Expected batch shape ({batch_size}, 8, 8, 123), got {batch_buffer.shape}"
     print(f"[PASS] Batch encoding shape correct: {batch_buffer.shape}")
 
     # Verify first position has White pawns on rank 1
@@ -124,7 +124,7 @@ def test_nhwc_pytorch_compatibility():
     # Convert to PyTorch tensor
     tensor = torch.from_numpy(encoding)
 
-    # Add batch dimension: (1, 8, 8, 122)
+    # Add batch dimension: (1, 8, 8, 123)
     tensor = tensor.unsqueeze(0)
 
     # Convert to channels_last format
@@ -133,8 +133,8 @@ def test_nhwc_pytorch_compatibility():
     print(f"PyTorch tensor shape: {tensor_cl.shape}")
     print(f"PyTorch tensor is_contiguous(channels_last): {tensor_cl.is_contiguous(memory_format=torch.channels_last)}")
 
-    assert tensor_cl.shape == (1, 8, 8, 122), \
-        f"Expected shape (1, 8, 8, 122), got {tensor_cl.shape}"
+    assert tensor_cl.shape == (1, 8, 8, 123), \
+        f"Expected shape (1, 8, 8, 123), got {tensor_cl.shape}"
     print("[PASS] NHWC layout compatible with PyTorch channels_last")
 
 def main():

@@ -144,7 +144,8 @@ int GlobalEvaluationQueue::submit_for_evaluation(
     const float* observations,
     const float* legal_masks,
     int num_leaves,
-    std::vector<int32_t>& out_request_ids)
+    std::vector<int32_t>& out_request_ids,
+    int timeout_ms)
 {
     if (shutdown_.load(std::memory_order_acquire) || num_leaves <= 0) {
         return 0;
@@ -161,12 +162,42 @@ int GlobalEvaluationQueue::submit_for_evaluation(
     int first_slot = 0;
 
     // =====================================================================
-    // Phase 1 (under lock, ~1µs): Claim staging slots + push metadata
+    // Phase 1 (under lock): Backpressure wait + claim staging slots + push metadata
     // =====================================================================
     // Only lightweight operations: integer arithmetic + vector push_back.
     // The expensive memcpy is deferred to Phase 2 (no lock).
     {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+
+        // Cool-down backpressure: if queue is full, activate cool-down and
+        // sleep until GPU signals recovery (drains to ≤50%).
+        // Workers sleep on CV — no spinning, background-program friendly.
+        //
+        // Unlike the old "wait for any space" predicate which resumed workers
+        // at 99% full (thundering herd), cool-down keeps ALL workers blocked
+        // until the GPU explicitly lifts the flag at 50% capacity, giving the
+        // GPU "clean air" to process with zero submission contention.
+        if (timeout_ms > 0) {
+            int current_head = staging_write_head_.load(std::memory_order_relaxed);
+            if (current_head + num_leaves > static_cast<int>(queue_capacity_)) {
+                // Queue is full — activate cool-down
+                cooldown_active_.store(true, std::memory_order_release);
+                metrics_.submission_waits.fetch_add(1, std::memory_order_relaxed);
+
+                // Block until GPU drains queue and lifts cooldown, or shutdown.
+                // No timeout — workers wait as long as needed rather than dropping evals.
+                queue_space_cv_.wait(lock, [this]() {
+                    return !cooldown_active_.load(std::memory_order_acquire) ||
+                           shutdown_.load(std::memory_order_acquire);
+                });
+
+                // If woken by shutdown, exit immediately — don't claim slots
+                // for requests that will never be evaluated.
+                if (shutdown_.load(std::memory_order_acquire)) {
+                    return 0;
+                }
+            }
+        }
 
         // Claim staging slots (synchronized with GPU's compaction reset)
         first_slot = staging_write_head_.load(std::memory_order_relaxed);
@@ -410,6 +441,7 @@ int GlobalEvaluationQueue::collect_batch(
     // =====================================================================
     // Only lightweight operations: deferred compaction, wait, vector swap.
     // NO memcpy of observation/mask data under lock.
+    bool space_freed = false;  // Track if compaction freed staging slots
     {
         std::unique_lock<std::mutex> lock(queue_mutex_);
 
@@ -420,6 +452,21 @@ int GlobalEvaluationQueue::collect_batch(
         if (needs_compaction_) {
             compact_remaining_locked();
             needs_compaction_ = false;
+            space_freed = true;
+        }
+
+        // --- Cool-down recovery check ---
+        // Lift cool-down when queue has drained to ≤50% after compaction.
+        // Notify INSIDE lock (before Phase 1 wait) to prevent deadlock:
+        // workers need to submit before GPU can collect the next batch.
+        // Workers wake blocked on queue_mutex_, then acquire it when GPU
+        // enters wait_for (which releases the lock).
+        if (space_freed && cooldown_active_.load(std::memory_order_relaxed)) {
+            int new_head = staging_write_head_.load(std::memory_order_relaxed);
+            if (new_head <= static_cast<int>(queue_capacity_ / 2)) {
+                cooldown_active_.store(false, std::memory_order_release);
+                queue_space_cv_.notify_all();
+            }
         }
 
         // TWO-PHASE WAIT with stall detection (UNCHANGED — it works well).
@@ -493,15 +540,20 @@ int GlobalEvaluationQueue::collect_batch(
         staged_requests_.erase(staged_requests_.begin(),
                                 staged_requests_.begin() + batch_size);
 
-        // LAZY COMPACTION: Schedule for next collect_batch if head > 75%.
+        // LAZY COMPACTION: Schedule for next collect_batch if head > 75%,
+        // OR if cooldown is active (ensures compaction ALWAYS runs during
+        // cooldown so the GPU can drain the queue and lift the flag).
         // Deferring is safe: collected slots' data is read in Phase 2 below,
         // and remaining requests' slot_ready_ flags are already set by workers.
         int head = staging_write_head_.load(std::memory_order_relaxed);
-        if (head > static_cast<int>(queue_capacity_ * 3 / 4)) {
+        if (head > static_cast<int>(queue_capacity_ * 3 / 4)
+            || cooldown_active_.load(std::memory_order_relaxed)) {
             needs_compaction_ = true;
         }
     }
     // Lock released — workers can submit new leaves during Phase 2
+    // NOTE: queue_space_cv_ notification now happens INSIDE the lock
+    // (before Phase 1 wait) to prevent deadlock with cool-down.
 
     // =====================================================================
     // Phase 2 (NO lock, OpenMP parallel): Spin-wait + NHWC memcpy + mask copy
@@ -751,7 +803,10 @@ void GlobalEvaluationQueue::shutdown() {
     // Wake up GPU thread
     queue_cv_.notify_all();
 
-    // Wake up all worker threads
+    // Wake up workers blocked on submit_for_evaluation() waiting for queue space
+    queue_space_cv_.notify_all();
+
+    // Wake up all worker threads waiting for results
     for (size_t i = 0; i < MAX_WORKERS; ++i) {
         worker_cvs_[i].notify_all();
     }
@@ -767,6 +822,7 @@ void GlobalEvaluationQueue::reset() {
     staging_write_head_.store(0, std::memory_order_release);
     current_policy_buffer_ = 0;
     needs_compaction_ = false;
+    cooldown_active_.store(false, std::memory_order_relaxed);
 
     // Clear all slot ready flags
     for (size_t i = 0; i < queue_capacity_; ++i) {

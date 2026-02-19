@@ -39,7 +39,7 @@ struct ParallelSelfPlayConfig {
 
     // Move selection
     int temperature_moves = 30;         // Moves with temperature=1.0
-    int max_moves_per_game = 512;       // Maximum moves before draw
+    int max_moves_per_game = 10000;     // Safety cap (real chess rules terminate games first)
 
     // GPU batching configuration
     int gpu_batch_size = 512;           // Maximum GPU batch size
@@ -192,10 +192,10 @@ struct ParallelSelfPlayStats {
 
 // Callback signature for neural network evaluation
 // Called by GPU thread with batched observations
-// Observations are in NCHW format (batch_size x 122 x 8 x 8) — C++ handles transpose
+// Observations are in NHWC format (batch_size x 8 x 8 x 123) — Python permutes to NCHW
 // Should perform forward pass and write results to policies and WDL probabilities
 using NeuralEvaluatorFn = std::function<void(
-    const float* observations,      // batch_size x 122 x 8 x 8 (NCHW)
+    const float* observations,      // batch_size x 8 x 8 x 123 (NHWC)
     const float* legal_masks,       // batch_size x 4672
     int batch_size,
     float* out_policies,            // batch_size x 4672

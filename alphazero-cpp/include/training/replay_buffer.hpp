@@ -57,7 +57,7 @@ public:
      * Add a single sample to the buffer.
      * Thread-safe.
      *
-     * @param observation Position encoding (8x8x122 = 7808 floats)
+     * @param observation Position encoding (8x8x123 = 7872 floats)
      * @param policy Target policy (4672 floats)
      * @param value Target value (1 float)
      * @param wdl_target Optional WDL soft target (3 floats: P(win), P(draw), P(loss))
@@ -77,7 +77,7 @@ public:
      * Add a batch of samples from a game trajectory.
      * Thread-safe.
      *
-     * @param observations Batch of observations (N x 7808)
+     * @param observations Batch of observations (N x 7872)
      * @param policies Batch of policies (N x 4672)
      * @param values Batch of values (N)
      * @param wdl_targets Optional WDL soft targets (N x 3), nullptr to skip
@@ -94,7 +94,7 @@ public:
      * Thread-safe. Used by Python bindings for NumPy arrays.
      *
      * @param batch_size Number of samples
-     * @param observations_ptr Pointer to flat observations array (batch_size * 7808)
+     * @param observations_ptr Pointer to flat observations array (batch_size * 7872)
      * @param policies_ptr Pointer to flat policies array (batch_size * 4672)
      * @param values_ptr Pointer to values array (batch_size)
      * @param wdl_ptr Optional WDL soft targets (batch_size * 3), nullptr to skip
@@ -229,7 +229,7 @@ public:
 private:
     // Buffer storage
     const size_t capacity_;
-    std::vector<float> observations_;  // Flat array: capacity * 7808
+    std::vector<float> observations_;  // Flat array: capacity * 7872
     std::vector<float> policies_;      // Flat array: capacity * 4672
     std::vector<float> values_;        // Array: capacity
     std::vector<float> wdl_targets_;   // Flat array: capacity * 3 (WDL soft targets)
@@ -274,7 +274,7 @@ private:
     thread_local static std::mt19937 rng_;
 
     // Constants
-    static constexpr size_t OBS_SIZE = 8 * 8 * 122;  // 7808
+    static constexpr size_t OBS_SIZE = 8 * 8 * 123;  // 7872
     static constexpr size_t POLICY_SIZE = 4672;
 };
 

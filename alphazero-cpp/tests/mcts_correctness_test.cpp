@@ -32,11 +32,10 @@ void test_puct_formula() {
     child->visit_count.store(10, std::memory_order_relaxed);
     child->value_sum_fixed.store(50000, std::memory_order_relaxed);  // Q = 5.0
     child->set_prior(0.2f);
-    child->virtual_loss.store(0, std::memory_order_relaxed);
 
     // Calculate expected PUCT score manually
     float q = 5.0f / 10.0f;  // value_sum / visit_count = 0.5
-    float exploration = 1.5f * 0.2f * std::sqrt(100.0f) / (1.0f + 10.0f + 0.0f);
+    float exploration = 1.5f * 0.2f * std::sqrt(100.0f) / (1.0f + 10.0f);
     float expected_puct = q + exploration;
 
     // Get actual PUCT score (need to access private method via friend or make it public for testing)
@@ -54,58 +53,6 @@ void test_puct_formula() {
     std::cout << std::endl;
 }
 
-// Test 2: Verify virtual loss mechanism
-void test_virtual_loss() {
-    std::cout << "=== Test 2: Virtual Loss Mechanism ===" << std::endl;
-
-    NodePool pool;
-    Node* parent = pool.allocate();
-    Node* child = pool.allocate();
-    child->parent = parent;
-
-    // Set up initial state
-    parent->visit_count.store(100, std::memory_order_relaxed);
-    parent->value_sum_fixed.store(0, std::memory_order_relaxed);
-
-    child->visit_count.store(10, std::memory_order_relaxed);
-    child->value_sum_fixed.store(50000, std::memory_order_relaxed);  // Q = 5.0
-    child->set_prior(0.2f);
-
-    // Calculate Q-value without virtual loss
-    float q_no_vl = child->q_value(0.0f);
-    std::cout << "✓ Q-value without virtual loss: " << std::fixed << std::setprecision(4)
-              << q_no_vl << std::endl;
-
-    // Add virtual loss
-    child->add_virtual_loss();
-    child->add_virtual_loss();
-    child->add_virtual_loss();
-
-    // Calculate Q-value with virtual loss
-    float q_with_vl = child->q_value(0.0f);
-    std::cout << "✓ Q-value with 3 virtual losses: " << std::fixed << std::setprecision(4)
-              << q_with_vl << std::endl;
-
-    // Virtual loss should decrease Q-value (makes node less attractive)
-    if (q_with_vl < q_no_vl) {
-        std::cout << "✓ PASS: Virtual loss correctly decreases Q-value" << std::endl;
-    } else {
-        std::cout << "✗ FAIL: Virtual loss did not decrease Q-value" << std::endl;
-    }
-
-    // Remove virtual losses
-    child->remove_virtual_loss();
-    child->remove_virtual_loss();
-    child->remove_virtual_loss();
-
-    float q_restored = child->q_value(0.0f);
-    if (std::abs(q_restored - q_no_vl) < 0.001f) {
-        std::cout << "✓ PASS: Virtual loss removal restores original Q-value" << std::endl;
-    } else {
-        std::cout << "✗ FAIL: Q-value not restored after removing virtual loss" << std::endl;
-    }
-    std::cout << std::endl;
-}
 
 // Test 3: Verify backpropagation value negation
 void test_backpropagation_negation() {
@@ -341,7 +288,6 @@ void test_fpu() {
     // Child is unvisited
     child->visit_count.store(0, std::memory_order_relaxed);
     child->value_sum_fixed.store(0, std::memory_order_relaxed);
-    child->virtual_loss.store(0, std::memory_order_relaxed);
 
     float parent_q = parent->q_value(0.0f);
     float child_q = child->q_value(parent_q);
@@ -368,7 +314,6 @@ int main() {
 
     try {
         test_puct_formula();
-        test_virtual_loss();
         test_backpropagation_negation();
         test_fixed_point_precision();
         test_terminal_detection();

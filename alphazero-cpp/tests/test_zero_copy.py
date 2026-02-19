@@ -27,7 +27,7 @@ def test_zero_copy_interface():
     fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
     # Pre-allocate buffer
-    buffer = np.zeros((8, 8, 122), dtype=np.float32)
+    buffer = np.zeros((8, 8, 123), dtype=np.float32)
 
     # Get buffer address before encoding
     buffer_id_before = id(buffer)
@@ -68,7 +68,7 @@ def test_batch_zero_copy_performance():
     positions = positions[:batch_size]
 
     # Pre-allocate batch buffer
-    batch_buffer = np.zeros((batch_size, 8, 8, 122), dtype=np.float32)
+    batch_buffer = np.zeros((batch_size, 8, 8, 123), dtype=np.float32)
 
     # Benchmark zero-copy encoding
     start = time.perf_counter()
@@ -98,7 +98,7 @@ def test_memory_copy_comparison():
     elapsed_copy = time.perf_counter() - start
 
     # Test 2: Zero-copy (encode_position_to_buffer writes to existing buffer)
-    buffer = np.zeros((8, 8, 122), dtype=np.float32)
+    buffer = np.zeros((8, 8, 123), dtype=np.float32)
     start = time.perf_counter()
     for _ in range(num_iterations):
         alphazero_cpp.encode_position_to_buffer(fen, buffer)
@@ -119,19 +119,19 @@ def test_gpu_memory_compatibility():
     fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
     # Create buffer with specific memory layout (C-contiguous, float32)
-    buffer = np.zeros((8, 8, 122), dtype=np.float32, order='C')
+    buffer = np.zeros((8, 8, 123), dtype=np.float32, order='C')
 
     # Encode to buffer
     alphazero_cpp.encode_position_to_buffer(fen, buffer)
 
     # Verify memory layout is GPU-compatible
     print(f"  Buffer dtype: {buffer.dtype} (expected: float32)")
-    print(f"  Buffer shape: {buffer.shape} (expected: (8, 8, 122))")
+    print(f"  Buffer shape: {buffer.shape} (expected: (8, 8, 123))")
     print(f"  Buffer is C-contiguous: {buffer.flags['C_CONTIGUOUS']}")
     print(f"  Buffer is aligned: {buffer.flags['ALIGNED']}")
 
-    # Check strides for (8, 8, 122) C-contiguous float32
-    expected_strides = (8 * 122 * 4, 122 * 4, 4)  # (3904, 488, 4) bytes
+    # Check strides for (8, 8, 123) C-contiguous float32
+    expected_strides = (8 * 123 * 4, 123 * 4, 4)  # (3904, 488, 4) bytes
     print(f"  Buffer strides: {buffer.strides} (expected: {expected_strides})")
 
     assert buffer.dtype == np.float32, f"Expected float32, got {buffer.dtype}"
@@ -151,7 +151,7 @@ def test_concurrent_encoding():
     ]
 
     # Create separate buffers for each position
-    buffers = [np.zeros((8, 8, 122), dtype=np.float32) for _ in positions]
+    buffers = [np.zeros((8, 8, 123), dtype=np.float32) for _ in positions]
 
     # Encode all positions
     for i, fen in enumerate(positions):

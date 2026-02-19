@@ -23,36 +23,46 @@ void PositionEncoder::encode_to_buffer(const chess::Board& board, float* buffer,
     encode_piece_planes(board, buffer, flip);
 
     // Encode auxiliary planes in NHWC layout
-    // For each square, write to channels 12-17
+    // Pre-compute scalar values outside the loop
+    chess::Color current_color = board.sideToMove();
+    chess::Color opponent_color = (current_color == chess::Color::WHITE)
+                                    ? chess::Color::BLACK
+                                    : chess::Color::WHITE;
+
+    // Channel 13: Move count
+    float move_count_val = std::min(1.0f, board.fullMoveNumber() / 100.0f);
+
+    // Channels 14-17: Castling rights (4 binary planes)
+    float p1_kingside  = board.castlingRights().has(current_color, chess::Board::CastlingRights::Side::KING_SIDE)  ? 1.0f : 0.0f;
+    float p1_queenside = board.castlingRights().has(current_color, chess::Board::CastlingRights::Side::QUEEN_SIDE) ? 1.0f : 0.0f;
+    float p2_kingside  = board.castlingRights().has(opponent_color, chess::Board::CastlingRights::Side::KING_SIDE)  ? 1.0f : 0.0f;
+    float p2_queenside = board.castlingRights().has(opponent_color, chess::Board::CastlingRights::Side::QUEEN_SIDE) ? 1.0f : 0.0f;
+
+    // Channel 18: No-progress count
+    float no_progress_val = std::min(1.0f, board.halfMoveClock() / 100.0f);
+
     for (int rank = 0; rank < HEIGHT; ++rank) {
         for (int file = 0; file < WIDTH; ++file) {
             float* square_channels = buffer + rank * WIDTH * CHANNELS + file * CHANNELS;
 
-            // Channels 12-13: Repetition counts (encoded in history planes now)
-            // Channel 14: Color to move (always 1.0 from current player's perspective)
-            square_channels[14] = 1.0f;
+            // Channel 12: Color to move (always 1.0 from current player's perspective)
+            square_channels[12] = 1.0f;
 
-            // Channel 15: Move count
-            int full_moves = board.fullMoveNumber();
-            square_channels[15] = std::min(1.0f, full_moves / 100.0f);
+            // Channel 13: Move count
+            square_channels[13] = move_count_val;
 
-            // Channel 16: Castling rights
-            chess::Color current_color = board.sideToMove();
-            bool kingside = board.castlingRights().has(current_color, chess::Board::CastlingRights::Side::KING_SIDE);
-            bool queenside = board.castlingRights().has(current_color, chess::Board::CastlingRights::Side::QUEEN_SIDE);
-            float castling_value = 0.0f;
-            if (kingside && queenside) castling_value = 1.0f;
-            else if (kingside) castling_value = 0.67f;
-            else if (queenside) castling_value = 0.33f;
-            square_channels[16] = castling_value;
+            // Channels 14-17: Castling rights (binary planes)
+            square_channels[14] = p1_kingside;
+            square_channels[15] = p1_queenside;
+            square_channels[16] = p2_kingside;
+            square_channels[17] = p2_queenside;
 
-            // Channel 17: No-progress count (50-move rule)
-            int halfmoves = board.halfMoveClock();
-            square_channels[17] = std::min(1.0f, halfmoves / 50.0f);
+            // Channel 18: No-progress count (fifty-move rule: draw at halfmoves >= 100)
+            square_channels[18] = no_progress_val;
         }
     }
 
-    // Channels 18-118: History planes (8 positions × 12 piece planes + 8 repetition planes)
+    // Channels 19-122: History planes (8 positions × 13 planes each)
     encode_history_planes(position_history, board, buffer, flip);
 }
 
@@ -139,17 +149,16 @@ void PositionEncoder::encode_history_planes(const std::vector<chess::Board>& pos
     // - 12 piece planes (6 piece types × 2 colors)
     // - 1 repetition plane (1.0 if position matches current position)
     // Total: 13 planes per historical position × 8 = 104 planes
-    // Channels 18-121 (all 8 positions fully encoded with 122 total channels)
+    // Channels 19-122 (all 8 positions fully encoded with 123 total channels)
 
-    // Note: We encode up to 8 most recent positions (FULL encoding for all 8)
-    // Channels 18-30: Position T-1 (12 pieces + 1 repetition)
-    // Channels 31-43: Position T-2 (12 pieces + 1 repetition)
-    // Channels 44-56: Position T-3 (12 pieces + 1 repetition)
-    // Channels 57-69: Position T-4 (12 pieces + 1 repetition)
-    // Channels 70-82: Position T-5 (12 pieces + 1 repetition)
-    // Channels 83-95: Position T-6 (12 pieces + 1 repetition)
-    // Channels 96-108: Position T-7 (12 pieces + 1 repetition)
-    // Channels 109-121: Position T-8 (12 pieces + 1 repetition) - NOW COMPLETE!
+    // Channels 19-31:  Position T-1 (12 pieces + 1 repetition)
+    // Channels 32-44:  Position T-2
+    // Channels 45-57:  Position T-3
+    // Channels 58-70:  Position T-4
+    // Channels 71-83:  Position T-5
+    // Channels 84-96:  Position T-6
+    // Channels 97-109: Position T-7
+    // Channels 110-122: Position T-8
 
     int history_size = std::min(8, static_cast<int>(position_history.size()));
 
@@ -165,7 +174,7 @@ void PositionEncoder::encode_history_planes(const std::vector<chess::Board>& pos
 
         // Starting channel for this historical position
         // Each position needs 13 channels (12 pieces + 1 repetition)
-        int base_channel = 18 + hist_idx * 13;
+        int base_channel = 19 + hist_idx * 13;
 
         // Encode piece planes for this historical position (12 channels)
         const chess::PieceType piece_types[] = {

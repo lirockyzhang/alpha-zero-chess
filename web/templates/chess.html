@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AlphaZero Chess - Play Against AI</title>
+    <title>AlphaZero Chess</title>
 
     <!-- Chessboard.js CSS -->
     <link rel="stylesheet" href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
@@ -64,7 +64,7 @@
 
         .game-container {
             display: grid;
-            grid-template-columns: 320px 1fr 320px;
+            grid-template-columns: 320px 1fr 340px;
             gap: 30px;
             margin-top: 20px;
         }
@@ -119,12 +119,19 @@
             margin-bottom: 10px;
         }
 
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none !important;
+            box-shadow: none !important;
+        }
+
         .btn-primary {
             background: #3498db;
             color: white;
         }
 
-        .btn-primary:hover {
+        .btn-primary:hover:not(:disabled) {
             background: #2980b9;
             transform: translateY(-2px);
             box-shadow: 0 5px 15px rgba(52, 152, 219, 0.3);
@@ -135,40 +142,8 @@
             color: white;
         }
 
-        .btn-secondary:hover {
+        .btn-secondary:hover:not(:disabled) {
             background: #7f8c8d;
-        }
-
-        .color-selector {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 15px;
-        }
-
-        .color-btn {
-            flex: 1;
-            padding: 10px;
-            border: 2px solid #ddd;
-            background: white;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: all 0.3s;
-        }
-
-        .color-btn.selected {
-            border-color: #3498db;
-            background: #ebf5fb;
-        }
-
-        .btn-selfplay {
-            background: #e67e22;
-            color: white;
-        }
-
-        .btn-selfplay:hover {
-            background: #d35400;
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(230, 126, 34, 0.3);
         }
 
         .btn-stop {
@@ -176,14 +151,8 @@
             color: white;
         }
 
-        .btn-stop:hover {
+        .btn-stop:hover:not(:disabled) {
             background: #c0392b;
-        }
-
-        .selfplay-controls {
-            margin-top: 10px;
-            padding-top: 10px;
-            border-top: 1px solid #ddd;
         }
 
         .speed-slider {
@@ -213,25 +182,10 @@
             max-width: 500px;
         }
 
-        .status.info {
-            background: #d1ecf1;
-            color: #0c5460;
-        }
-
-        .status.success {
-            background: #d4edda;
-            color: #155724;
-        }
-
-        .status.warning {
-            background: #fff3cd;
-            color: #856404;
-        }
-
-        .status.error {
-            background: #f8d7da;
-            color: #721c24;
-        }
+        .status.info { background: #d1ecf1; color: #0c5460; }
+        .status.success { background: #d4edda; color: #155724; }
+        .status.warning { background: #fff3cd; color: #856404; }
+        .status.error { background: #f8d7da; color: #721c24; }
 
         .move-history {
             max-height: 200px;
@@ -242,10 +196,7 @@
             border: 1px solid #ddd;
         }
 
-        .move-history p {
-            margin: 5px 0;
-            color: #34495e;
-        }
+        .move-history p { margin: 5px 0; color: #34495e; }
 
         /* AI Evaluation Display */
         .ai-evaluation {
@@ -265,39 +216,16 @@
             border-radius: 5px;
         }
 
-        .eval-label {
-            font-weight: 600;
-            color: #2c3e50;
-        }
+        .eval-label { font-weight: 600; color: #2c3e50; }
 
-        .eval-score {
-            font-size: 1.2em;
-            font-weight: bold;
-        }
-
-        .eval-score.positive {
-            color: #27ae60;
-        }
-
-        .eval-score.negative {
-            color: #e74c3c;
-        }
-
-        .eval-score.neutral {
-            color: #95a5a6;
-        }
+        .eval-score { font-size: 1.2em; font-weight: bold; }
+        .eval-score.positive { color: #27ae60; }
+        .eval-score.negative { color: #e74c3c; }
+        .eval-score.neutral { color: #95a5a6; }
 
         /* WDL Probability Bar */
-        .wdl-container {
-            margin-bottom: 10px;
-        }
-
-        .wdl-label {
-            font-weight: 600;
-            color: #2c3e50;
-            margin-bottom: 6px;
-            font-size: 0.9em;
-        }
+        .wdl-container { margin-bottom: 10px; }
+        .wdl-label { font-weight: 600; color: #2c3e50; margin-bottom: 6px; font-size: 0.9em; }
 
         .wdl-bar {
             display: flex;
@@ -321,21 +249,11 @@
             overflow: hidden;
         }
 
-        .wdl-win {
-            background: #27ae60;
-        }
+        .wdl-win { background: #27ae60; }
+        .wdl-draw { background: #95a5a6; }
+        .wdl-loss { background: #e74c3c; }
 
-        .wdl-draw {
-            background: #95a5a6;
-        }
-
-        .wdl-loss {
-            background: #e74c3c;
-        }
-
-        .top-moves {
-            margin-top: 10px;
-        }
+        .top-moves { margin-top: 10px; }
 
         .top-move {
             display: flex;
@@ -347,32 +265,22 @@
             font-size: 0.9em;
         }
 
-        .move-san {
-            font-weight: 600;
-            color: #2c3e50;
-        }
-
-        .move-prob {
-            color: #7f8c8d;
-        }
+        .move-san { font-weight: 600; color: #2c3e50; }
+        .move-prob { color: #7f8c8d; }
 
         /* Promotion Dialog */
         .promotion-dialog {
             display: none;
             position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
             background: rgba(0, 0, 0, 0.7);
             z-index: 1000;
             justify-content: center;
             align-items: center;
         }
 
-        .promotion-dialog.active {
-            display: flex;
-        }
+        .promotion-dialog.active { display: flex; }
 
         .promotion-content {
             background: white;
@@ -381,20 +289,12 @@
             text-align: center;
         }
 
-        .promotion-content h2 {
-            margin-bottom: 20px;
-            color: #2c3e50;
-        }
+        .promotion-content h2 { margin-bottom: 20px; color: #2c3e50; }
 
-        .promotion-pieces {
-            display: flex;
-            gap: 15px;
-            justify-content: center;
-        }
+        .promotion-pieces { display: flex; gap: 15px; justify-content: center; }
 
         .promotion-piece {
-            width: 80px;
-            height: 80px;
+            width: 80px; height: 80px;
             border: 2px solid #ddd;
             border-radius: 10px;
             cursor: pointer;
@@ -411,104 +311,114 @@
             transform: scale(1.1);
         }
 
-        /* PGN Controls */
-        .btn-pgn {
-            background: #2ecc71;
-            color: white;
-        }
+        /* PGN Buttons */
+        .btn-pgn { background: #2ecc71; color: white; }
+        .btn-pgn:hover:not(:disabled) { background: #27ae60; transform: translateY(-2px); box-shadow: 0 5px 15px rgba(46, 204, 113, 0.3); }
 
-        .btn-pgn:hover {
-            background: #27ae60;
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(46, 204, 113, 0.3);
-        }
+        .btn-import { background: #9b59b6; color: white; }
+        .btn-import:hover:not(:disabled) { background: #8e44ad; transform: translateY(-2px); box-shadow: 0 5px 15px rgba(155, 89, 182, 0.3); }
 
-        .btn-import {
-            background: #9b59b6;
-            color: white;
-        }
-
-        .btn-import:hover {
-            background: #8e44ad;
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(155, 89, 182, 0.3);
-        }
-
-        .pgn-buttons {
-            display: flex;
-            gap: 10px;
-        }
-
-        .pgn-buttons button {
-            flex: 1;
-        }
+        .pgn-buttons { display: flex; gap: 10px; }
+        .pgn-buttons button { flex: 1; }
 
         /* Replay Mode Controls */
-        .replay-controls {
-            display: none;
-            margin-top: 10px;
-        }
+        .replay-controls { display: none; margin-top: 10px; }
+        .replay-controls.active { display: block; }
 
-        .replay-controls.active {
-            display: block;
-        }
+        .replay-nav { display: flex; gap: 5px; margin-bottom: 10px; }
+        .replay-nav button { flex: 1; padding: 8px; font-size: 1.1em; margin-bottom: 0; }
 
-        .replay-nav {
+        .btn-replay-nav { background: #34495e; color: white; }
+        .btn-replay-nav:hover { background: #2c3e50; }
+        .btn-exit-replay { background: #e74c3c; color: white; }
+        .btn-exit-replay:hover { background: #c0392b; }
+        .replay-info { text-align: center; font-size: 0.9em; color: #7f8c8d; margin-bottom: 8px; }
+        .move-history .replay-active { background: #3498db; color: white; border-radius: 3px; padding: 1px 4px; }
+
+        /* Auto-play button for replay */
+        .btn-autoplay { background: #2ecc71; color: white; }
+        .btn-autoplay:hover { background: #27ae60; }
+        .btn-autoplay.playing { background: #e67e22; }
+        .btn-autoplay.playing:hover { background: #d35400; }
+
+        /* Player selector dropdown */
+        .player-row {
             display: flex;
-            gap: 5px;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+
+        .player-row label {
+            font-weight: 600;
+            color: #2c3e50;
+            min-width: 50px;
+        }
+
+        .player-row select {
+            flex: 1;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 0.95em;
+            background: white;
+        }
+
+        /* Collapsible sub-panels */
+        .sub-panel {
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 12px;
+        }
+
+        .sub-panel h4 {
+            color: #34495e;
+            font-size: 0.95em;
             margin-bottom: 10px;
         }
 
-        .replay-nav button {
-            flex: 1;
-            padding: 8px;
-            font-size: 1.1em;
-            margin-bottom: 0;
-        }
-
-        .btn-replay-nav {
-            background: #34495e;
-            color: white;
-        }
-
-        .btn-replay-nav:hover {
-            background: #2c3e50;
-        }
-
-        .btn-exit-replay {
-            background: #e74c3c;
-            color: white;
-        }
-
-        .btn-exit-replay:hover {
-            background: #c0392b;
-        }
-
-        .replay-info {
-            text-align: center;
+        .sub-panel label {
+            font-weight: 500;
+            color: #34495e;
+            display: block;
+            margin-bottom: 4px;
             font-size: 0.9em;
-            color: #7f8c8d;
+        }
+
+        .sub-panel select,
+        .sub-panel input[type="number"],
+        .sub-panel input[type="text"] {
+            width: 100%;
+            padding: 7px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 0.9em;
             margin-bottom: 8px;
         }
 
-        .move-history .replay-active {
-            background: #3498db;
+        .btn-load-model {
+            background: #8e44ad;
             color: white;
-            border-radius: 3px;
-            padding: 1px 4px;
         }
 
-        /* Model Status */
+        .btn-load-model:hover:not(:disabled) {
+            background: #7d3c98;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(142, 68, 173, 0.3);
+        }
+
         .model-status {
             display: flex;
             align-items: center;
             gap: 8px;
-            margin-bottom: 12px;
+            margin-bottom: 8px;
         }
 
         .model-status-dot {
-            width: 12px;
-            height: 12px;
+            width: 10px;
+            height: 10px;
             border-radius: 50%;
             flex-shrink: 0;
         }
@@ -524,72 +434,54 @@
         }
 
         .model-status-text {
-            font-size: 0.9em;
+            font-size: 0.85em;
             color: #34495e;
         }
 
-        .btn-load-model {
-            background: #8e44ad;
-            color: white;
+        /* In-game controls */
+        .ingame-controls {
+            display: none;
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid #ddd;
         }
 
-        .btn-load-model:hover {
-            background: #7d3c98;
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(142, 68, 173, 0.3);
-        }
+        .ingame-controls.active { display: block; }
 
-        /* Pause/Resume for self-play */
-        .btn-pause {
-            background: #f39c12;
-            color: white;
-        }
-
-        .btn-pause:hover {
-            background: #e67e22;
-        }
-
-        .btn-resume {
-            background: #27ae60;
-            color: white;
-        }
-
-        .btn-resume:hover {
-            background: #219a52;
-        }
-
-        .selfplay-btn-row {
+        .ingame-btn-row {
             display: flex;
             gap: 8px;
         }
 
-        .selfplay-btn-row button {
-            flex: 1;
+        .ingame-btn-row button { flex: 1; }
+
+        .btn-pause { background: #f39c12; color: white; }
+        .btn-pause:hover:not(:disabled) { background: #e67e22; }
+        .btn-resume { background: #27ae60; color: white; }
+        .btn-resume:hover:not(:disabled) { background: #219a52; }
+
+        /* Checkbox row */
+        .checkbox-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
         }
 
-        /* Auto-play button for replay */
-        .btn-autoplay {
-            background: #2ecc71;
-            color: white;
+        .checkbox-row input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
         }
 
-        .btn-autoplay:hover {
-            background: #27ae60;
-        }
-
-        .btn-autoplay.playing {
-            background: #e67e22;
-        }
-
-        .btn-autoplay.playing:hover {
-            background: #d35400;
+        .checkbox-row label {
+            margin-bottom: 0;
+            font-size: 0.9em;
         }
 
         @media (max-width: 1024px) {
             .game-container {
                 grid-template-columns: 320px 1fr;
             }
-
             .controls {
                 grid-column: 1 / -1;
             }
@@ -599,7 +491,6 @@
             .game-container {
                 grid-template-columns: 1fr;
             }
-
             .eval-panel {
                 position: static;
             }
@@ -608,25 +499,35 @@
 </head>
 <body>
     <div class="container">
-        <h1>♟️ AlphaZero Chess</h1>
-        <p class="subtitle">Play against the trained AI model</p>
+        <h1>AlphaZero Chess</h1>
+        <p class="subtitle">Play against AI, watch AI vs AI, or test with Stockfish</p>
 
         <div class="model-info" id="model-info-banner">
-            {% if model_loaded %}
-            <span id="model-info-text">{{ model_name }} -- {{ num_filters }} filters, {{ num_blocks }} blocks</span>
-            {% else %}
-            <span id="model-info-text">No model loaded -- load a checkpoint below to start playing</span>
-            {% endif %}
+            <span id="model-info-text">
+                {% if model_loaded %}
+                    {% if white_model.loaded and black_model.loaded and white_model.name == black_model.name %}
+                        {{ white_model.name }} -- {{ white_model.num_filters }}f/{{ white_model.num_blocks }}b
+                    {% elif white_model.loaded and black_model.loaded %}
+                        W: {{ white_model.name }} ({{ white_model.num_filters }}f/{{ white_model.num_blocks }}b) vs B: {{ black_model.name }} ({{ black_model.num_filters }}f/{{ black_model.num_blocks }}b)
+                    {% elif white_model.loaded %}
+                        White: {{ white_model.name }} ({{ white_model.num_filters }}f/{{ white_model.num_blocks }}b)
+                    {% else %}
+                        Black: {{ black_model.name }} ({{ black_model.num_filters }}f/{{ black_model.num_blocks }}b)
+                    {% endif %}
+                {% else %}
+                    No model loaded -- load a checkpoint to start playing
+                {% endif %}
+            </span>
         </div>
 
         <div class="game-container">
             <!-- Left column: AI Evaluation -->
             <div class="eval-panel">
                 <div class="control-group">
-                    <h3>AI Evaluation</h3>
+                    <h3 id="eval-panel-title">AI Evaluation</h3>
                     <div class="ai-evaluation" id="ai-evaluation">
                         <div class="eval-value">
-                            <span class="eval-label">MCTS Value:</span>
+                            <span class="eval-label" id="eval-value-label">MCTS Value:</span>
                             <span class="eval-score neutral" id="mcts-score">--</span>
                         </div>
                         <div class="wdl-container" id="wdl-container">
@@ -652,7 +553,7 @@
             <!-- Center column: Board + Status + Move History -->
             <div class="board-column">
                 <div id="board"></div>
-                <div id="status" class="status info">Select your color and click "New Game" to start</div>
+                <div id="status" class="status info">Configure players and click "Start Game"</div>
                 <div class="move-history-group">
                     <div class="control-group">
                         <h3>Move History</h3>
@@ -663,45 +564,86 @@
                 </div>
             </div>
 
-            <!-- Right column: Controls -->
+            <!-- Right column: Unified Controls -->
             <div class="controls">
-                <div class="control-group">
-                    <h3>Model</h3>
-                    <div class="model-status" id="model-status">
-                        <div class="model-status-dot {{ 'loaded' if model_loaded else 'not-loaded' }}" id="model-status-dot"></div>
-                        <span class="model-status-text" id="model-status-text">
-                            {% if model_loaded %}Loaded{% else %}Not loaded{% endif %}
-                        </span>
-                    </div>
-                    <div style="margin-bottom: 10px;">
-                        <label for="model-path-input" style="font-weight: 500; color: #34495e; display: block; margin-bottom: 4px;">Checkpoint Path</label>
-                        <input type="text" id="model-path-input" placeholder="/path/to/checkpoint.pt"
-                               style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 6px; font-size: 0.9em;">
-                    </div>
-                    <button class="btn-load-model" onclick="loadModel()">Load Model</button>
-                </div>
-
-                <div class="control-group">
+                <!-- Game Setup Panel -->
+                <div class="control-group" id="setup-panel">
                     <h3>Game Setup</h3>
-                    <div class="color-selector">
-                        <button class="color-btn selected" id="white-btn" onclick="selectColor('white')">
-                            White
-                        </button>
-                        <button class="color-btn" id="black-btn" onclick="selectColor('black')">
-                            Black
-                        </button>
-                    </div>
-                    <button class="btn-primary" id="new-game-btn" onclick="newGame()" {% if not model_loaded %}disabled{% endif %}>New Game</button>
-                    <button class="btn-secondary" onclick="resetBoard()">Reset Board</button>
 
-                    <div class="selfplay-controls">
-                        <button class="btn-selfplay" id="selfplay-btn" onclick="startSelfPlay()" {% if not model_loaded %}disabled{% endif %}>AI vs AI</button>
-                        <div class="selfplay-btn-row" id="selfplay-active-btns" style="display: none;">
-                            <button class="btn-pause" id="pause-btn" onclick="pauseSelfPlay()">Pause</button>
-                            <button class="btn-resume" id="resume-btn" onclick="resumeSelfPlay()" style="display: none;">Resume</button>
-                            <button class="btn-stop" id="stop-btn" onclick="stopSelfPlay()">Stop</button>
+                    <div class="player-row">
+                        <label for="white-player">White:</label>
+                        <select id="white-player" onchange="onPlayerTypeChange()">
+                            <option value="human">Human</option>
+                            <option value="model">AlphaZero Model</option>
+                            <option value="stockfish" id="white-sf-option">Stockfish</option>
+                        </select>
+                    </div>
+
+                    <div class="player-row">
+                        <label for="black-player">Black:</label>
+                        <select id="black-player" onchange="onPlayerTypeChange()">
+                            <option value="human">Human</option>
+                            <option value="model" selected>AlphaZero Model</option>
+                            <option value="stockfish" id="black-sf-option">Stockfish</option>
+                        </select>
+                    </div>
+
+                    <!-- White Checkpoint Picker (shown when white is model) -->
+                    <div class="sub-panel" id="checkpoint-panel-white" style="display:none;">
+                        <h4>White Checkpoint</h4>
+                        <div class="model-status" id="model-status-white">
+                            <div class="model-status-dot {{ 'loaded' if white_model.loaded else 'not-loaded' }}" id="model-status-dot-white"></div>
+                            <span class="model-status-text" id="model-status-text-white">
+                                {% if white_model.loaded %}Loaded: {{ white_model.name }}{% else %}Not loaded{% endif %}
+                            </span>
                         </div>
-                        <div style="margin-top: 8px;">
+                        <select id="checkpoint-select-white">
+                            <option value="">-- Select checkpoint --</option>
+                        </select>
+                        <input type="text" id="model-path-input-white" placeholder="Or enter path manually..."
+                               style="margin-bottom: 8px;">
+                        <button class="btn-load-model" onclick="loadCheckpoint('white')">Load</button>
+                    </div>
+
+                    <!-- Black Checkpoint Picker (shown when black is model) -->
+                    <div class="sub-panel" id="checkpoint-panel-black" style="display:none;">
+                        <h4>Black Checkpoint</h4>
+                        <div class="model-status" id="model-status-black">
+                            <div class="model-status-dot {{ 'loaded' if black_model.loaded else 'not-loaded' }}" id="model-status-dot-black"></div>
+                            <span class="model-status-text" id="model-status-text-black">
+                                {% if black_model.loaded %}Loaded: {{ black_model.name }}{% else %}Not loaded{% endif %}
+                            </span>
+                        </div>
+                        <select id="checkpoint-select-black">
+                            <option value="">-- Select checkpoint --</option>
+                        </select>
+                        <input type="text" id="model-path-input-black" placeholder="Or enter path manually..."
+                               style="margin-bottom: 8px;">
+                        <button class="btn-load-model" onclick="loadCheckpoint('black')">Load</button>
+                    </div>
+
+                    <!-- Stockfish Settings (shown when stockfish selected) -->
+                    <div class="sub-panel" id="stockfish-panel" style="display:none;">
+                        <h4>Stockfish Settings</h4>
+                        <label for="sf-depth">Depth:</label>
+                        <input type="number" id="sf-depth" value="20" min="1" max="30">
+                        <div class="checkbox-row">
+                            <input type="checkbox" id="sf-limit-elo" onchange="document.getElementById('sf-elo').disabled = !this.checked;">
+                            <label for="sf-limit-elo">Limit ELO:</label>
+                        </div>
+                        <input type="number" id="sf-elo" value="1500" min="100" max="3500" disabled>
+                    </div>
+
+                    <button class="btn-primary" id="start-game-btn" onclick="startGame()">Start Game</button>
+
+                    <!-- In-Game Controls (shown during game) -->
+                    <div class="ingame-controls" id="ingame-controls">
+                        <div class="ingame-btn-row">
+                            <button class="btn-pause" id="pause-btn" onclick="pauseGame()">Pause</button>
+                            <button class="btn-resume" id="resume-btn" onclick="resumeGame()" style="display:none;">Resume</button>
+                            <button class="btn-secondary" id="new-setup-btn" onclick="newSetup()">New Setup</button>
+                        </div>
+                        <div id="delay-slider-container" style="margin-top: 8px;">
                             <label for="speed-slider" style="font-weight: 500; color: #34495e; display: block; margin-bottom: 4px;">Move Delay</label>
                             <input type="range" id="speed-slider" class="speed-slider" min="0.1" max="3.0" step="0.1" value="0.8">
                             <div class="speed-label">
@@ -733,6 +675,7 @@
                     </div>
                 </div>
 
+                <!-- MCTS Settings -->
                 <div class="control-group">
                     <h3>MCTS Settings</h3>
                     <div style="margin-bottom: 10px;">
@@ -766,38 +709,51 @@
         <div class="promotion-content">
             <h2>Choose Promotion Piece</h2>
             <div class="promotion-pieces">
-                <div class="promotion-piece" onclick="selectPromotion('q')">♕</div>
-                <div class="promotion-piece" onclick="selectPromotion('r')">♖</div>
-                <div class="promotion-piece" onclick="selectPromotion('b')">♗</div>
-                <div class="promotion-piece" onclick="selectPromotion('n')">♘</div>
+                <div class="promotion-piece" onclick="selectPromotion('q')">&#9813;</div>
+                <div class="promotion-piece" onclick="selectPromotion('r')">&#9814;</div>
+                <div class="promotion-piece" onclick="selectPromotion('b')">&#9815;</div>
+                <div class="promotion-piece" onclick="selectPromotion('n')">&#9816;</div>
             </div>
         </div>
     </div>
 
     <!-- jQuery -->
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-
     <!-- Chess.js -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
-
     <!-- Chessboard.js -->
     <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
 
     <script>
+        // ===================== State =====================
         let board = null;
         let game = new Chess();
-        let humanColor = 'white';
         let sessionId = 'session_' + Date.now();
         let moveHistory = [];
-        let pendingMove = null;  // For pawn promotion
-        let selfPlayActive = false;
-        let selfPlayPaused = false;
-        let selfPlayTimeout = null;
-        let modelLoaded = {{ 'true' if model_loaded else 'false' }};
+        let pendingMove = null;
 
-        // Replay auto-play state
+        // Game config — replaces old humanColor + selfPlayActive
+        let gameConfig = { white: 'human', black: 'model' };
+        let gameActive = false;     // true while a game is in progress
+        let aiTurnActive = false;   // true while AI polling loop is running
+        let gamePaused = false;
+        let aiTimeout = null;
+
+        let modelStatus = {
+            white: { loaded: {{ 'true' if white_model.loaded else 'false' }}, name: '{{ white_model.name }}', filters: {{ white_model.num_filters }}, blocks: {{ white_model.num_blocks }} },
+            black: { loaded: {{ 'true' if black_model.loaded else 'false' }}, name: '{{ black_model.name }}', filters: {{ black_model.num_filters }}, blocks: {{ black_model.num_blocks }} }
+        };
+        let stockfishAvailable = {{ 'true' if stockfish_available else 'false' }};
+
+        // Replay state
+        let replayMode = false;
+        let replayGame = null;
+        let replayMoves = [];
+        let replayIndex = -1;
         let replayAutoPlay = false;
         let replayAutoPlayTimeout = null;
+
+        // ===================== Helpers =====================
 
         function parseUciMove(uci) {
             return {
@@ -807,71 +763,378 @@
             };
         }
 
-        function selectColor(color) {
-            humanColor = color;
-            document.getElementById('white-btn').classList.remove('selected');
-            document.getElementById('black-btn').classList.remove('selected');
-            document.getElementById(color + '-btn').classList.add('selected');
-        }
-
         function updateStatus(message, type = 'info') {
-            const statusEl = document.getElementById('status');
-            statusEl.textContent = message;
-            statusEl.className = 'status ' + type;
+            const el = document.getElementById('status');
+            el.textContent = message;
+            el.className = 'status ' + type;
         }
 
         function updateMoveHistory() {
-            const historyEl = document.getElementById('move-history');
+            const el = document.getElementById('move-history');
             if (moveHistory.length === 0) {
-                historyEl.innerHTML = '<p style="color: #95a5a6;">No moves yet</p>';
+                el.innerHTML = '<p style="color: #95a5a6;">No moves yet</p>';
                 return;
             }
-
             let html = '';
             for (let i = 0; i < moveHistory.length; i += 2) {
-                const moveNum = Math.floor(i / 2) + 1;
-                const whiteMove = moveHistory[i];
-                const blackMove = moveHistory[i + 1] || '';
-                html += `<p>${moveNum}. ${whiteMove} ${blackMove}</p>`;
+                const num = Math.floor(i / 2) + 1;
+                html += `<p>${num}. ${moveHistory[i]} ${moveHistory[i + 1] || ''}</p>`;
             }
-            historyEl.innerHTML = html;
-            historyEl.scrollTop = historyEl.scrollHeight;
+            el.innerHTML = html;
+            el.scrollTop = el.scrollHeight;
         }
 
         function colorEvalScore(el, value) {
             el.textContent = value.toFixed(3);
-            if (value > 0.1) {
-                el.className = 'eval-score positive';
-            } else if (value < -0.1) {
-                el.className = 'eval-score negative';
-            } else {
-                el.className = 'eval-score neutral';
+            el.className = value > 0.1 ? 'eval-score positive' : value < -0.1 ? 'eval-score negative' : 'eval-score neutral';
+        }
+
+        function resetEvalDisplay() {
+            document.getElementById('eval-value-label').textContent = 'MCTS Value:';
+            document.getElementById('mcts-score').textContent = '--';
+            document.getElementById('mcts-score').className = 'eval-score neutral';
+            document.getElementById('wdl-container').style.display = '';
+            document.getElementById('nn-value-fallback').style.display = 'none';
+            ['wdl-win', 'wdl-draw', 'wdl-loss'].forEach(id => {
+                document.getElementById(id).style.width = '33.3%';
+                document.getElementById(id).textContent = '--';
+            });
+            document.getElementById('top-moves').innerHTML = '<p style="color: #95a5a6; font-size: 0.9em;">No evaluation yet</p>';
+        }
+
+        /** Determine which player is to move now */
+        function currentPlayer() {
+            return game.turn() === 'w' ? gameConfig.white : gameConfig.black;
+        }
+
+        /** Check if any side is an AI (model or stockfish) */
+        function hasAI() {
+            return gameConfig.white !== 'human' || gameConfig.black !== 'human';
+        }
+
+        /** Get the human's color, or null if none/both */
+        function humanSide() {
+            const wh = gameConfig.white === 'human';
+            const bh = gameConfig.black === 'human';
+            if (wh && !bh) return 'white';
+            if (bh && !wh) return 'black';
+            return null;  // both or neither
+        }
+
+        // ===================== Setup Panel =====================
+
+        function initSetupPanel() {
+            // Fetch checkpoints and populate both dropdowns
+            fetch('/api/list_checkpoints')
+                .then(r => r.json())
+                .then(data => {
+                    ['white', 'black'].forEach(slot => {
+                        const sel = document.getElementById(`checkpoint-select-${slot}`);
+                        (data.checkpoints || []).forEach(cp => {
+                            const opt = document.createElement('option');
+                            opt.value = cp.path;
+                            opt.textContent = cp.display;
+                            sel.appendChild(opt);
+                        });
+                    });
+                })
+                .catch(() => {});
+
+            // Fetch stockfish status
+            fetch('/api/stockfish_status')
+                .then(r => r.json())
+                .then(data => {
+                    stockfishAvailable = data.available;
+                    if (!data.available) {
+                        document.getElementById('white-sf-option').textContent = 'Stockfish (not installed)';
+                        document.getElementById('white-sf-option').disabled = true;
+                        document.getElementById('black-sf-option').textContent = 'Stockfish (not installed)';
+                        document.getElementById('black-sf-option').disabled = true;
+                    }
+                })
+                .catch(() => {});
+
+            // Fetch per-slot model status
+            fetch('/api/model_status')
+                .then(r => r.json())
+                .then(data => {
+                    updateSlotUI('white', data.white);
+                    updateSlotUI('black', data.black);
+                })
+                .catch(() => {});
+
+            onPlayerTypeChange();
+        }
+
+        function onPlayerTypeChange() {
+            const wp = document.getElementById('white-player').value;
+            const bp = document.getElementById('black-player').value;
+
+            // Show/hide per-side checkpoint panels independently
+            document.getElementById('checkpoint-panel-white').style.display = (wp === 'model') ? '' : 'none';
+            document.getElementById('checkpoint-panel-black').style.display = (bp === 'model') ? '' : 'none';
+
+            // Show/hide stockfish panel
+            const needsSf = (wp === 'stockfish' || bp === 'stockfish');
+            document.getElementById('stockfish-panel').style.display = needsSf ? '' : 'none';
+        }
+
+        // ===================== Start Game =====================
+
+        function startGame() {
+            if (replayMode) exitReplay();
+            if (aiTurnActive) stopAI();
+
+            const wp = document.getElementById('white-player').value;
+            const bp = document.getElementById('black-player').value;
+
+            // Validate per-slot model loading
+            if (wp === 'model' && !modelStatus.white.loaded) {
+                updateStatus('Load a model checkpoint for White first', 'error');
+                return;
+            }
+            if (bp === 'model' && !modelStatus.black.loaded) {
+                updateStatus('Load a model checkpoint for Black first', 'error');
+                return;
+            }
+            if ((wp === 'stockfish' || bp === 'stockfish') && !stockfishAvailable) {
+                updateStatus('Stockfish is not installed', 'error');
+                return;
+            }
+
+            gameConfig = { white: wp, black: bp };
+            updateStatus('Starting game...', 'info');
+
+            // Build request
+            const body = {
+                session_id: sessionId,
+                white_player: wp,
+                black_player: bp,
+            };
+
+            if (wp === 'stockfish' || bp === 'stockfish') {
+                body.stockfish_depth = parseInt(document.getElementById('sf-depth').value) || 20;
+                if (document.getElementById('sf-limit-elo').checked) {
+                    body.stockfish_elo = parseInt(document.getElementById('sf-elo').value) || 1500;
+                }
+            }
+
+            fetch('/api/new_game', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (!data.success) {
+                    updateStatus('Error: ' + data.error, 'error');
+                    return;
+                }
+
+                // Reset frontend
+                game = new Chess();
+                moveHistory = [];
+                updateMoveHistory();
+                resetEvalDisplay();
+
+                // Board orientation
+                const hs = humanSide();
+                board.orientation(hs || 'white');
+                board.position('start');
+
+                gameActive = true;
+                showIngameControls(true);
+
+                // If White was AI, the server already made the first move
+                if (data.ai_move) {
+                    const aiMove = game.move(parseUciMove(data.ai_move));
+                    if (aiMove) {
+                        moveHistory.push(aiMove.san);
+                        updateMoveHistory();
+                    }
+                    game.load(data.fen);
+                    board.position(data.fen);
+                    if (data.evaluation) updateEvaluation(data.evaluation);
+                }
+
+                // Determine what to show
+                const cp = currentPlayer();
+                if (cp === 'human') {
+                    updateStatus('Your turn', 'info');
+                } else {
+                    // It's an AI's turn — start polling loop
+                    startAILoop();
+                }
+            })
+            .catch(err => {
+                updateStatus('Error: ' + err.message, 'error');
+            });
+        }
+
+        function showIngameControls(show) {
+            const el = document.getElementById('ingame-controls');
+            el.classList.toggle('active', show);
+
+            // Show move delay only if any AI plays
+            document.getElementById('delay-slider-container').style.display = hasAI() ? '' : 'none';
+
+            // Reset pause/resume buttons
+            document.getElementById('pause-btn').style.display = '';
+            document.getElementById('resume-btn').style.display = 'none';
+            gamePaused = false;
+        }
+
+        function newSetup() {
+            stopAI();
+            gameActive = false;
+            showIngameControls(false);
+            game = new Chess();
+            board.position('start');
+            moveHistory = [];
+            updateMoveHistory();
+            resetEvalDisplay();
+            updateStatus('Configure players and click "Start Game"', 'info');
+        }
+
+        // ===================== AI Polling Loop =====================
+
+        function startAILoop() {
+            aiTurnActive = true;
+            gamePaused = false;
+            aiStep();
+        }
+
+        function aiStep() {
+            if (!aiTurnActive || gamePaused) return;
+
+            const turn = game.turn() === 'w' ? 'White' : 'Black';
+            const engine = currentPlayer();
+            const label = engine === 'stockfish' ? 'Stockfish' : 'AlphaZero';
+            updateStatus(`${label} (${turn}) is thinking...`, 'info');
+
+            fetch('/api/ai_move', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: sessionId })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (!aiTurnActive) return;
+
+                if (!data.success) {
+                    updateStatus('Error: ' + data.error, 'error');
+                    stopAI();
+                    return;
+                }
+
+                if (data.waiting_for_human) {
+                    // It's a human's turn now
+                    aiTurnActive = false;
+                    updateStatus('Your turn', 'info');
+                    return;
+                }
+
+                // Apply AI move
+                if (data.ai_move) {
+                    const move = game.move(parseUciMove(data.ai_move));
+                    if (move) {
+                        moveHistory.push(move.san);
+                        updateMoveHistory();
+                    }
+                }
+
+                game.load(data.fen);
+                board.position(data.fen, true);
+
+                if (data.evaluation) updateEvaluation(data.evaluation);
+
+                // Game over?
+                if (data.game_over) {
+                    const result = data.result;
+                    let msg = 'Game Over! ';
+                    if (result.winner === 'white') msg += 'White wins';
+                    else if (result.winner === 'black') msg += 'Black wins';
+                    else msg += 'Draw';
+                    msg += ' (' + result.reason + ')';
+                    updateStatus(msg, 'success');
+                    stopAI();
+                    return;
+                }
+
+                if (gamePaused) {
+                    updateStatus('Game paused', 'warning');
+                    return;
+                }
+
+                // If next player is also AI, schedule next step
+                const nextPlayer = currentPlayer();
+                if (nextPlayer !== 'human') {
+                    const delay = parseFloat(document.getElementById('speed-slider').value) * 1000;
+                    aiTimeout = setTimeout(aiStep, delay);
+                } else {
+                    // Hand control back to human
+                    aiTurnActive = false;
+                    updateStatus('Your turn', 'info');
+                }
+            })
+            .catch(err => {
+                if (aiTurnActive) {
+                    updateStatus('Error: ' + err.message, 'error');
+                    stopAI();
+                }
+            });
+        }
+
+        function stopAI() {
+            aiTurnActive = false;
+            gamePaused = false;
+            if (aiTimeout) {
+                clearTimeout(aiTimeout);
+                aiTimeout = null;
             }
         }
 
-        function resetWdlDisplay() {
-            document.getElementById('wdl-container').style.display = '';
-            document.getElementById('nn-value-fallback').style.display = 'none';
-            document.getElementById('wdl-win').style.width = '33.3%';
-            document.getElementById('wdl-win').textContent = '--';
-            document.getElementById('wdl-draw').style.width = '33.3%';
-            document.getElementById('wdl-draw').textContent = '--';
-            document.getElementById('wdl-loss').style.width = '33.3%';
-            document.getElementById('wdl-loss').textContent = '--';
+        function pauseGame() {
+            gamePaused = true;
+            if (aiTimeout) {
+                clearTimeout(aiTimeout);
+                aiTimeout = null;
+            }
+            document.getElementById('pause-btn').style.display = 'none';
+            document.getElementById('resume-btn').style.display = '';
+            updateStatus('Game paused', 'warning');
         }
+
+        function resumeGame() {
+            gamePaused = false;
+            document.getElementById('pause-btn').style.display = '';
+            document.getElementById('resume-btn').style.display = 'none';
+
+            // If it's an AI's turn, resume the polling loop
+            if (currentPlayer() !== 'human') {
+                aiTurnActive = true;
+                aiStep();
+            } else {
+                updateStatus('Your turn', 'info');
+            }
+        }
+
+        // ===================== Evaluation Display =====================
 
         function updateEvaluation(evaluation) {
             if (!evaluation) return;
 
-            // Update MCTS value
+            // Adapt labels for Stockfish vs Model
+            const isStockfish = evaluation.engine === 'stockfish';
+            document.getElementById('eval-value-label').textContent = isStockfish ? 'SF Eval:' : 'MCTS Value:';
+
             colorEvalScore(document.getElementById('mcts-score'), evaluation.mcts_value);
 
-            // Update WDL bar or fall back to NN scalar
+            // WDL bar
             if (evaluation.wdl) {
                 const [win, draw, loss] = evaluation.wdl;
                 document.getElementById('wdl-container').style.display = '';
                 document.getElementById('nn-value-fallback').style.display = 'none';
-
                 document.getElementById('wdl-win').style.width = (win * 100) + '%';
                 document.getElementById('wdl-win').textContent = (win * 100).toFixed(1) + '%';
                 document.getElementById('wdl-draw').style.width = (draw * 100) + '%';
@@ -879,91 +1142,77 @@
                 document.getElementById('wdl-loss').style.width = (loss * 100) + '%';
                 document.getElementById('wdl-loss').textContent = (loss * 100).toFixed(1) + '%';
             } else {
-                // Legacy scalar model: show NN value instead
                 document.getElementById('wdl-container').style.display = 'none';
                 document.getElementById('nn-value-fallback').style.display = '';
                 colorEvalScore(document.getElementById('nn-score'), evaluation.nn_value);
             }
 
-            // Update top moves
-            const topMovesEl = document.getElementById('top-moves');
+            // Top moves
+            const topEl = document.getElementById('top-moves');
             if (evaluation.top_moves && evaluation.top_moves.length > 0) {
-                let html = '<div style="font-size: 0.85em; color: #7f8c8d; margin-bottom: 5px;">Top Moves:</div>';
-                evaluation.top_moves.forEach((move, idx) => {
-                    const prob = (move.probability * 100).toFixed(1);
+                const label = isStockfish ? 'Top Moves (cp):' : 'Top Moves:';
+                let html = `<div style="font-size: 0.85em; color: #7f8c8d; margin-bottom: 5px;">${label}</div>`;
+                evaluation.top_moves.forEach((m, idx) => {
+                    let metric;
+                    if (isStockfish) {
+                        // Show centipawns
+                        const cp = m.cp !== undefined ? m.cp : m.probability;
+                        metric = (cp > 0 ? '+' : '') + Math.round(cp) + ' cp';
+                    } else {
+                        metric = (m.probability * 100).toFixed(1) + '%';
+                    }
                     html += `<div class="top-move">
-                        <span class="move-san">${idx + 1}. ${move.move_san}</span>
-                        <span class="move-prob">${prob}%</span>
+                        <span class="move-san">${idx + 1}. ${m.move_san}</span>
+                        <span class="move-prob">${metric}</span>
                     </div>`;
                 });
-                topMovesEl.innerHTML = html;
+                topEl.innerHTML = html;
             } else {
-                topMovesEl.innerHTML = '<p style="color: #95a5a6; font-size: 0.9em;">No moves available</p>';
+                topEl.innerHTML = '<p style="color: #95a5a6; font-size: 0.9em;">No moves available</p>';
             }
         }
 
+        // ===================== Board Interaction =====================
+
         function onDragStart(source, piece, position, orientation) {
-            // Don't allow moves during replay mode
             if (replayMode) return false;
-
-            // Don't allow moves during self-play
-            if (selfPlayActive) return false;
-
-            // Don't allow moves if game is over
             if (game.game_over()) return false;
+            if (!gameActive) return false;
 
-            // Only allow human to move their pieces
-            if ((humanColor === 'white' && piece.search(/^b/) !== -1) ||
-                (humanColor === 'black' && piece.search(/^w/) !== -1)) {
-                return false;
-            }
+            // Check if current turn belongs to a human player
+            const isWhiteTurn = game.turn() === 'w';
+            const player = isWhiteTurn ? gameConfig.white : gameConfig.black;
+            if (player !== 'human') return false;
 
-            // Don't allow moves when it's not human's turn
-            if ((humanColor === 'white' && game.turn() === 'b') ||
-                (humanColor === 'black' && game.turn() === 'w')) {
-                return false;
-            }
+            // Only let human drag their own color
+            if (isWhiteTurn && piece.search(/^b/) !== -1) return false;
+            if (!isWhiteTurn && piece.search(/^w/) !== -1) return false;
         }
 
         function onDrop(source, target) {
-            // Check if this is a pawn promotion
             const piece = game.get(source);
             const isPromotion = piece && piece.type === 'p' &&
                 ((piece.color === 'w' && target[1] === '8') ||
                  (piece.color === 'b' && target[1] === '1'));
 
             if (isPromotion) {
-                // Store the move and show promotion dialog
-                // Return 'snapback' to keep board in sync with game state until promotion is complete
                 pendingMove = { from: source, to: target };
                 document.getElementById('promotion-dialog').classList.add('active');
                 return 'snapback';
             }
 
-            // Try to make the move (non-promotion)
-            const move = game.move({
-                from: source,
-                to: target
-            });
-
-            // Illegal move
+            const move = game.move({ from: source, to: target });
             if (move === null) return 'snapback';
 
-            // Add to move history
             moveHistory.push(move.san);
             updateMoveHistory();
-
-            // Make API call to get model's response
             makeMove(move.from + move.to);
         }
 
         function selectPromotion(piece) {
-            // Hide dialog
             document.getElementById('promotion-dialog').classList.remove('active');
-
             if (!pendingMove) return;
 
-            // Make the promotion move
             const move = game.move({
                 from: pendingMove.from,
                 to: pendingMove.to,
@@ -976,16 +1225,10 @@
                 return;
             }
 
-            // Update board
             board.position(game.fen());
-
-            // Add to move history
             moveHistory.push(move.san);
             updateMoveHistory();
-
-            // Make API call with promotion
             makeMove(move.from + move.to + piece);
-
             pendingMove = null;
         }
 
@@ -994,146 +1237,143 @@
         }
 
         function makeMove(moveUci) {
-            updateStatus('AI is thinking...', 'info');
+            const opponent = currentPlayer();  // after our local move, game.turn() flipped
+            const isOpponentAI = (opponent !== 'human');
+
+            if (isOpponentAI) {
+                updateStatus('AI is thinking...', 'info');
+            }
 
             fetch('/api/make_move', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    session_id: sessionId,
-                    move: moveUci
-                })
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: sessionId, move: moveUci })
             })
-            .then(response => response.json())
+            .then(r => r.json())
             .then(data => {
                 if (!data.success) {
                     updateStatus('Error: ' + data.error, 'error');
-                    // Undo the move we made on the frontend
                     game.undo();
                     moveHistory.pop();
                     updateMoveHistory();
-                    // Revert the board to the correct position
                     board.position(game.fen());
                     return;
                 }
 
-                // Add AI's move to history BEFORE loading new FEN
-                // (game.load() clears move history, so we must do this first)
-                if (data.model_move) {
-                    // Make AI's move on current game state to get SAN notation
-                    const aiMove = game.move(parseUciMove(data.model_move));
+                // If AI auto-responded
+                if (data.ai_move) {
+                    const aiMove = game.move(parseUciMove(data.ai_move));
                     if (aiMove) {
                         moveHistory.push(aiMove.san);
                         updateMoveHistory();
                     }
                 }
 
-                // Now sync with server's authoritative state
                 game.load(data.fen);
                 board.position(data.fen);
 
-                // Update AI evaluation
-                if (data.evaluation) {
-                    updateEvaluation(data.evaluation);
-                }
+                if (data.evaluation) updateEvaluation(data.evaluation);
 
-                // Check if game is over
                 if (data.game_over) {
                     const result = data.result;
-                    let message = 'Game Over! ';
-                    if (result.winner === humanColor) {
-                        message += 'You won! 🎉';
-                    } else if (result.winner === null) {
-                        message += 'Draw';
-                    } else {
-                        message += 'AI won!';
-                    }
-                    message += ' (' + result.reason + ')';
-                    updateStatus(message, result.winner === humanColor ? 'success' : 'warning');
+                    const hs = humanSide();
+                    let msg = 'Game Over! ';
+                    if (result.winner === hs) msg += 'You won!';
+                    else if (result.winner === null) msg += 'Draw';
+                    else if (hs) msg += 'AI won!';
+                    else msg += (result.winner === 'white' ? 'White' : 'Black') + ' wins';
+                    msg += ' (' + result.reason + ')';
+                    updateStatus(msg, result.winner === hs ? 'success' : 'warning');
                 } else {
-                    updateStatus('Your turn', 'info');
+                    // Check if next turn is AI → start polling
+                    const nextPlayer = currentPlayer();
+                    if (nextPlayer !== 'human') {
+                        startAILoop();
+                    } else {
+                        updateStatus('Your turn', 'info');
+                    }
                 }
             })
-            .catch(error => {
-                updateStatus('Error: ' + error.message, 'error');
-                console.error('Error:', error);
-                // Undo the move we made on the frontend
+            .catch(err => {
+                updateStatus('Error: ' + err.message, 'error');
                 game.undo();
                 moveHistory.pop();
                 updateMoveHistory();
-                // Revert the board
                 board.position(game.fen());
             });
         }
 
-        function newGame() {
-            if (replayMode) exitReplay();
-            if (selfPlayActive) stopSelfPlay();
-            updateStatus('Starting new game...', 'info');
+        // ===================== Model Loading =====================
 
-            fetch('/api/new_game', {
+        /** Update UI for a single model slot (white or black). */
+        function updateSlotUI(slot, info) {
+            modelStatus[slot] = info;
+            const dot = document.getElementById(`model-status-dot-${slot}`);
+            const text = document.getElementById(`model-status-text-${slot}`);
+
+            if (info.loaded) {
+                dot.className = 'model-status-dot loaded';
+                text.textContent = `Loaded: ${info.name} (${info.num_filters}f/${info.num_blocks}b)`;
+            } else {
+                dot.className = 'model-status-dot not-loaded';
+                text.textContent = 'Not loaded';
+            }
+            updateBanner();
+        }
+
+        /** Update the top banner to reflect current model state. */
+        function updateBanner() {
+            const banner = document.getElementById('model-info-text');
+            const w = modelStatus.white;
+            const b = modelStatus.black;
+            if (w.loaded && b.loaded && w.name === b.name) {
+                banner.textContent = `${w.name} -- ${w.num_filters}f/${w.num_blocks}b`;
+            } else if (w.loaded && b.loaded) {
+                banner.textContent = `W: ${w.name} (${w.num_filters}f/${w.num_blocks}b) vs B: ${b.name} (${b.num_filters}f/${b.num_blocks}b)`;
+            } else if (w.loaded) {
+                banner.textContent = `White: ${w.name} (${w.num_filters}f/${w.num_blocks}b)`;
+            } else if (b.loaded) {
+                banner.textContent = `Black: ${b.name} (${b.num_filters}f/${b.num_blocks}b)`;
+            } else {
+                banner.textContent = 'No model loaded -- load a checkpoint to start playing';
+            }
+        }
+
+        /** Load checkpoint for a specific slot ("white" or "black"). */
+        function loadCheckpoint(slot) {
+            const dropdown = document.getElementById(`checkpoint-select-${slot}`).value;
+            const manual = document.getElementById(`model-path-input-${slot}`).value.trim();
+            const path = manual || dropdown;
+
+            if (!path) {
+                updateStatus(`Select a checkpoint or enter a path for ${slot}`, 'error');
+                return;
+            }
+
+            updateStatus(`Loading ${slot} model...`, 'info');
+            document.getElementById(`model-status-text-${slot}`).textContent = 'Loading...';
+
+            fetch('/api/load_model', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    session_id: sessionId,
-                    color: humanColor
-                })
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ checkpoint_path: path, slot: slot })
             })
-            .then(response => response.json())
+            .then(r => r.json())
             .then(data => {
-                if (!data.success) {
-                    updateStatus('Error: ' + data.error, 'error');
-                    return;
-                }
-
-                // Reset game
-                game = new Chess();
-                moveHistory = [];
-                updateMoveHistory();
-
-                // Clear evaluation
-                document.getElementById('mcts-score').textContent = '--';
-                document.getElementById('mcts-score').className = 'eval-score neutral';
-                resetWdlDisplay();
-                document.getElementById('top-moves').innerHTML = '<p style="color: #95a5a6; font-size: 0.9em;">No evaluation yet</p>';
-
-                // Update board orientation
-                board.orientation(humanColor);
-                board.position('start');
-
-                // If human plays black, AI makes first move
-                if (humanColor === 'black' && data.model_move) {
-                    // Make AI's move on fresh game to get SAN notation
-                    // (game.load() clears history, so we must do this first)
-                    const aiMove = game.move(parseUciMove(data.model_move));
-                    if (aiMove) {
-                        moveHistory.push(aiMove.san);
-                        updateMoveHistory();
-                    }
-
-                    // Sync with server's authoritative state
-                    game.load(data.fen);
-                    board.position(data.fen);
-
-                    // Update evaluation
-                    if (data.evaluation) {
-                        updateEvaluation(data.evaluation);
-                    }
-
-                    updateStatus('Your turn', 'info');
+                if (data.success) {
+                    updateSlotUI('white', data.white);
+                    updateSlotUI('black', data.black);
+                    updateStatus(`${slot.charAt(0).toUpperCase() + slot.slice(1)} model loaded: ${data.model_name}`, 'success');
                 } else {
-                    updateStatus('Your turn - White to move', 'info');
+                    updateStatus('Failed: ' + data.error, 'error');
                 }
             })
-            .catch(error => {
-                updateStatus('Error: ' + error.message, 'error');
-                console.error('Error:', error);
+            .catch(err => {
+                updateStatus('Error: ' + err.message, 'error');
             });
         }
+
+        // ===================== Settings =====================
 
         function updateSettings() {
             const simulations = parseInt(document.getElementById('sim-input').value);
@@ -1144,45 +1384,23 @@
             fetch('/api/update_settings', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    num_simulations: simulations,
-                    c_puct: cpuct,
-                    risk_beta: riskBeta
-                })
+                body: JSON.stringify({ num_simulations: simulations, c_puct: cpuct, risk_beta: riskBeta })
             })
-            .then(response => response.json())
+            .then(r => r.json())
             .then(data => {
                 if (data.success) {
                     statusEl.textContent = `Updated: ${data.num_simulations} sims, c_puct=${data.c_puct}, beta=${data.risk_beta}`;
                     statusEl.style.color = '#27ae60';
                 } else {
-                    statusEl.textContent = 'Failed to update settings';
+                    statusEl.textContent = 'Failed to update';
                     statusEl.style.color = '#e74c3c';
                 }
                 setTimeout(() => { statusEl.textContent = ''; }, 3000);
             })
-            .catch(error => {
-                statusEl.textContent = 'Error: ' + error.message;
+            .catch(err => {
+                statusEl.textContent = 'Error: ' + err.message;
                 statusEl.style.color = '#e74c3c';
             });
-        }
-
-        function resetBoard() {
-            if (replayMode) exitReplay();
-            if (selfPlayActive) stopSelfPlay();
-            game = new Chess();
-            board.position('start');
-            moveHistory = [];
-            updateMoveHistory();
-
-            // Clear evaluation
-            document.getElementById('mcts-score').textContent = '--';
-            document.getElementById('mcts-score').className = 'eval-score neutral';
-            document.getElementById('nn-score').textContent = '--';
-            document.getElementById('nn-score').className = 'eval-score neutral';
-            document.getElementById('top-moves').innerHTML = '<p style="color: #95a5a6; font-size: 0.9em;">No evaluation yet</p>';
-
-            updateStatus('Board reset. Click "New Game" to start playing', 'info');
         }
 
         // Speed slider live update
@@ -1190,186 +1408,14 @@
             document.getElementById('speed-value').textContent = this.value + 's';
         });
 
-        // ===================== Self-Play Mode =====================
-
-        function setSelfPlayButtonState(state) {
-            // state: 'idle' | 'playing' | 'paused'
-            const selfplayBtn = document.getElementById('selfplay-btn');
-            const activeBtns = document.getElementById('selfplay-active-btns');
-            const pauseBtn = document.getElementById('pause-btn');
-            const resumeBtn = document.getElementById('resume-btn');
-
-            if (state === 'idle') {
-                selfplayBtn.style.display = '';
-                activeBtns.style.display = 'none';
-            } else if (state === 'playing') {
-                selfplayBtn.style.display = 'none';
-                activeBtns.style.display = '';
-                pauseBtn.style.display = '';
-                resumeBtn.style.display = 'none';
-            } else if (state === 'paused') {
-                selfplayBtn.style.display = 'none';
-                activeBtns.style.display = '';
-                pauseBtn.style.display = 'none';
-                resumeBtn.style.display = '';
-            }
-        }
-
-        function startSelfPlay() {
-            // Start a new game for self-play
-            selfPlayActive = true;
-            selfPlayPaused = false;
-            setSelfPlayButtonState('playing');
-            updateStatus('Starting AI vs AI...', 'info');
-
-            fetch('/api/new_game', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    session_id: sessionId,
-                    color: 'white'  // doesn't matter for self-play; just creates a game
-                })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (!data.success) {
-                    updateStatus('Error: ' + data.error, 'error');
-                    stopSelfPlay();
-                    return;
-                }
-
-                // Reset frontend state
-                game = new Chess();
-                moveHistory = [];
-                updateMoveHistory();
-                board.orientation('white');
-                board.position('start');
-
-                // Clear evaluation
-                document.getElementById('mcts-score').textContent = '--';
-                document.getElementById('mcts-score').className = 'eval-score neutral';
-                resetWdlDisplay();
-                document.getElementById('top-moves').innerHTML = '<p style="color: #95a5a6; font-size: 0.9em;">AI vs AI starting...</p>';
-
-                // Start the self-play loop
-                selfPlayStep();
-            })
-            .catch(error => {
-                updateStatus('Error: ' + error.message, 'error');
-                stopSelfPlay();
-            });
-        }
-
-        function pauseSelfPlay() {
-            selfPlayPaused = true;
-            if (selfPlayTimeout) {
-                clearTimeout(selfPlayTimeout);
-                selfPlayTimeout = null;
-            }
-            setSelfPlayButtonState('paused');
-            updateStatus('AI vs AI -- Paused', 'warning');
-        }
-
-        function resumeSelfPlay() {
-            selfPlayPaused = false;
-            setSelfPlayButtonState('playing');
-            selfPlayStep();
-        }
-
-        function stopSelfPlay() {
-            selfPlayActive = false;
-            selfPlayPaused = false;
-            if (selfPlayTimeout) {
-                clearTimeout(selfPlayTimeout);
-                selfPlayTimeout = null;
-            }
-            setSelfPlayButtonState('idle');
-            updateStatus('Self-play stopped', 'info');
-        }
-
-        function selfPlayStep() {
-            if (!selfPlayActive || selfPlayPaused) return;
-
-            const turn = game.turn() === 'w' ? 'White' : 'Black';
-            updateStatus(`AI vs AI -- ${turn} is thinking...`, 'info');
-
-            fetch('/api/self_play_move', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ session_id: sessionId })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (!selfPlayActive) return;
-
-                if (!data.success) {
-                    updateStatus('Error: ' + data.error, 'error');
-                    stopSelfPlay();
-                    return;
-                }
-
-                // Always apply the move (server already made it — keep frontend in sync)
-                if (data.model_move) {
-                    const move = game.move(parseUciMove(data.model_move));
-                    if (move) {
-                        moveHistory.push(move.san);
-                        updateMoveHistory();
-                    }
-                }
-
-                // Sync board with server state
-                game.load(data.fen);
-                board.position(data.fen, true);  // animate: true
-
-                // Update evaluation
-                if (data.evaluation) {
-                    updateEvaluation(data.evaluation);
-                }
-
-                // Check game over
-                if (data.game_over) {
-                    const result = data.result;
-                    let message = 'AI vs AI -- Game Over! ';
-                    if (result.winner === 'white') {
-                        message += 'White wins';
-                    } else if (result.winner === 'black') {
-                        message += 'Black wins';
-                    } else {
-                        message += 'Draw';
-                    }
-                    message += ' (' + result.reason + ')';
-                    updateStatus(message, 'success');
-                    stopSelfPlay();
-                    return;
-                }
-
-                // Don't schedule next move if paused while fetch was in-flight
-                if (selfPlayPaused) {
-                    updateStatus('AI vs AI -- Paused', 'warning');
-                    return;
-                }
-
-                // Schedule next move after delay
-                const delay = parseFloat(document.getElementById('speed-slider').value) * 1000;
-                selfPlayTimeout = setTimeout(selfPlayStep, delay);
-            })
-            .catch(error => {
-                if (selfPlayActive) {
-                    updateStatus('Error: ' + error.message, 'error');
-                    stopSelfPlay();
-                }
-            });
-        }
-
         // ===================== PGN Export =====================
 
         function exportPGN() {
             if (replayMode) {
-                // Export the replay game instead
                 if (replayGame) {
                     const pgn = replayGame.pgn();
-                    const timestamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
-                    downloadPGN(pgn, `replay_game_${timestamp}.pgn`);
+                    const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
+                    downloadPGN(pgn, `replay_game_${ts}.pgn`);
                 }
                 return;
             }
@@ -1377,12 +1423,9 @@
             fetch('/api/export_pgn', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    session_id: sessionId,
-                    humanColor: humanColor
-                })
+                body: JSON.stringify({ session_id: sessionId })
             })
-            .then(response => response.json())
+            .then(r => r.json())
             .then(data => {
                 if (!data.success) {
                     updateStatus('Export failed: ' + data.error, 'error');
@@ -1391,9 +1434,7 @@
                 downloadPGN(data.pgn, data.filename);
                 updateStatus('PGN exported!', 'success');
             })
-            .catch(error => {
-                updateStatus('Export error: ' + error.message, 'error');
-            });
+            .catch(err => updateStatus('Export error: ' + err.message, 'error'));
         }
 
         function downloadPGN(content, filename) {
@@ -1410,62 +1451,36 @@
 
         // ===================== PGN Import & Replay Mode =====================
 
-        let replayMode = false;
-        let replayGame = null;       // Chess.js game with all moves loaded
-        let replayMoves = [];        // Array of {from, to, san, ...} verbose move objects
-        let replayIndex = -1;        // Current position (-1 = start, 0 = after first move)
-
         function importPGN(event) {
             const file = event.target.files[0];
             if (!file) return;
-
             const reader = new FileReader();
-            reader.onload = function(e) {
-                const pgnText = e.target.result;
-                loadPGNForReplay(pgnText);
-            };
+            reader.onload = function(e) { loadPGNForReplay(e.target.result); };
             reader.readAsText(file);
-
-            // Reset file input so same file can be re-imported
             event.target.value = '';
         }
 
         function loadPGNForReplay(pgnText) {
-            // Stop any active self-play
-            if (selfPlayActive) stopSelfPlay();
+            if (aiTurnActive) stopAI();
 
-            // Parse PGN using chess.js
             const tempGame = new Chess();
             const loaded = tempGame.load_pgn(pgnText);
+            if (!loaded) { updateStatus('Failed to parse PGN file', 'error'); return; }
 
-            if (!loaded) {
-                updateStatus('Failed to parse PGN file', 'error');
-                return;
-            }
-
-            // Extract all moves (verbose) by replaying
             const moves = tempGame.history({ verbose: true });
+            if (moves.length === 0) { updateStatus('PGN contains no moves', 'error'); return; }
 
-            if (moves.length === 0) {
-                updateStatus('PGN contains no moves', 'error');
-                return;
-            }
-
-            // Enter replay mode
             replayMode = true;
             replayGame = tempGame;
             replayMoves = moves;
             replayIndex = -1;
 
-            // Show replay controls
             document.getElementById('replay-controls').classList.add('active');
 
-            // Reset board to starting position
             game = new Chess();
             board.orientation('white');
             board.position('start');
 
-            // Update move history display
             updateReplayMoveHistory();
             updateReplayInfo();
             updateStatus('Replay mode: Use navigation buttons to step through moves', 'info');
@@ -1473,86 +1488,53 @@
 
         function replayStep(direction, fromAutoPlay) {
             if (!replayMode) return;
-
-            // Manual navigation stops auto-play
-            if (!fromAutoPlay && replayAutoPlay) {
-                stopReplayAutoPlay();
-            }
+            if (!fromAutoPlay && replayAutoPlay) stopReplayAutoPlay();
 
             switch (direction) {
-                case 'first':
-                    replayIndex = -1;
-                    break;
-                case 'prev':
-                    if (replayIndex >= 0) replayIndex--;
-                    break;
-                case 'next':
-                    if (replayIndex < replayMoves.length - 1) replayIndex++;
-                    break;
-                case 'last':
-                    replayIndex = replayMoves.length - 1;
-                    break;
+                case 'first': replayIndex = -1; break;
+                case 'prev': if (replayIndex >= 0) replayIndex--; break;
+                case 'next': if (replayIndex < replayMoves.length - 1) replayIndex++; break;
+                case 'last': replayIndex = replayMoves.length - 1; break;
             }
 
-            // Rebuild position up to replayIndex
             game = new Chess();
-            for (let i = 0; i <= replayIndex; i++) {
-                game.move(replayMoves[i].san);
-            }
-
-            board.position(game.fen(), true);  // animate
+            for (let i = 0; i <= replayIndex; i++) game.move(replayMoves[i].san);
+            board.position(game.fen(), true);
             updateReplayMoveHistory();
             updateReplayInfo();
         }
 
         function updateReplayInfo() {
-            const infoEl = document.getElementById('replay-info');
-            const total = replayMoves.length;
-            if (replayIndex < 0) {
-                infoEl.textContent = `Start position (${total} moves)`;
-            } else {
-                infoEl.textContent = `Move ${replayIndex + 1} / ${total}`;
-            }
+            const el = document.getElementById('replay-info');
+            if (replayIndex < 0) el.textContent = `Start position (${replayMoves.length} moves)`;
+            else el.textContent = `Move ${replayIndex + 1} / ${replayMoves.length}`;
         }
 
         function updateReplayMoveHistory() {
-            const historyEl = document.getElementById('move-history');
-
-            if (replayMoves.length === 0) {
-                historyEl.innerHTML = '<p style="color: #95a5a6;">No moves</p>';
-                return;
-            }
+            const el = document.getElementById('move-history');
+            if (replayMoves.length === 0) { el.innerHTML = '<p style="color: #95a5a6;">No moves</p>'; return; }
 
             let html = '';
             for (let i = 0; i < replayMoves.length; i += 2) {
-                const moveNum = Math.floor(i / 2) + 1;
-                const whiteMove = replayMoves[i].san;
-                const blackMove = (i + 1 < replayMoves.length) ? replayMoves[i + 1].san : '';
-
-                const whiteClass = (i === replayIndex) ? ' class="replay-active"' : '';
-                const blackClass = (i + 1 === replayIndex) ? ' class="replay-active"' : '';
-
-                html += `<p>${moveNum}. <span${whiteClass} onclick="jumpToMove(${i})" style="cursor:pointer">${whiteMove}</span>`;
-                if (blackMove) {
-                    html += ` <span${blackClass} onclick="jumpToMove(${i + 1})" style="cursor:pointer">${blackMove}</span>`;
+                const num = Math.floor(i / 2) + 1;
+                const wc = (i === replayIndex) ? ' class="replay-active"' : '';
+                const bc = (i + 1 === replayIndex) ? ' class="replay-active"' : '';
+                html += `<p>${num}. <span${wc} onclick="jumpToMove(${i})" style="cursor:pointer">${replayMoves[i].san}</span>`;
+                if (i + 1 < replayMoves.length) {
+                    html += ` <span${bc} onclick="jumpToMove(${i + 1})" style="cursor:pointer">${replayMoves[i + 1].san}</span>`;
                 }
                 html += '</p>';
             }
-            historyEl.innerHTML = html;
-            historyEl.scrollTop = historyEl.scrollHeight;
+            el.innerHTML = html;
+            el.scrollTop = el.scrollHeight;
         }
 
         function jumpToMove(index) {
             if (!replayMode) return;
             if (replayAutoPlay) stopReplayAutoPlay();
             replayIndex = index;
-
-            // Rebuild position
             game = new Chess();
-            for (let i = 0; i <= replayIndex; i++) {
-                game.move(replayMoves[i].san);
-            }
-
+            for (let i = 0; i <= replayIndex; i++) game.move(replayMoves[i].san);
             board.position(game.fen(), true);
             updateReplayMoveHistory();
             updateReplayInfo();
@@ -1564,83 +1546,19 @@
             replayGame = null;
             replayMoves = [];
             replayIndex = -1;
-
-            // Hide replay controls
             document.getElementById('replay-controls').classList.remove('active');
-
-            // Reset to empty board
             game = new Chess();
             board.position('start');
             moveHistory = [];
             updateMoveHistory();
-
-            updateStatus('Replay ended. Click "New Game" to play', 'info');
-        }
-
-        // ===================== Model Loader =====================
-
-        function updateModelUI(loaded, name, filters, blocks) {
-            modelLoaded = loaded;
-            const dot = document.getElementById('model-status-dot');
-            const text = document.getElementById('model-status-text');
-            const banner = document.getElementById('model-info-text');
-            const newGameBtn = document.getElementById('new-game-btn');
-            const selfplayBtn = document.getElementById('selfplay-btn');
-
-            if (loaded) {
-                dot.className = 'model-status-dot loaded';
-                text.textContent = 'Loaded';
-                banner.textContent = `${name} -- ${filters} filters, ${blocks} blocks`;
-                newGameBtn.disabled = false;
-                selfplayBtn.disabled = false;
-            } else {
-                dot.className = 'model-status-dot not-loaded';
-                text.textContent = 'Not loaded';
-                banner.textContent = 'No model loaded -- load a checkpoint below to start playing';
-                newGameBtn.disabled = true;
-                selfplayBtn.disabled = true;
-            }
-        }
-
-        function loadModel() {
-            const path = document.getElementById('model-path-input').value.trim();
-            if (!path) {
-                updateStatus('Please enter a checkpoint path', 'error');
-                return;
-            }
-
-            updateStatus('Loading model...', 'info');
-            document.getElementById('model-status-text').textContent = 'Loading...';
-
-            fetch('/api/load_model', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ checkpoint_path: path })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    updateModelUI(true, data.model_name, data.num_filters, data.num_blocks);
-                    updateStatus(`Model loaded: ${data.model_name}`, 'success');
-                } else {
-                    updateModelUI(false, '', 0, 0);
-                    updateStatus('Failed to load model: ' + data.error, 'error');
-                }
-            })
-            .catch(error => {
-                updateModelUI(false, '', 0, 0);
-                updateStatus('Error loading model: ' + error.message, 'error');
-            });
+            updateStatus('Replay ended. Set up a new game.', 'info');
         }
 
         // ===================== Replay Auto-Play =====================
 
         function toggleReplayAutoPlay() {
-            if (replayAutoPlay) {
-                stopReplayAutoPlay();
-            } else {
-                startReplayAutoPlay();
-            }
+            if (replayAutoPlay) stopReplayAutoPlay();
+            else startReplayAutoPlay();
         }
 
         function startReplayAutoPlay() {
@@ -1648,38 +1566,26 @@
             replayAutoPlay = true;
             const btn = document.getElementById('autoplay-btn');
             btn.classList.add('playing');
-            btn.innerHTML = '&#9646;&#9646;';  // pause icon
+            btn.innerHTML = '&#9646;&#9646;';
             btn.title = 'Pause auto-play';
             replayAutoPlayStep();
         }
 
         function stopReplayAutoPlay() {
             replayAutoPlay = false;
-            if (replayAutoPlayTimeout) {
-                clearTimeout(replayAutoPlayTimeout);
-                replayAutoPlayTimeout = null;
-            }
+            if (replayAutoPlayTimeout) { clearTimeout(replayAutoPlayTimeout); replayAutoPlayTimeout = null; }
             const btn = document.getElementById('autoplay-btn');
             btn.classList.remove('playing');
-            btn.innerHTML = '&#9654;';  // play icon
+            btn.innerHTML = '&#9654;';
             btn.title = 'Auto-play';
         }
 
         function replayAutoPlayStep() {
-            if (!replayAutoPlay || !replayMode) {
+            if (!replayAutoPlay || !replayMode || replayIndex >= replayMoves.length - 1) {
                 stopReplayAutoPlay();
                 return;
             }
-
-            // Stop at end
-            if (replayIndex >= replayMoves.length - 1) {
-                stopReplayAutoPlay();
-                return;
-            }
-
-            replayStep('next', true);  // fromAutoPlay = true
-
-            // Schedule next step using speed slider
+            replayStep('next', true);
             const delay = parseFloat(document.getElementById('speed-slider').value) * 1000;
             replayAutoPlayTimeout = setTimeout(replayAutoPlayStep, delay);
         }
@@ -1688,39 +1594,19 @@
 
         document.addEventListener('keydown', function(e) {
             if (!replayMode) return;
-
             switch (e.key) {
-                case 'ArrowLeft':
-                    e.preventDefault();
-                    replayStep('prev');
-                    break;
-                case 'ArrowRight':
-                    e.preventDefault();
-                    replayStep('next');
-                    break;
-                case 'Home':
-                    e.preventDefault();
-                    replayStep('first');
-                    break;
-                case 'End':
-                    e.preventDefault();
-                    replayStep('last');
-                    break;
-                case 'Escape':
-                    e.preventDefault();
-                    exitReplay();
-                    break;
-                case ' ':
-                    e.preventDefault();
-                    toggleReplayAutoPlay();
-                    break;
+                case 'ArrowLeft': e.preventDefault(); replayStep('prev'); break;
+                case 'ArrowRight': e.preventDefault(); replayStep('next'); break;
+                case 'Home': e.preventDefault(); replayStep('first'); break;
+                case 'End': e.preventDefault(); replayStep('last'); break;
+                case 'Escape': e.preventDefault(); exitReplay(); break;
+                case ' ': e.preventDefault(); toggleReplayAutoPlay(); break;
             }
         });
 
         // ===================== Board Initialization =====================
 
-        // Initialize board
-        const config = {
+        const boardConfig = {
             draggable: true,
             position: 'start',
             onDragStart: onDragStart,
@@ -1728,20 +1614,12 @@
             onSnapEnd: onSnapEnd,
             pieceTheme: 'https://chessboardjs.com/img/chesspieces/wikipedia/{piece}.png'
         };
-        board = Chessboard('board', config);
+        board = Chessboard('board', boardConfig);
 
-        // Make board responsive
-        $(window).resize(function() {
-            board.resize();
-        });
+        $(window).resize(function() { board.resize(); });
 
-        // Fetch model status on page load
-        fetch('/api/model_status')
-            .then(response => response.json())
-            .then(data => {
-                updateModelUI(data.loaded, data.model_name, data.num_filters, data.num_blocks);
-            })
-            .catch(() => {});
+        // Initialize setup panel on page load
+        initSetupPanel();
     </script>
 </body>
 </html>

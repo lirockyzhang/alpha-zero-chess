@@ -34,7 +34,6 @@ struct BatchSearchConfig {
     int batch_timeout_ms = 20;      // Max wait time for batch
     float risk_beta = 0.0f;         // ERM risk sensitivity: >0 risk-seeking, <0 risk-averse, 0 neutral
     float fpu_base = 0.3f;          // Dynamic FPU: penalty = fpu_base * sqrt(1 - prior)
-    bool use_virtual_loss = true;   // Auto-set: false when batch_size<=1 (VL is no-op for single-leaf search)
 
     // Gumbel Top-k Sequential Halving (Danihelka et al. 2022)
     bool use_gumbel = false;        // Use Gumbel SH at root instead of PUCT+Dirichlet
@@ -145,12 +144,7 @@ public:
     float get_root_risk_value(float beta) const;
 
     // Cancel pending evaluations (call when evaluation times out)
-    // This removes virtual losses and clears in-flight tracking so search can continue
     void cancel_pending_evaluations() {
-        // Remove virtual losses from all pending paths
-        for (const auto& eval : pending_evals_) {
-            remove_virtual_losses_for_path(eval.node);
-        }
         pending_evals_.clear();
         simulations_in_flight_ = 0;
     }
@@ -213,9 +207,6 @@ private:
 
     // Add Dirichlet noise to root
     void add_dirichlet_noise(Node* root);
-
-    // Remove virtual losses along path from node to root (for cancelled evaluations)
-    void remove_virtual_losses_for_path(Node* node);
 
     // Gumbel Top-k Sequential Halving internal methods
     void init_gumbel();                           // Setup noise, top-m, SH phases
