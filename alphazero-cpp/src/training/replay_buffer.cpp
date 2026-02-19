@@ -1,8 +1,10 @@
 #include "training/replay_buffer.hpp"
+#include "training/sum_tree.hpp"
 #include <iostream>
 #include <fstream>
 #include <algorithm>
 #include <cstring>
+#include <cmath>
 
 namespace training {
 
@@ -107,6 +109,13 @@ void ReplayBuffer::add_sample(
     }
     update_composition_counters(pos, new_meta);
 
+    // PER: assign max priority to new sample (O(1) leaf-only write)
+    if (sum_tree_) {
+        float max_p = sum_tree_->max_priority();
+        sum_tree_->set_leaf(pos, max_p);
+        tree_needs_rebuild_ = true;
+    }
+
     // Update statistics (simple fetch_add, no CAS contention)
     // NOTE: current_size_ ELIMINATED - size() computes min(total_added, capacity)
     total_added_.value.fetch_add(1, std::memory_order_release);
@@ -203,6 +212,13 @@ void ReplayBuffer::add_batch_raw(
         }
         update_composition_counters(pos, new_meta);
 
+        // PER: assign max priority to new sample (O(1) leaf-only write)
+        if (sum_tree_) {
+            float max_p = sum_tree_->max_priority();
+            sum_tree_->set_leaf(pos, max_p);
+            tree_needs_rebuild_ = true;
+        }
+
         // Update statistics (no CAS!)
         total_added_.value.fetch_add(1, std::memory_order_release);
     }
@@ -285,6 +301,12 @@ void ReplayBuffer::clear() {
     SampleMeta sentinel{};
     sentinel.game_result = 0xFF;
     std::fill(metadata_.begin(), metadata_.end(), sentinel);
+
+    // Clear PER state
+    if (sum_tree_) {
+        sum_tree_->clear();
+        tree_needs_rebuild_ = false;
+    }
 }
 
 ReplayBuffer::Composition ReplayBuffer::get_composition() const {
@@ -308,6 +330,151 @@ ReplayBuffer::Stats ReplayBuffer::get_stats() const {
         draws_count_.value.load(std::memory_order_relaxed),
         losses_count_.value.load(std::memory_order_relaxed)
     };
+}
+
+// ============================================================================
+// Prioritized Experience Replay (PER)
+// ============================================================================
+
+void ReplayBuffer::enable_per(float alpha) {
+    if (alpha <= 0.0f) return;  // alpha=0 means uniform sampling, don't allocate
+
+    priority_exponent_ = alpha;
+    sum_tree_ = std::make_unique<SumTree>(capacity_);
+
+    // Initialize existing samples with uniform priority (1.0^alpha = 1.0)
+    size_t current = size();
+    for (size_t i = 0; i < current; ++i) {
+        sum_tree_->set_leaf(i, 1.0f);
+    }
+    if (current > 0) {
+        sum_tree_->rebuild();
+    }
+    tree_needs_rebuild_ = false;
+
+    std::cerr << "[ReplayBuffer] PER enabled: alpha=" << alpha
+              << ", capacity=" << capacity_ << std::endl;
+}
+
+bool ReplayBuffer::sample_prioritized(
+    size_t batch_size,
+    float beta,
+    std::vector<float>& observations,
+    std::vector<float>& policies,
+    std::vector<float>& values,
+    std::vector<float>* wdl_targets,
+    std::vector<float>* soft_values,
+    std::vector<uint32_t>& out_indices,
+    std::vector<float>& out_is_weights
+) {
+    if (!sum_tree_) return false;
+
+    size_t current = size();
+    if (current < batch_size) return false;
+
+    std::lock_guard<std::mutex> lock(per_mutex_);
+
+    // Rebuild tree if new samples were added since last sample
+    if (tree_needs_rebuild_) {
+        sum_tree_->rebuild();
+        tree_needs_rebuild_ = false;
+    }
+
+    // Resize output buffers
+    observations.resize(batch_size * OBS_SIZE);
+    policies.resize(batch_size * POLICY_SIZE);
+    values.resize(batch_size);
+    if (wdl_targets) wdl_targets->resize(batch_size * 3);
+    if (soft_values) soft_values->resize(batch_size);
+    out_indices.resize(batch_size);
+    out_is_weights.resize(batch_size);
+
+    float total = sum_tree_->total();
+    if (total <= 0.0f) {
+        // Degenerate case: all priorities are zero, fall back to uniform
+        // This shouldn't happen in practice since new samples get max priority
+        return false;
+    }
+
+    // Stratified sampling: divide [0, total) into batch_size equal segments
+    // and sample uniformly within each segment
+    float segment = total / static_cast<float>(batch_size);
+
+    // For IS weight normalization: track min probability
+    float min_prob = 1.0f;
+
+    for (size_t i = 0; i < batch_size; ++i) {
+        float low = segment * static_cast<float>(i);
+        float uniform_val = low + static_cast<float>(rng_()) / static_cast<float>(rng_.max()) * segment;
+        // Clamp to valid range
+        uniform_val = std::min(uniform_val, total - 1e-6f);
+        uniform_val = std::max(uniform_val, 0.0f);
+
+        size_t idx = sum_tree_->sample(uniform_val);
+        // Clamp to current buffer size
+        if (idx >= current) idx = current - 1;
+
+        out_indices[i] = static_cast<uint32_t>(idx);
+
+        // Compute sampling probability
+        float priority = sum_tree_->get(idx);
+        float prob = priority / total;
+        if (prob < 1e-10f) prob = 1e-10f;  // avoid division by zero
+        if (prob < min_prob) min_prob = prob;
+
+        // IS weight: (N * P(i))^(-beta)
+        out_is_weights[i] = std::pow(static_cast<float>(current) * prob, -beta);
+
+        // Copy sample data
+        std::memcpy(
+            observations.data() + i * OBS_SIZE,
+            observations_.data() + idx * OBS_SIZE,
+            OBS_SIZE * sizeof(float)
+        );
+        std::memcpy(
+            policies.data() + i * POLICY_SIZE,
+            policies_.data() + idx * POLICY_SIZE,
+            POLICY_SIZE * sizeof(float)
+        );
+        values[i] = values_[idx];
+
+        if (wdl_targets) {
+            std::memcpy(
+                wdl_targets->data() + i * 3,
+                wdl_targets_.data() + idx * 3,
+                3 * sizeof(float)
+            );
+        }
+        if (soft_values) {
+            (*soft_values)[i] = soft_values_[idx];
+        }
+    }
+
+    // Normalize IS weights so max weight = 1.0
+    // max_weight corresponds to min_prob: (N * min_prob)^(-beta)
+    float max_weight = std::pow(static_cast<float>(current) * min_prob, -beta);
+    if (max_weight > 0.0f) {
+        for (size_t i = 0; i < batch_size; ++i) {
+            out_is_weights[i] /= max_weight;
+        }
+    }
+
+    return true;
+}
+
+void ReplayBuffer::update_priorities(
+    const std::vector<uint32_t>& indices,
+    const std::vector<float>& priorities
+) {
+    if (!sum_tree_) return;
+    if (indices.size() != priorities.size()) return;
+
+    std::lock_guard<std::mutex> lock(per_mutex_);
+
+    for (size_t i = 0; i < indices.size(); ++i) {
+        float p = std::pow(priorities[i], priority_exponent_);
+        sum_tree_->update(indices[i], p);
+    }
 }
 
 // ============================================================================

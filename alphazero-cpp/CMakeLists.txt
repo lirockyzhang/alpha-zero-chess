@@ -118,6 +118,7 @@ target_link_libraries(selfplay PUBLIC
 # Training library
 add_library(training STATIC
     src/training/replay_buffer.cpp
+    src/training/sum_tree.cpp
     src/training/trainer.cpp
 )
 

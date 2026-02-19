@@ -3,10 +3,15 @@
 #include <vector>
 #include <atomic>
 #include <random>
+#include <mutex>
+#include <memory>
 #include <cstdint>
 #include <string>
 
 namespace training {
+
+// Forward declaration
+class SumTree;
 
 // ============================================================================
 // Per-Sample Metadata
@@ -210,6 +215,66 @@ public:
      */
     bool load(const std::string& path);
 
+    // ========================================================================
+    // Prioritized Experience Replay (PER)
+    // ========================================================================
+
+    /**
+     * Enable PER with the given priority exponent (alpha).
+     * Allocates sum-tree and initializes existing samples with uniform priority.
+     * @param alpha Priority exponent (0=uniform, 0.6=recommended)
+     */
+    void enable_per(float alpha);
+
+    /**
+     * Check if PER is enabled.
+     */
+    bool per_enabled() const { return sum_tree_ != nullptr; }
+
+    /**
+     * Get the priority exponent (alpha).
+     */
+    float priority_exponent() const { return priority_exponent_; }
+
+    /**
+     * Sample a prioritized batch with IS weights.
+     * Thread-safe (holds per_mutex_).
+     *
+     * @param batch_size Number of samples to return
+     * @param beta IS correction exponent (0=no correction, 1=full correction)
+     * @param observations Output: sampled observations
+     * @param policies Output: sampled policies
+     * @param values Output: sampled values
+     * @param wdl_targets Output: sampled WDL targets (nullable)
+     * @param soft_values Output: sampled soft values (nullable)
+     * @param out_indices Output: indices of sampled leaves (for update_priorities)
+     * @param out_is_weights Output: IS correction weights (normalized so max=1)
+     * @return true if successful
+     */
+    bool sample_prioritized(
+        size_t batch_size,
+        float beta,
+        std::vector<float>& observations,
+        std::vector<float>& policies,
+        std::vector<float>& values,
+        std::vector<float>* wdl_targets,
+        std::vector<float>* soft_values,
+        std::vector<uint32_t>& out_indices,
+        std::vector<float>& out_is_weights
+    );
+
+    /**
+     * Update priorities for sampled indices.
+     * Thread-safe (holds per_mutex_).
+     *
+     * @param indices Leaf indices (from sample_prioritized)
+     * @param priorities New priority values (typically loss + epsilon)
+     */
+    void update_priorities(
+        const std::vector<uint32_t>& indices,
+        const std::vector<float>& priorities
+    );
+
     /**
      * Get buffer statistics.
      */
@@ -276,6 +341,12 @@ private:
     // Constants
     static constexpr size_t OBS_SIZE = 8 * 8 * 123;  // 7872
     static constexpr size_t POLICY_SIZE = 4672;
+
+    // Prioritized Experience Replay (PER) state
+    std::unique_ptr<SumTree> sum_tree_;         // nullptr when PER disabled
+    float priority_exponent_{0.0f};             // alpha
+    bool tree_needs_rebuild_{false};            // set by add_sample, cleared by sample_prioritized
+    mutable std::mutex per_mutex_;              // protects sum_tree_ during sample + update
 };
 
 } // namespace training
