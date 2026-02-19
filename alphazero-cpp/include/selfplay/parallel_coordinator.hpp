@@ -246,11 +246,28 @@ public:
     // Start generation (non-blocking)
     void start(NeuralEvaluatorFn evaluator);
 
-    // Wait for completion
+    // Wait for all workers and GPU thread to finish
     void wait();
 
     // Stop early (graceful shutdown)
     void stop();
+
+    // =========================================================================
+    // Lifecycle Split (for concurrent reanalysis)
+    // =========================================================================
+
+    // Connect a secondary evaluation queue (reanalysis).
+    // GPU thread fills spare batch capacity from this queue.
+    void set_secondary_queue(GlobalEvaluationQueue* queue);
+
+    // Disconnect the secondary queue.
+    void clear_secondary_queue();
+
+    // Wait for self-play workers only (GPU thread keeps running for reanalysis).
+    void wait_for_workers();
+
+    // Shut down the GPU thread (call after reanalysis is done).
+    void shutdown_gpu_thread();
 
     // Get last error from worker/GPU threads (thread-safe, first-error-wins)
     std::string get_last_error() const {
@@ -351,8 +368,11 @@ private:
     // Configuration
     ParallelSelfPlayConfig config_;
 
-    // Evaluation queue
+    // Evaluation queue (primary — self-play workers)
     GlobalEvaluationQueue eval_queue_;
+
+    // Secondary evaluation queue (reanalysis — fills spare GPU batch capacity)
+    std::atomic<GlobalEvaluationQueue*> secondary_queue_{nullptr};
 
     // Replay buffer (optional, for direct data storage)
     training::ReplayBuffer* replay_buffer_;

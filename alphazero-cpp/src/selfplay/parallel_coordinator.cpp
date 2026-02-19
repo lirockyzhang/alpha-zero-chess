@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdio>
+#include <cstring>
 #include <random>
 
 namespace selfplay {
@@ -80,18 +81,28 @@ void ParallelSelfPlayCoordinator::start(NeuralEvaluatorFn evaluator) {
 }
 
 void ParallelSelfPlayCoordinator::wait() {
-    // Wait for all worker threads
+    wait_for_workers();
+    shutdown_gpu_thread();
+}
+
+void ParallelSelfPlayCoordinator::wait_for_workers() {
     for (auto& thread : worker_threads_) {
         if (thread.joinable()) {
             thread.join();
         }
     }
     worker_threads_.clear();
+}
 
-    // Signal GPU thread to stop (all workers done)
+void ParallelSelfPlayCoordinator::shutdown_gpu_thread() {
+    // Signal primary queue shutdown
     eval_queue_.shutdown();
 
-    // Wait for GPU thread
+    // Signal secondary queue shutdown (if connected)
+    auto* sec = secondary_queue_.load(std::memory_order_acquire);
+    if (sec) sec->shutdown();
+
+    // Wait for GPU thread to finish
     if (gpu_thread_.joinable()) {
         gpu_thread_.join();
     }
@@ -99,9 +110,19 @@ void ParallelSelfPlayCoordinator::wait() {
     running_.store(false, std::memory_order_release);
 }
 
+void ParallelSelfPlayCoordinator::set_secondary_queue(GlobalEvaluationQueue* queue) {
+    secondary_queue_.store(queue, std::memory_order_release);
+}
+
+void ParallelSelfPlayCoordinator::clear_secondary_queue() {
+    secondary_queue_.store(nullptr, std::memory_order_release);
+}
+
 void ParallelSelfPlayCoordinator::stop() {
     shutdown_.store(true, std::memory_order_release);
     eval_queue_.shutdown();
+    auto* sec = secondary_queue_.load(std::memory_order_acquire);
+    if (sec) sec->shutdown();
 }
 
 // ============================================================================
@@ -175,7 +196,10 @@ void ParallelSelfPlayCoordinator::worker_thread_func(int worker_id) {
                         state.value,
                         state.mcts_wdl.data(),
                         &state.soft_value,
-                        &meta
+                        &meta,
+                        state.fen.empty() ? nullptr : state.fen.c_str(),
+                        state.history_hashes.data(),
+                        state.num_history
                     );
                 }
             } else {
@@ -209,7 +233,9 @@ void ParallelSelfPlayCoordinator::worker_thread_func(int worker_id) {
 
     workers_active_.fetch_sub(1, std::memory_order_relaxed);
 
-    // If this is the last worker, signal GPU thread
+    // If this is the last self-play worker:
+    // - Always shut down primary queue (no more self-play leaves)
+    // - GPU thread stays alive if secondary queue is connected (reanalysis continues)
     if (workers_active_.load(std::memory_order_acquire) == 0) {
         eval_queue_.shutdown();
     }
@@ -226,36 +252,80 @@ void ParallelSelfPlayCoordinator::gpu_thread_func() {
             float* obs_ptr = nullptr;
             float* mask_ptr = nullptr;
 
-            // Collect batch (blocks with timeout)
-            int batch_size = eval_queue_.collect_batch(
-                &obs_ptr, &mask_ptr, config_.gpu_timeout_ms
-            );
+            // === Primary queue (self-play, high priority) ===
+            int primary_count = 0;
+            bool primary_done = eval_queue_.is_shutdown();
+            if (!primary_done) {
+                primary_count = eval_queue_.collect_batch(
+                    &obs_ptr, &mask_ptr, config_.gpu_timeout_ms);
+            }
 
-            if (batch_size == 0) {
-                // Check if we should exit
-                if (eval_queue_.is_shutdown() ||
-                    shutdown_.load(std::memory_order_acquire)) {
-                    break;
+            // === Secondary queue (reanalysis, fills spare capacity) ===
+            int secondary_count = 0;
+            auto* sec_queue = secondary_queue_.load(std::memory_order_acquire);
+            if (sec_queue && !sec_queue->is_shutdown()) {
+                float* sec_obs = nullptr;
+                float* sec_mask = nullptr;
+                // Primary has items → non-blocking (fill gaps only)
+                // Primary empty   → full timeout (dedicated reanalysis mode)
+                int sec_timeout = (primary_count > 0) ? 0 : config_.gpu_timeout_ms;
+                int sec_max = static_cast<int>(config_.gpu_batch_size) - primary_count;
+                if (sec_max > 0) {
+                    secondary_count = sec_queue->collect_batch(
+                        &sec_obs, &sec_mask, sec_timeout);
+                    secondary_count = std::min(secondary_count, sec_max);
+
+                    if (secondary_count > 0) {
+                        if (primary_count > 0) {
+                            // Append secondary data to primary's batch buffer
+                            std::memcpy(obs_ptr + primary_count * OBS_SIZE,
+                                        sec_obs, secondary_count * OBS_SIZE * sizeof(float));
+                            std::memcpy(mask_ptr + primary_count * POLICY_SIZE,
+                                        sec_mask, secondary_count * POLICY_SIZE * sizeof(float));
+                        } else {
+                            // Use secondary's buffers directly (zero-copy)
+                            obs_ptr = sec_obs;
+                            mask_ptr = sec_mask;
+                        }
+                    }
                 }
+            }
+
+            int total_batch = primary_count + secondary_count;
+            if (total_batch == 0) {
+                bool secondary_done = !sec_queue || sec_queue->is_shutdown();
+                if ((primary_done && secondary_done) ||
+                    shutdown_.load(std::memory_order_acquire)) break;
                 continue;
             }
 
             try {
                 // Call neural network evaluator (writes WDL probs to wdl buffer)
-                evaluator_(obs_ptr, mask_ptr, batch_size,
+                evaluator_(obs_ptr, mask_ptr, total_batch,
                            policies.data(), wdl.data());
 
                 // Convert WDL probabilities to scalar values
                 // Risk adjustment happens at node level (q_value_risk), not here
-                for (int i = 0; i < batch_size; ++i) {
+                for (int i = 0; i < total_batch; ++i) {
                     float pw = wdl[i * 3 + 0];  // P(win)
                     float pd = wdl[i * 3 + 1];  // P(draw)
                     float pl = wdl[i * 3 + 2];  // P(loss)
                     values[i] = mcts::wdl_to_value(pw, pd, pl);
                 }
 
-                // Distribute scalar results + WDL probs to workers
-                eval_queue_.submit_results(policies.data(), values.data(), batch_size, wdl.data());
+                // Route results back to respective queues
+                if (primary_count > 0) {
+                    eval_queue_.submit_results(
+                        policies.data(), values.data(),
+                        primary_count, wdl.data());
+                }
+                if (secondary_count > 0) {
+                    sec_queue->submit_results(
+                        policies.data() + primary_count * POLICY_SIZE,
+                        values.data() + primary_count,
+                        secondary_count,
+                        wdl.data() + primary_count * 3);
+                }
             } catch (const std::exception& e) {
                 // Track error for debugging GPU thread issues
                 stats_.gpu_errors.fetch_add(1, std::memory_order_relaxed);
@@ -545,14 +615,29 @@ GameTrajectory ParallelSelfPlayCoordinator::play_single_game(
         std::vector<chess::Board> history_vec(position_history.begin(), position_history.end());
         encoding::PositionEncoder::encode_to_buffer(board, state_obs.data(), history_vec);
 
+        // Capture FEN and Zobrist history hashes for reanalysis
+        std::string position_fen;
+        std::array<uint64_t, 8> hist_hashes{};
+        uint8_t num_hist = 0;
+        if (replay_buffer_ && replay_buffer_->fen_storage_enabled()) {
+            position_fen = board.getFen();
+            num_hist = static_cast<uint8_t>(
+                std::min(size_t(8), position_history.size()));
+            for (uint8_t h = 0; h < num_hist; ++h) {
+                hist_hashes[h] = position_history[
+                    position_history.size() - 1 - h].hash();
+            }
+        }
+
         // Compute risk-adjusted root value (LogSumExp diagnostic) if risk_beta != 0
         float move_risk_beta = (board.sideToMove() == chess::Color::WHITE)
                                ? risk_white : risk_black;
         float soft_val = (move_risk_beta != 0.0f)
             ? search.get_root_risk_value(move_risk_beta) : 0.0f;
 
-        // Add to trajectory (with MCTS root WDL distribution and soft value)
-        trajectory.add_state(state_obs, policy, search.get_root_wdl(), soft_val);
+        // Add to trajectory (with MCTS root WDL, soft value, FEN, and history hashes)
+        trajectory.add_state(state_obs, policy, search.get_root_wdl(), soft_val,
+                             position_fen, hist_hashes, num_hist);
 
         // Safety check: if no move was selected (shouldn't happen), break
         if (legal_moves.empty()) {
