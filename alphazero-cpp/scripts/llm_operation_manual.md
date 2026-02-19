@@ -235,6 +235,10 @@ To change them, stop training and restart with `--resume`:
 | `--se-reduction` | int | SE (Squeeze-and-Excitation) block reduction ratio (default 16). Each residual block contains an SE block that computes channel attention: `filters → filters/r → filters`. Lower r = more capacity/slower, higher r = less capacity/faster. Standard values: 4, 8, 16, 32. Cannot change mid-training. |
 | `--buffer-size` | int | Replay buffer capacity |
 | `--workers` | int | Number of parallel self-play workers |
+| `--priority-exponent` | float | PER priority exponent α (default 0.0=disabled, 0.6=recommended). Allocates sum-tree on startup. |
+| `--per-beta` | float | PER initial IS correction β (default 0.4). Only used when priority-exponent > 0. |
+| `--per-beta-final` | float | PER final IS correction β (default 1.0). Anneals from per-beta to this value. |
+| `--per-beta-warmup` | int | Iterations to anneal β (default 0 = anneal over all iterations). |
 
 **CRITICAL: `--resume` does NOT preserve CLI arguments.** When using `--resume`, you MUST re-specify ALL parameters (`--filters`, `--blocks`, `--se-reduction`, `--workers`, `--simulations`, `--search-algorithm`, `--train-batch`, `--epochs`, `--games-per-iter`, etc.). Only the model weights, optimizer state, and replay buffer are loaded from the checkpoint. Omitting parameters causes them to revert to defaults (e.g., workers=1, simulations=800, train_batch=256), which can silently produce terrible results.
 
@@ -1005,6 +1009,18 @@ When `--priority-exponent 0` (the default), `enable_per()` is never called. The 
 ```bash
 --priority-exponent 0.6 --per-beta 0.4 --per-beta-final 1.0 --per-beta-warmup 0
 ```
+
+**PER in the Buffet training strategy:**
+
+| Phase | PER? | Rationale |
+|-------|------|-----------|
+| Phase 1 (Buffet, iters 1-20) | No | All positions are from random play. Losses are uniformly high — no "easy" positions to deprioritize. PER overhead with no benefit. |
+| Phase 2 (Tasting Menu, iters 20-60) | Optional | As model improves, buffer accumulates easy positions. PER starts to help by focusing on hard positions. Enable at Phase 2 restart if loss < 7.0. |
+| Phase 3+ (Real Chess, iters 60+) | Yes | Large buffer with wide loss distribution. Many positions are well-learned. PER significantly improves training efficiency by focusing gradient updates on challenging positions. |
+
+**PER and value head collapse:** PER can help prevent/recover from value head collapse (Section 10o) by amplifying the gradient signal from decisive positions. When the buffer is 90%+ draws, the few W/L positions have high value loss and get sampled more frequently under PER, keeping the value head responsive. However, PER alone cannot fix a deeply collapsed value head (value_loss < 0.15) — apply epochs=1 first to reset overfitting, then enable PER on restart.
+
+**PER requires restart:** Because the sum-tree is allocated at startup, PER cannot be enabled or disabled via `param_updates.json`. To enable PER, stop training (`touch <run_dir>/stop`) and restart with `--resume <run_dir> --priority-exponent 0.6`.
 
 **RPBF v3 format:** Buffer files saved with PER enabled include a priorities section after metadata (flag in `reserved[0]` bit 0). Loading a file with priorities into a PER-enabled buffer restores the priority distribution. Loading without PER enabled skips the priorities section. Files saved without PER are also valid v3 (no priorities section).
 

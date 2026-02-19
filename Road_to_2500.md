@@ -89,7 +89,7 @@ This is the most dangerous phase — reducing temperature can trigger draw death
 **Transition criteria:**
 - Loss below 5.0, draw rate < 60%, endgame puzzles 2+/5
 
-**Stop and restart** (to increase simulations):
+**Stop and restart** (to increase simulations + enable PER):
 ```bash
 touch <run_dir>/stop
 # Wait for graceful shutdown, then:
@@ -104,8 +104,11 @@ uv run python alphazero-cpp/scripts/train.py \
   --lr 0.0005 --train-batch 1024 --epochs 3 \
   --buffer-size 500000 \
   --temperature-moves 30 \
+  --priority-exponent 0.6 --per-beta 0.4 --per-beta-final 1.0 \
   --live
 ```
+
+**Why enable PER here:** By Phase 3 the buffer contains 100K+ positions with a wide loss distribution — many "easy" positions the model has mastered, and fewer "hard" ones. PER focuses gradient updates on the hard positions, improving training efficiency. The IS weight correction (beta annealing 0.4→1.0) ensures gradients remain unbiased.
 
 **LR decay schedule:**
 
@@ -151,6 +154,7 @@ uv run python alphazero-cpp/scripts/train.py \
   --train-batch 1024 --epochs 5 \
   --buffer-size 500000 \
   --temperature-moves 20 \
+  --priority-exponent 0.6 --per-beta 0.4 --per-beta-final 1.0 \
   --opponent-risk "-0.3:0.3" \
   --live
 ```
@@ -233,6 +237,8 @@ Valid keys for `param_updates.json` (with ranges):
 
 Keys prefixed with `_` (e.g., `_reason`) are treated as metadata — logged but not applied. Unknown keys are logged as warnings and skipped. Values are clamped to their valid range.
 
+**Not hot-reloadable (require restart):** `--priority-exponent`, `--per-beta`, `--per-beta-final`, `--per-beta-warmup`, `--filters`, `--blocks`, `--se-reduction`, `--buffer-size`, `--workers`, `--search-algorithm`. To change these, stop training and restart with `--resume`.
+
 **7. Resume training** by deleting both signal files:
 ```bash
 rm <run_dir>/selfplay_done <run_dir>/awaiting_review
@@ -275,3 +281,100 @@ Training unblocks only when **both** files are absent. If neither Claude Code no
 - First few iterations: **40-60%+ decisive games** (the key signal that Buffet is working)
 - Periodically: run `evaluation.py` gauntlet against Stockfish at increasing ELO levels
 - Final: consistent >50% win rate vs Stockfish at ELO 2500 with 1600 sims
+
+---
+
+## Training Log
+
+### Run 1: `f256-b20-se4_2026-02-18_01-43-26` (Traditional → Buffet retrofit)
+
+**Parameters used:**
+- sims=64, temp=50 (not the plan's 80), workers=24 (not 32), train_batch=256 (not 1024)
+- epochs: started at 1 (correct), risk_beta=0.3 (not in plan)
+- Multiple resumes with inconsistent CLI args
+
+**Progression (EXPERIMENTAL — actual observed data):**
+
+| Iteration | Loss | Policy | Value | W | B | D | Draw% | Fifty-Move | Rep | AvgLen |
+|-----------|------|--------|-------|---|---|---|-------|-----------|-----|--------|
+| 1 | 9.65 | 8.49 | 1.16 | - | - | - | ~90% | - | - | 300+ |
+| 5 | ~8.5 | ~8.0 | ~0.5 | - | - | - | ~85% | - | - | 300+ |
+| 10 | ~8.0 | ~7.7 | ~0.35 | - | - | - | ~85% | - | - | 330 |
+| 18 | 7.91 | 7.57 | 0.34 | 5 | 11 | 112 | 87.5% | 41 | 64 | ~330 |
+| 19 | 7.85 | 7.51 | 0.35 | 10 | 26 | 92 | 71.9% | 60 | 28 | ~330 |
+| 20 | 7.76 | 7.49 | 0.27 | 3 | 5 | 112 | 93.3% | 96 | 10 | 320 |
+
+**Buffer at iter 20:** 188,453 positions — W=7,254 (3.8%), D=173,775 (92.1%), L=7,424 (3.9%)
+
+**Key observations (EXPERIMENTAL):**
+1. Policy loss improved monotonically (8.49 → 7.49) — the model IS learning move selection
+2. Value loss collapsed (1.16 → 0.27) — the value head is deeply draw-biased
+3. Fifty-move draws dominate, NOT repetition draws (Gumbel prevents repetitions)
+4. The model CAN find checkmates (sample game at iter 20: 292-move checkmate) but rarely does
+5. With temp=50, games still average 320+ moves — not enough randomization
+6. `train_batch=256` was a parameter mismatch from the plan (should have been 1024)
+
+**Attempt: Buffet retrofit on iter 20 model (FAILED — EXPERIMENTAL):**
+
+Resumed from iter 20 with corrected Buffet params (temp=80, sims=64, train_batch=1024, workers=32, epochs=1):
+
+| Iter | Games | W | D | L | Draw% | Fifty-Move | ValLoss | AvgLen |
+|------|-------|---|---|---|-------|-----------|---------|--------|
+| 21 | 128 | 1 | 127 | 0 | **99.2%** | 117 | **0.098** | 355.7 |
+
+**Conclusion:** Buffet (temp=80) on a draw-biased model produced 99% draws and collapsed value_loss further (0.27 → 0.098). The model is "too smart to lose accidentally" (avoids checkmate for 200+ moves after 80 random moves) but "too dumb to win intentionally." **Buffet requires fresh random weights.** See llm_operation_manual.md Section 10o for full analysis.
+
+### Run 2: Fresh Buffet Start (planned, not yet executed)
+
+**Parameters (from Phase 1 plan):**
+```bash
+uv run python alphazero-cpp/scripts/train.py \
+  --claude --claude-timeout 3600 \
+  --iterations 50 \
+  --games-per-iter 128 --workers 32 \
+  --simulations 64 \
+  --search-algorithm gumbel --gumbel-top-k 16 \
+  --filters 256 --blocks 20 --se-reduction 4 \
+  --lr 0.001 --train-batch 1024 --epochs 1 \
+  --buffer-size 500000 \
+  --temperature-moves 80 \
+  --live
+```
+
+**Preliminary test (EXPERIMENTAL, 1 game only):**
+- Launched fresh run from random weights, first game completed: **decisive** (black win, 132 moves)
+- Confirms random models DO produce accidental checkmates that bootstrap the value head
+- Run stopped before full iteration per user request
+
+**Expected behavior (THEORY — not yet validated):**
+- Iters 1-3: 40-60%+ decisive games, loss ~9.0
+- Iters 5-10: Loss drops fast, game length shortens
+- Iters 10-20: Clear tactical understanding, beats random
+
+**Timing (EXPERIMENTAL — measured from Run 1 and aborted Run 2):**
+- Self-play: ~20 min per iteration (NOT 10-20 seconds as originally predicted)
+- Reason: early games average 320-360 moves, much longer than the predicted 80-150
+- NN throughput: ~2,200 evals/s (matches expectations)
+- Phase 1 total: ~17 hours for 50 iterations (not minutes)
+
+---
+
+## Lessons Learned
+
+### L1. Buffet Requires Fresh Weights (EXPERIMENTAL — confirmed)
+The Buffet approach generates decisive games through accidental checkmates by random models. A trained model with value_loss < 0.3 defeats this mechanism — it avoids checkmate for 200+ moves after randomization. **Never apply Buffet to a model that has developed draw bias.** Start fresh.
+
+### L2. CLI Parameter Consistency is Critical (EXPERIMENTAL — confirmed)
+`--resume` does NOT preserve CLI arguments. The first run used inconsistent `train_batch` (256 vs plan's 1024) and `workers` (24 vs plan's 32) across resumes. **Always copy the full launch command and modify it when resuming.**
+
+### L3. Self-Play Time Estimates Were Wrong (EXPERIMENTAL — measured)
+With sims=64, the plan predicted 10-20 second self-play. Actual: ~20 minutes. The error was assuming 80-150 move games, but early random games average 320-360 moves. Each move still requires 64 sims × 16 search_batch evaluations, so long games dominate wall-clock time.
+
+### L4. Value Head Collapse Is the Primary Failure Mode (EXPERIMENTAL — observed across 3 runs)
+In all runs so far, the value head collapses toward "always predict draw" within 3-10 iterations. The policy head improves steadily. The bottleneck is not learning to play chess — it's learning to EVALUATE positions. This is why the Buffet approach (which maximizes decisive training signal for the value head) is the right strategy.
+
+### L5. PER Is Most Valuable After Phase 1 (THEORY — not yet tested in training)
+PER (Prioritized Experience Replay) samples positions proportional to training loss, focusing gradient updates on positions the model struggles with. During Phase 1 (Buffet), all positions have similarly high loss — PER provides no benefit and wastes overhead. From Phase 3 onward, the buffer contains a wide mix of easy and hard positions — PER significantly improves training efficiency. Enable with `--priority-exponent 0.6` on restart. PER can also help with value head collapse by amplifying gradient signal from the minority of decisive positions in a draw-heavy buffer.
+
+### L6. No Buffer Persistence (.rpbf files not saved) (EXPERIMENTAL — observed)
+Despite buffer persistence being documented in the operation manual (Section 10l), no `.rpbf` files were found in the run directory. This means `--resume` starts with an empty buffer. **TODO: investigate whether buffer saving is actually implemented in train.py for this run configuration.**
