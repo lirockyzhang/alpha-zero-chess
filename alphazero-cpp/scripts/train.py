@@ -2288,11 +2288,8 @@ Examples:
                         help="PER priority exponent alpha (default: 0.0 = uniform sampling). "
                              "Recommended: 0.6. Higher = more aggressive prioritization.")
     parser.add_argument("--per-beta", type=float, default=0.4,
-                        help="PER IS correction beta start (default: 0.4)")
-    parser.add_argument("--per-beta-final", type=float, default=1.0,
-                        help="PER IS correction beta end (default: 1.0 = full correction)")
-    parser.add_argument("--per-beta-warmup", type=int, default=0,
-                        help="Iterations to anneal beta from start to final (default: 0 = anneal over all iterations)")
+                        help="PER IS correction beta (default: 0.4). "
+                             "0=no correction, 1=full correction. See operation manual Section 10q.")
 
     # Device and paths
     parser.add_argument("--device", type=str, default="cuda",
@@ -2461,9 +2458,7 @@ Examples:
         print(f"Opponent risk:       {args.opponent_risk}")
     print(f"Buffer:              {args.buffer_size} positions")
     if args.priority_exponent > 0:
-        print(f"PER:                 alpha={args.priority_exponent:g}, "
-              f"beta={args.per_beta:g}->{args.per_beta_final:g}, "
-              f"warmup={args.per_beta_warmup or 'all'}")
+        print(f"PER:                 alpha={args.priority_exponent:g}, beta={args.per_beta:g}")
     print(f"Checkpoints:         model_iter_*.pt (every {args.save_interval} iters)")
     print(f"Visualization:       {'disabled' if args.no_visualization else 'summary.html'}")
     print(f"Progress reports:    Every {args.progress_interval:.0f} seconds")
@@ -2651,7 +2646,7 @@ Examples:
         print(f"  Risk:      risk_beta={args.risk_beta:g}")
         print(f"  Training:  lr={args.lr:.2e}, train_batch={args.train_batch}, epochs={args.epochs}")
         if args.priority_exponent > 0:
-            print(f"  PER:       alpha={args.priority_exponent:g}, beta={args.per_beta:g}->{args.per_beta_final:g}")
+            print(f"  PER:       alpha={args.priority_exponent:g}, beta={args.per_beta:g}")
         print(f"  Self-play: games_per_iter={args.games_per_iter}, workers={args.workers}, "
               f"max_fillup_factor={args.max_fillup_factor}")
         if args.opponent_risk_min != 0.0 or args.opponent_risk_max != 0.0:
@@ -3254,12 +3249,8 @@ Examples:
 
                 train_start = time.time()
 
-                # PER beta annealing
-                current_per_beta = 0.0
-                if args.priority_exponent > 0:
-                    warmup = args.per_beta_warmup if args.per_beta_warmup > 0 else args.iterations
-                    progress = min(1.0, (iteration + 1) / max(warmup, 1))
-                    current_per_beta = args.per_beta + progress * (args.per_beta_final - args.per_beta)
+                # PER beta (fixed, not annealed)
+                current_per_beta = args.per_beta if args.priority_exponent > 0 else 0.0
 
                 train_metrics = train_iteration(
                     network, optimizer, replay_buffer,

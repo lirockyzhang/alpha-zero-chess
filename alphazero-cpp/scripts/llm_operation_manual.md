@@ -236,9 +236,7 @@ To change them, stop training and restart with `--resume`:
 | `--buffer-size` | int | Replay buffer capacity |
 | `--workers` | int | Number of parallel self-play workers |
 | `--priority-exponent` | float | PER priority exponent α (default 0.0=disabled, 0.6=recommended). Allocates sum-tree on startup. |
-| `--per-beta` | float | PER initial IS correction β (default 0.4). Only used when priority-exponent > 0. |
-| `--per-beta-final` | float | PER final IS correction β (default 1.0). Anneals from per-beta to this value. |
-| `--per-beta-warmup` | int | Iterations to anneal β (default 0 = anneal over all iterations). |
+| `--per-beta` | float | PER IS correction β (default 0.4). Fixed value, not annealed. See Section 10q for selection guide. |
 
 **CRITICAL: `--resume` does NOT preserve CLI arguments.** When using `--resume`, you MUST re-specify ALL parameters (`--filters`, `--blocks`, `--se-reduction`, `--workers`, `--simulations`, `--search-algorithm`, `--train-batch`, `--epochs`, `--games-per-iter`, etc.). Only the model weights, optimizer state, and replay buffer are loaded from the checkpoint. Omitting parameters causes them to revert to defaults (e.g., workers=1, simulations=800, train_batch=256), which can silently produce terrible results.
 
@@ -971,9 +969,7 @@ Started a new run from random weights with the same Buffet parameters. The very 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--priority-exponent` | 0.0 | Priority exponent α. 0=uniform (disabled), 0.6=recommended |
-| `--per-beta` | 0.4 | Initial IS correction exponent β |
-| `--per-beta-final` | 1.0 | Final IS correction exponent β |
-| `--per-beta-warmup` | 0 | Iterations to anneal β (0=anneal over all iterations) |
+| `--per-beta` | 0.4 | IS correction exponent β. Fixed value (not annealed). See selection guide below |
 
 **How it works internally:**
 
@@ -1005,22 +1001,54 @@ When `--priority-exponent 0` (the default), `enable_per()` is never called. The 
 - During initial random-weight phase (all losses are similarly high — no benefit from prioritization)
 - If buffer is very small (<10K) — uniform sampling already covers most positions
 
-**Recommended settings:**
-```bash
---priority-exponent 0.6 --per-beta 0.4 --per-beta-final 1.0 --per-beta-warmup 0
+**Choosing `--per-beta` (IS correction strength):**
+
+Beta controls how much importance sampling corrects the gradient bias from non-uniform sampling. PER samples high-loss positions more often, which biases the gradient toward those positions. IS weights undo this bias so the network doesn't overfit to outliers.
+
+| β value | IS correction | Gradient behavior | When to use |
+|---------|--------------|-------------------|-------------|
+| 0.0 | None | Fully biased toward high-loss samples. Fastest loss reduction, highest overfit risk. | Never recommended for sustained training. |
+| 0.2-0.3 | Light | Mostly biased. High-loss positions still heavily overrepresented. | Aggressive catch-up: when training is far behind and you need the model to rapidly learn hard positions (e.g., first 5-10 iters after enabling PER on a stale buffer). |
+| **0.4** | **Moderate (default)** | **Good balance. High-loss positions are prioritized but IS weights prevent runaway overfitting. Gradient direction slightly biased but magnitude is controlled.** | **Most training scenarios. Start here.** |
+| 0.6-0.7 | Strong | Near-unbiased gradients. Priority sampling still focuses on hard positions, but weights significantly dampen their influence. | Stable late-training (loss < 3.0) where convergence quality matters more than learning speed. Also when grad_norm_max is elevated (>5) — higher beta smooths gradient spikes from outlier positions. |
+| 1.0 | Full | Mathematically unbiased — equivalent to uniform sampling's gradient expectations, but with priority-biased sample selection. | Theoretical correctness. In practice, overly conservative — negates most of PER's benefit. Only use if you observe training instability (oscillating loss, grad spikes) that lower beta values can't fix. |
+
+**Practical decision tree for `--per-beta`:**
+
 ```
+Is this a new PER-enabled run (first time enabling)?
+  → Start with --per-beta 0.4 (default)
+
+Is grad_norm_max consistently > 5?
+  → Increase to --per-beta 0.7 (dampens outlier gradients)
+
+Is loss oscillating (up-down-up-down over 5+ iters)?
+  → Increase to --per-beta 0.7 or 1.0
+
+Is training progressing but slowly (loss declining < 1% per iter)?
+  → Decrease to --per-beta 0.3 (more aggressive prioritization)
+
+Is the buffer heavily draw-saturated (>90% draws)?
+  → Use --per-beta 0.3 (amplify the rare W/L positions more)
+
+Is loss < 2.0 and you're fine-tuning for quality?
+  → Increase to --per-beta 0.6-0.7 (stability over speed)
+```
+
+**Changing beta requires restart:** `--per-beta` is a CLI argument, not hot-reloadable via `param_updates.json`. To change it: `touch <run_dir>/stop`, then restart with `--resume <run_dir> --priority-exponent 0.6 --per-beta <new_value>`.
 
 **PER in the Buffet training strategy:**
 
-| Phase | PER? | Rationale |
-|-------|------|-----------|
-| Phase 1 (Buffet, iters 1-20) | No | All positions are from random play. Losses are uniformly high — no "easy" positions to deprioritize. PER overhead with no benefit. |
-| Phase 2 (Tasting Menu, iters 20-60) | Optional | As model improves, buffer accumulates easy positions. PER starts to help by focusing on hard positions. Enable at Phase 2 restart if loss < 7.0. |
-| Phase 3+ (Real Chess, iters 60+) | Yes | Large buffer with wide loss distribution. Many positions are well-learned. PER significantly improves training efficiency by focusing gradient updates on challenging positions. |
+| Phase | PER? | Recommended β | Rationale |
+|-------|------|---------------|-----------|
+| Phase 1 (Buffet, iters 1-20) | No | — | All positions are from random play. Losses are uniformly high — no "easy" positions to deprioritize. PER overhead with no benefit. |
+| Phase 2 (Tasting Menu, iters 20-60) | Optional | 0.4 | As model improves, buffer accumulates easy positions. PER starts to help by focusing on hard positions. Enable at Phase 2 restart if loss < 7.0. |
+| Phase 3 (Real Chess, iters 60-150) | Yes | 0.4 | Large buffer with wide loss distribution. Default beta provides good balance between prioritization and stability. |
+| Phase 4+ (Deep Training, iters 150+) | Yes | 0.6-0.7 | Late training prioritizes convergence quality. Higher beta smooths gradients for fine-grained improvement. |
 
-**PER and value head collapse:** PER can help prevent/recover from value head collapse (Section 10o) by amplifying the gradient signal from decisive positions. When the buffer is 90%+ draws, the few W/L positions have high value loss and get sampled more frequently under PER, keeping the value head responsive. However, PER alone cannot fix a deeply collapsed value head (value_loss < 0.15) — apply epochs=1 first to reset overfitting, then enable PER on restart.
+**PER and value head collapse:** PER can help prevent/recover from value head collapse (Section 10o) by amplifying the gradient signal from decisive positions. When the buffer is 90%+ draws, the few W/L positions have high value loss and get sampled more frequently under PER, keeping the value head responsive. Use `--per-beta 0.3` in this scenario to maximize the amplification. However, PER alone cannot fix a deeply collapsed value head (value_loss < 0.15) — apply epochs=1 first to reset overfitting, then enable PER on restart.
 
-**PER requires restart:** Because the sum-tree is allocated at startup, PER cannot be enabled or disabled via `param_updates.json`. To enable PER, stop training (`touch <run_dir>/stop`) and restart with `--resume <run_dir> --priority-exponent 0.6`.
+**PER requires restart:** Because the sum-tree is allocated at startup, PER cannot be enabled or disabled via `param_updates.json`. To enable PER, stop training (`touch <run_dir>/stop`) and restart with `--resume <run_dir> --priority-exponent 0.6 --per-beta 0.4`.
 
 **RPBF v3 format:** Buffer files saved with PER enabled include a priorities section after metadata (flag in `reserved[0]` bit 0). Loading a file with priorities into a PER-enabled buffer restores the priority distribution. Loading without PER enabled skips the priorities section. Files saved without PER are also valid v3 (no priorities section).
 

@@ -104,11 +104,11 @@ uv run python alphazero-cpp/scripts/train.py \
   --lr 0.0005 --train-batch 1024 --epochs 3 \
   --buffer-size 500000 \
   --temperature-moves 30 \
-  --priority-exponent 0.6 --per-beta 0.4 --per-beta-final 1.0 \
+  --priority-exponent 0.6 --per-beta 0.4 \
   --live
 ```
 
-**Why enable PER here:** By Phase 3 the buffer contains 100K+ positions with a wide loss distribution — many "easy" positions the model has mastered, and fewer "hard" ones. PER focuses gradient updates on the hard positions, improving training efficiency. The IS weight correction (beta annealing 0.4→1.0) ensures gradients remain unbiased.
+**Why enable PER here:** By Phase 3 the buffer contains 100K+ positions with a wide loss distribution — many "easy" positions the model has mastered, and fewer "hard" ones. PER focuses gradient updates on the hard positions, improving training efficiency. `--per-beta 0.4` provides moderate IS correction (good balance of prioritization vs gradient stability). See `llm_operation_manual.md` Section 10q for the full beta selection guide.
 
 **LR decay schedule:**
 
@@ -154,7 +154,7 @@ uv run python alphazero-cpp/scripts/train.py \
   --train-batch 1024 --epochs 5 \
   --buffer-size 500000 \
   --temperature-moves 20 \
-  --priority-exponent 0.6 --per-beta 0.4 --per-beta-final 1.0 \
+  --priority-exponent 0.6 --per-beta 0.6 \
   --opponent-risk "-0.3:0.3" \
   --live
 ```
@@ -237,7 +237,7 @@ Valid keys for `param_updates.json` (with ranges):
 
 Keys prefixed with `_` (e.g., `_reason`) are treated as metadata — logged but not applied. Unknown keys are logged as warnings and skipped. Values are clamped to their valid range.
 
-**Not hot-reloadable (require restart):** `--priority-exponent`, `--per-beta`, `--per-beta-final`, `--per-beta-warmup`, `--filters`, `--blocks`, `--se-reduction`, `--buffer-size`, `--workers`, `--search-algorithm`. To change these, stop training and restart with `--resume`.
+**Not hot-reloadable (require restart):** `--priority-exponent`, `--per-beta`, `--filters`, `--blocks`, `--se-reduction`, `--buffer-size`, `--workers`, `--search-algorithm`. To change these, stop training and restart with `--resume`.
 
 **7. Resume training** by deleting both signal files:
 ```bash
@@ -374,7 +374,7 @@ With sims=64, the plan predicted 10-20 second self-play. Actual: ~20 minutes. Th
 In all runs so far, the value head collapses toward "always predict draw" within 3-10 iterations. The policy head improves steadily. The bottleneck is not learning to play chess — it's learning to EVALUATE positions. This is why the Buffet approach (which maximizes decisive training signal for the value head) is the right strategy.
 
 ### L5. PER Is Most Valuable After Phase 1 (THEORY — not yet tested in training)
-PER (Prioritized Experience Replay) samples positions proportional to training loss, focusing gradient updates on positions the model struggles with. During Phase 1 (Buffet), all positions have similarly high loss — PER provides no benefit and wastes overhead. From Phase 3 onward, the buffer contains a wide mix of easy and hard positions — PER significantly improves training efficiency. Enable with `--priority-exponent 0.6` on restart. PER can also help with value head collapse by amplifying gradient signal from the minority of decisive positions in a draw-heavy buffer.
+PER (Prioritized Experience Replay) samples positions proportional to training loss, focusing gradient updates on positions the model struggles with. During Phase 1 (Buffet), all positions have similarly high loss — PER provides no benefit and wastes overhead. From Phase 3 onward, the buffer contains a wide mix of easy and hard positions — PER significantly improves training efficiency. Enable with `--priority-exponent 0.6 --per-beta 0.4` on restart. Use `--per-beta 0.6` in Phase 4+ for smoother convergence. PER can also help with value head collapse by amplifying gradient signal from the minority of decisive positions in a draw-heavy buffer (use `--per-beta 0.3` in that case for maximum amplification). See `llm_operation_manual.md` Section 10q for the full beta selection guide.
 
 ### L6. No Buffer Persistence (.rpbf files not saved) (EXPERIMENTAL — observed)
 Despite buffer persistence being documented in the operation manual (Section 10l), no `.rpbf` files were found in the run directory. This means `--resume` starts with an empty buffer. **TODO: investigate whether buffer saving is actually implemented in train.py for this run configuration.**

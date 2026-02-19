@@ -143,9 +143,7 @@ Parameters are grouped by which phase of training they affect:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--priority-exponent` | 0.0 | Priority exponent α (0=uniform/disabled, 0.6=recommended) |
-| `--per-beta` | 0.4 | Initial IS correction exponent β |
-| `--per-beta-final` | 1.0 | Final IS correction exponent β |
-| `--per-beta-warmup` | 0 | Iterations to anneal β (0=anneal over all iterations) |
+| `--per-beta` | 0.4 | IS correction β (0=none, 0.4=moderate, 1.0=full). See operation manual Section 10q |
 
 #### Visualization & Evaluation
 | Parameter | Default | Description |
@@ -1156,7 +1154,7 @@ evaluate.py --checkpoint checkpoints/f192-b15_.../model_final.pt --opponent rand
 | Feature | Default | Description |
 |---------|---------|-------------|
 | Prioritized Experience Replay | `--priority-exponent 0` (disabled) | Loss-proportional sampling with IS correction. Enable with `--priority-exponent 0.6` |
-| IS beta annealing | `--per-beta 0.4` → `--per-beta-final 1.0` | Importance sampling weights anneal to fully debias gradients |
+| IS correction | `--per-beta 0.4` | Fixed importance sampling correction (0=none, 1=full). Tunable per phase |
 | Per-sample loss | Enabled when PER active | Training computes per-sample policy+value loss for priority updates |
 | RPBF v3 priorities | Auto | Buffer files include priority section when PER enabled |
 
