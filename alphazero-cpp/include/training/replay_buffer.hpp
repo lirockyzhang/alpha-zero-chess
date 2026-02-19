@@ -68,6 +68,9 @@ public:
      * @param wdl_target Optional WDL soft target (3 floats: P(win), P(draw), P(loss))
      * @param soft_value Optional ERM risk-adjusted root value
      * @param meta Optional per-sample metadata (iteration, game_result, termination, etc.)
+     * @param fen Optional FEN string (stored if fen_storage_enabled)
+     * @param history_hashes Optional 8 Zobrist hashes [T-1..T-8] for repetition detection
+     * @param num_history Number of valid history hashes (0-8)
      */
     void add_sample(
         const std::vector<float>& observation,
@@ -75,7 +78,10 @@ public:
         float value,
         const float* wdl_target = nullptr,
         const float* soft_value = nullptr,
-        const SampleMeta* meta = nullptr
+        const SampleMeta* meta = nullptr,
+        const char* fen = nullptr,
+        const uint64_t* history_hashes = nullptr,
+        uint8_t num_history = 0
     );
 
     /**
@@ -275,6 +281,52 @@ public:
         const std::vector<float>& priorities
     );
 
+    // ========================================================================
+    // FEN + History Hash Storage (for MCTS Reanalysis)
+    // ========================================================================
+
+    /**
+     * Enable FEN and Zobrist hash storage for reanalysis.
+     * Allocates fixed-size buffers for FEN strings and history hashes.
+     * Must be called before adding samples that should store FEN data.
+     */
+    void enable_fen_storage();
+
+    /**
+     * Check if FEN storage is enabled.
+     */
+    bool fen_storage_enabled() const { return store_fens_; }
+
+    /**
+     * Get FEN string at buffer index.
+     * Returns empty string if FEN storage disabled or index invalid.
+     */
+    std::string get_fen(size_t index) const;
+
+    /**
+     * Get pointer to 8 history hashes at buffer index.
+     * Returns nullptr if FEN storage disabled.
+     */
+    const uint64_t* get_history_hashes(size_t index) const;
+
+    /**
+     * Get number of valid history hashes at buffer index.
+     */
+    uint8_t get_num_history(size_t index) const;
+
+    /**
+     * Get direct pointer to observation data at buffer index.
+     * Used by reanalyzer to read stored observation without copy.
+     */
+    const float* get_observation_ptr(size_t index) const;
+
+    /**
+     * Update the policy target at a specific buffer index.
+     * Used by reanalyzer to write fresh MCTS policy.
+     * Thread-safe (writes to unique position, no lock needed).
+     */
+    void update_policy(size_t index, const float* policy);
+
     /**
      * Get buffer statistics.
      */
@@ -341,6 +393,14 @@ private:
     // Constants
     static constexpr size_t OBS_SIZE = 8 * 8 * 123;  // 7872
     static constexpr size_t POLICY_SIZE = 4672;
+    static constexpr size_t FEN_SLOT_SIZE = 128;      // Fixed-size slot per FEN string
+    static constexpr size_t HISTORY_DEPTH = 8;        // Zobrist hashes per sample
+
+    // FEN + history hash storage (allocated when enabled via enable_fen_storage())
+    std::vector<char> fens_;               // capacity * FEN_SLOT_SIZE (null-terminated C strings)
+    std::vector<uint64_t> history_hashes_; // capacity * HISTORY_DEPTH (Zobrist hashes [T-1..T-8])
+    std::vector<uint8_t> num_history_;     // capacity (valid hash count per sample)
+    bool store_fens_{false};
 
     // Prioritized Experience Replay (PER) state
     std::unique_ptr<SumTree> sum_tree_;         // nullptr when PER disabled
