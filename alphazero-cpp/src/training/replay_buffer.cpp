@@ -35,6 +35,10 @@ ReplayBuffer::ReplayBuffer(size_t capacity)
     losses_count_.value.store(0, std::memory_order_relaxed);
 }
 
+// Destructor must be defined in .cpp where SumTree is complete
+// (unique_ptr<SumTree> requires complete type for deletion)
+ReplayBuffer::~ReplayBuffer() = default;
+
 void ReplayBuffer::update_composition_counters(size_t pos, const SampleMeta& new_meta) {
     // Decrement old counter if overwriting a valid (non-sentinel) entry
     uint8_t old_result = metadata_[pos].game_result;
@@ -481,9 +485,9 @@ void ReplayBuffer::update_priorities(
 // Binary Save/Load (.rpbf format)
 // ============================================================================
 //
-// Header (72 bytes):
+// Header (64 bytes):
 //   magic:        char[4] = "RPBF"
-//   version:      uint32_t = 2
+//   version:      uint32_t = 2 or 3
 //   capacity:     uint64_t   (original buffer capacity)
 //   num_samples:  uint64_t   (= size(), i.e. min(total_added, capacity))
 //   write_pos:    uint64_t
@@ -491,7 +495,7 @@ void ReplayBuffer::update_priorities(
 //   total_games:  uint64_t
 //   obs_size:     uint32_t
 //   policy_size:  uint32_t
-//   reserved:     uint8_t[8] (future use)
+//   reserved:     uint8_t[8] (reserved[0] bit 0 = has_priorities in v3)
 //
 // Data (contiguous):
 //   observations: num_samples * OBS_SIZE * 4 bytes
@@ -500,6 +504,7 @@ void ReplayBuffer::update_priorities(
 //   wdl_targets:  num_samples * 3 * 4 bytes
 //   soft_values:  num_samples * 4 bytes
 //   metadata:     num_samples * 8 bytes
+//   priorities:   num_samples * 4 bytes (v3 only, if has_priorities flag set)
 
 #pragma pack(push, 1)
 struct RpbfHeader {
@@ -529,7 +534,7 @@ bool ReplayBuffer::save(const std::string& path) const {
     // Write header
     RpbfHeader header{};
     header.magic[0] = 'R'; header.magic[1] = 'P'; header.magic[2] = 'B'; header.magic[3] = 'F';
-    header.version = 2;
+    header.version = 3;
     header.capacity = static_cast<uint64_t>(capacity_);
     header.num_samples = num_samples;
     header.write_pos = write_pos_.value.load(std::memory_order_relaxed);
@@ -538,6 +543,10 @@ bool ReplayBuffer::save(const std::string& path) const {
     header.obs_size = static_cast<uint32_t>(OBS_SIZE);
     header.policy_size = static_cast<uint32_t>(POLICY_SIZE);
     std::memset(header.reserved, 0, sizeof(header.reserved));
+    // reserved[0] bit 0: has_priorities flag
+    if (sum_tree_ && num_samples > 0) {
+        header.reserved[0] |= 0x01;
+    }
 
     out.write(reinterpret_cast<const char*>(&header), sizeof(header));
 
@@ -560,6 +569,16 @@ bool ReplayBuffer::save(const std::string& path) const {
     out.write(reinterpret_cast<const char*>(metadata_.data()),
               num_samples * sizeof(SampleMeta));
 
+    // Write priorities if PER is enabled (v3)
+    if (sum_tree_ && num_samples > 0) {
+        std::vector<float> priorities(num_samples);
+        for (uint64_t i = 0; i < num_samples; ++i) {
+            priorities[i] = sum_tree_->get(i);
+        }
+        out.write(reinterpret_cast<const char*>(priorities.data()),
+                  num_samples * sizeof(float));
+    }
+
     out.close();
 
     if (!out.good()) {
@@ -567,7 +586,8 @@ bool ReplayBuffer::save(const std::string& path) const {
         return false;
     }
 
-    std::cerr << "[ReplayBuffer] Saved " << num_samples << " samples to " << path << std::endl;
+    std::cerr << "[ReplayBuffer] Saved " << num_samples << " samples to " << path
+              << (sum_tree_ ? " (with priorities)" : "") << std::endl;
     return true;
 }
 
@@ -593,12 +613,14 @@ bool ReplayBuffer::load(const std::string& path) {
         return false;
     }
 
-    // Validate version
-    if (header.version != 2) {
+    // Validate version (v3 only)
+    if (header.version != 3) {
         std::cerr << "[ReplayBuffer] Unsupported version " << header.version
-                  << " in: " << path << std::endl;
+                  << " (expected 3) in: " << path << std::endl;
         return false;
     }
+
+    bool has_priorities = (header.reserved[0] & 0x01) != 0;
 
     // Validate sizes
     if (header.obs_size != OBS_SIZE || header.policy_size != POLICY_SIZE) {
@@ -660,18 +682,40 @@ bool ReplayBuffer::load(const std::string& path) {
 
     in.read(reinterpret_cast<char*>(metadata_.data()),
             num_samples * sizeof(SampleMeta));
+    if (num_samples < file_samples) {
+        in.seekg((file_samples - num_samples) * sizeof(SampleMeta), std::ios::cur);
+    }
+
+    // Load priorities if present and PER is enabled
+    if (has_priorities && sum_tree_) {
+        std::vector<float> priorities(num_samples);
+        in.read(reinterpret_cast<char*>(priorities.data()),
+                num_samples * sizeof(float));
+        for (uint64_t i = 0; i < num_samples; ++i) {
+            sum_tree_->set_leaf(i, priorities[i]);
+        }
+        sum_tree_->rebuild();
+        tree_needs_rebuild_ = false;
+        std::cerr << "[ReplayBuffer] Loaded priorities for " << num_samples << " samples" << std::endl;
+    } else if (has_priorities && !sum_tree_) {
+        // Skip priorities section
+        in.seekg(file_samples * sizeof(float), std::ios::cur);
+    } else if (sum_tree_) {
+        // No priorities in file but PER enabled: initialize uniform
+        for (uint64_t i = 0; i < num_samples; ++i) {
+            sum_tree_->set_leaf(i, 1.0f);
+        }
+        sum_tree_->rebuild();
+        tree_needs_rebuild_ = false;
+    }
 
     if (!in.good()) {
         std::cerr << "[ReplayBuffer] Read error during load from: " << path << std::endl;
-        // Reset to avoid inconsistent state
         clear();
         return false;
     }
 
     in.close();
-
-    // If we truncated, we need to skip past the remaining data in the file
-    // (already handled since we only read num_samples worth)
 
     // Initialize sentinel metadata for unused slots
     SampleMeta sentinel{};

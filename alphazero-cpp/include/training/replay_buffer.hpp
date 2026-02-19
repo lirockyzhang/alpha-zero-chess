@@ -56,7 +56,7 @@ public:
      */
     explicit ReplayBuffer(size_t capacity);
 
-    ~ReplayBuffer() = default;
+    ~ReplayBuffer();
 
     /**
      * Add a single sample to the buffer.

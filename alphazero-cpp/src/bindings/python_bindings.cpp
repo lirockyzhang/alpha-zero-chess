@@ -1159,7 +1159,75 @@ PYBIND11_MODULE(alphazero_cpp, m) {
             return d;
         },
         "Get W/D/L composition of buffer contents.\n"
-        "Returns dict with keys: wins, draws, losses.");
+        "Returns dict with keys: wins, draws, losses.")
+        // Prioritized Experience Replay (PER)
+        .def("enable_per", &training::ReplayBuffer::enable_per,
+             py::arg("alpha"),
+             "Enable Prioritized Experience Replay.\n"
+             "alpha: priority exponent (0=uniform, 0.6=recommended)")
+        .def("per_enabled", &training::ReplayBuffer::per_enabled,
+             "Check if PER is enabled")
+        .def("priority_exponent", &training::ReplayBuffer::priority_exponent,
+             "Get priority exponent (alpha)")
+        .def("sample_prioritized", [](training::ReplayBuffer& self,
+                                       size_t batch_size, float beta) {
+            std::vector<float> observations, policies, values, wdl_targets, soft_values;
+            std::vector<uint32_t> indices;
+            std::vector<float> is_weights;
+
+            bool success = self.sample_prioritized(
+                batch_size, beta, observations, policies, values,
+                &wdl_targets, &soft_values, indices, is_weights);
+            if (!success) {
+                throw std::runtime_error("PER sampling failed (not enabled or not enough samples)");
+            }
+
+            constexpr size_t OBS_FLAT = encoding::PositionEncoder::TOTAL_SIZE;  // 7872
+            py::array_t<float> obs_array(std::vector<size_t>{batch_size, OBS_FLAT});
+            py::array_t<float> pol_array(std::vector<size_t>{batch_size, 4672UL});
+            py::array_t<float> val_array(std::vector<size_t>{batch_size});
+            py::array_t<float> wdl_array(std::vector<size_t>{batch_size, 3UL});
+            py::array_t<float> sv_array(std::vector<size_t>{batch_size});
+            py::array_t<uint32_t> idx_array(std::vector<size_t>{batch_size});
+            py::array_t<float> wt_array(std::vector<size_t>{batch_size});
+
+            std::memcpy(obs_array.mutable_data(), observations.data(),
+                       batch_size * OBS_FLAT * sizeof(float));
+            std::memcpy(pol_array.mutable_data(), policies.data(),
+                       batch_size * 4672 * sizeof(float));
+            std::memcpy(val_array.mutable_data(), values.data(),
+                       batch_size * sizeof(float));
+            std::memcpy(wdl_array.mutable_data(), wdl_targets.data(),
+                       batch_size * 3 * sizeof(float));
+            std::memcpy(sv_array.mutable_data(), soft_values.data(),
+                       batch_size * sizeof(float));
+            std::memcpy(idx_array.mutable_data(), indices.data(),
+                       batch_size * sizeof(uint32_t));
+            std::memcpy(wt_array.mutable_data(), is_weights.data(),
+                       batch_size * sizeof(float));
+
+            return py::make_tuple(obs_array, pol_array, val_array, wdl_array,
+                                  sv_array, idx_array, wt_array);
+        },
+        py::arg("batch_size"), py::arg("beta"),
+        "Sample a prioritized batch with IS weights.\n"
+        "Returns: (observations, policies, values, wdl_targets, soft_values, indices, is_weights)")
+        .def("update_priorities", [](training::ReplayBuffer& self,
+                                      py::array_t<uint32_t> indices,
+                                      py::array_t<float> priorities) {
+            auto idx_buf = indices.request();
+            auto pri_buf = priorities.request();
+            size_t n = idx_buf.shape[0];
+            std::vector<uint32_t> idx_vec(static_cast<uint32_t*>(idx_buf.ptr),
+                                           static_cast<uint32_t*>(idx_buf.ptr) + n);
+            std::vector<float> pri_vec(static_cast<float*>(pri_buf.ptr),
+                                        static_cast<float*>(pri_buf.ptr) + n);
+            self.update_priorities(idx_vec, pri_vec);
+        },
+        py::arg("indices"), py::arg("priorities"),
+        "Update priorities for sampled indices.\n"
+        "indices: uint32 array from sample_prioritized\n"
+        "priorities: float32 array of new priorities (typically loss + epsilon)");
 
     // Trainer
     py::class_<training::Trainer::Config>(m, "TrainerConfig")
