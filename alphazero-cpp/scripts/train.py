@@ -3138,7 +3138,7 @@ Examples:
             reanalyzer = None
             reanalyze_this_iter = (
                 args.reanalyze_fraction > 0
-                and replay_buffer.size() > args.batch_size
+                and replay_buffer.size() > args.train_batch
             )
             if reanalyze_this_iter:
                 import random as _rng
