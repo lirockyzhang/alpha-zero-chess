@@ -740,7 +740,8 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
     //
     // search-batch>1 (async pipeline for experimentation):
     //   Uses double-buffering to overlap CPU leaf collection with GPU evaluation.
-    //   Higher virtual losses but amortizes per-leaf overhead.
+    //   Virtual losses (pessimistic value=-1) on in-flight leaves discourage
+    //   PUCT from re-selecting the same paths within a batch.
 
     std::vector<int32_t> sim_request_ids;
 
@@ -808,7 +809,8 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
         // Pipelined async loop (for search-batch > 1)
         // =====================================================================
         // Uses double-buffering: while GPU processes batch N, CPU collects N+1.
-        // Virtual losses prevent re-selecting the same paths across in-flight batches.
+        // Virtual losses (value=-1, visit+1 on in-flight paths) discourage PUCT
+        // from re-selecting same leaves; removed when results arrive or on cancel.
 
         int prev_queued = 0;
 

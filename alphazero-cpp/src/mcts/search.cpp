@@ -389,6 +389,40 @@ std::vector<int32_t> MCTSSearch::get_visit_counts() const {
 }
 
 // ============================================================================
+// Virtual Losses (for async pipeline leaf deduplication)
+// ============================================================================
+// Temporarily add a pessimistic (loss = -1.0) visit along a leaf's path to
+// root.  This has two effects on PUCT for subsequent selections:
+//   1. visit_count increases → exploration term decreases
+//   2. value_sum becomes very negative → Q-value drops to ~-1.0
+// Together these strongly discourage re-selecting the same sub-path within a
+// batch.  The virtual loss is removed when NN results arrive (update_prev_leaves)
+// or on cancellation (cancel_prev_pending / cancel_collection_pending).
+//
+// The loss value alternates sign at each level (same as backpropagation),
+// because a "loss" from the leaf's perspective is a "win" for the parent.
+
+static constexpr int64_t VIRTUAL_LOSS_FIXED = -10000;  // -1.0 in fixed-point
+
+void MCTSSearch::add_virtual_visits(Node* leaf) {
+    int64_t loss = VIRTUAL_LOSS_FIXED;
+    for (Node* n = leaf; n != nullptr; n = n->parent) {
+        n->value_sum_fixed.fetch_add(loss, std::memory_order_relaxed);
+        n->visit_count.fetch_add(1, std::memory_order_relaxed);
+        loss = -loss;  // flip perspective at each level
+    }
+}
+
+void MCTSSearch::remove_virtual_visits(Node* leaf) {
+    int64_t loss = VIRTUAL_LOSS_FIXED;
+    for (Node* n = leaf; n != nullptr; n = n->parent) {
+        n->value_sum_fixed.fetch_sub(loss, std::memory_order_relaxed);
+        n->visit_count.fetch_sub(1, std::memory_order_relaxed);
+        loss = -loss;
+    }
+}
+
+// ============================================================================
 // Async Double-Buffer Pipeline Implementation
 // ============================================================================
 
@@ -428,6 +462,7 @@ int MCTSSearch::collect_leaves_async(float* obs_buffer, float* mask_buffer, int 
             simulations_completed_++;
             if (config_.use_gumbel) advance_gumbel_sim();
         } else if (!leaf->is_expanded()) {
+            add_virtual_visits(leaf);
             collection.emplace_back(leaf, board, sim);
         } else {
             float value = leaf->q_value(0.0f, config_.fpu_base);
@@ -485,6 +520,9 @@ void MCTSSearch::update_prev_leaves(const std::vector<std::vector<float>>& polic
         const auto& eval = eval_buffer[i];
         Node* leaf = eval.node;
 
+        // Remove virtual visits before real backpropagation replaces them
+        remove_virtual_visits(leaf);
+
         expand(leaf, eval.board, policies[i], values[i]);
         if (wdl != nullptr) {
             backpropagate(leaf, values[i], wdl[i*3+0], wdl[i*3+1], wdl[i*3+2]);
@@ -500,11 +538,17 @@ void MCTSSearch::update_prev_leaves(const std::vector<std::vector<float>>& polic
 
 void MCTSSearch::cancel_prev_pending() {
     const auto& eval_buffer = get_evaluation_buffer();
+    for (const auto& eval : eval_buffer) {
+        remove_virtual_visits(eval.node);
+    }
     simulations_in_flight_ -= static_cast<int>(eval_buffer.size());
 }
 
 void MCTSSearch::cancel_collection_pending() {
     auto& coll_buffer = get_collection_buffer();
+    for (const auto& eval : coll_buffer) {
+        remove_virtual_visits(eval.node);
+    }
     simulations_in_flight_ -= static_cast<int>(coll_buffer.size());
     coll_buffer.clear();
 }

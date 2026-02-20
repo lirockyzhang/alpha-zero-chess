@@ -12,7 +12,7 @@ checkpoints/f192-b15_2024-02-03_14-30-00/
 ├── model_iter_001.pt            # Checkpoints (every N iterations)
 ├── model_iter_005.pt
 ├── model_final.pt               # Final checkpoint
-├── training_metrics.json        # Loss, games, moves per iteration
+├── training_log.jsonl           # Append-only JSONL: config + per-iteration metrics
 ├── evaluation_results.json      # vs_random win rate, endgame scores
 ├── summary.html                 # Visual training summary (default)
 └── replay_buffer.rpbf           # Replay buffer (saved after each self-play phase)
@@ -754,7 +754,7 @@ uv run python alphazero-cpp/scripts/train.py \
 This will:
 1. Load the network weights and optimizer state
 2. Start from the next iteration (e.g., iteration 51)
-3. Load `training_metrics.json` and append new metrics
+3. Load `training_log.jsonl` and append new metrics
 4. Load `evaluation_results.json` and append new evaluations
 5. Load replay buffer from `replay_buffer.rpbf`
 6. Continue saving to the same run directory
@@ -767,7 +767,7 @@ The training script supports **graceful shutdown**. When you press Ctrl+C:
 1. **Finishes the current game** (doesn't interrupt mid-game)
 2. **Saves an emergency checkpoint** to `{run_dir}/model_iter_XXX_emergency.pt`
 3. **Saves the replay buffer** to `replay_buffer.rpbf`
-4. **Saves training metrics** to `training_metrics.json`
+4. **Saves training metrics** to `training_log.jsonl`
 5. **Prints resume instructions**
 
 ```bash
@@ -911,7 +911,7 @@ checkpoints/f192-b15_YYYY-MM-DD_HH-MM-SS/
 ├── model_iter_001.pt         # Checkpoint at iteration 1
 ├── model_iter_005.pt         # Checkpoint at iteration 5
 ├── model_final.pt            # Final checkpoint (same as last iteration)
-├── training_metrics.json     # Per-iteration metrics (loss, games, etc.)
+├── training_log.jsonl     # Per-iteration metrics (loss, games, etc.)
 ├── evaluation_results.json   # Evaluation metrics per checkpoint
 ├── summary.html              # Visual summary with charts
 └── replay_buffer.rpbf        # Replay buffer (saved after each self-play phase)
@@ -2357,3 +2357,173 @@ evaluate.py --checkpoint checkpoints/f192-b15_.../model_final.pt --opponent rand
 
   Would you like me to swap the loop order anyway, or shall we focus on the production testing (--workers 64 --simulations 800
   --eval-batch 1024) to measure the actual throughput improvement?
+
+  Why W_ra = f * W is the optimal split (the load-balancing derivation):
+
+  All workers share one GPU via GlobalEvaluationQueue. The GPU processes Theta evals/sec regardless of which worker
+  submitted them. Each worker gets Theta/W of the GPU's capacity. For self-play and reanalysis to finish simultaneously:
+
+  Time_selfplay = G * L * N / (W_sp/W * Theta)
+  Time_reanalysis = R * N / (W_ra/W * Theta)
+
+  Setting equal and substituting R = f/(1-f) * G * L:
+    G*L / W_sp = f/(1-f) * G*L / W_ra
+    W_ra / W_sp = f / (1-f)
+    => W_ra = f * W,  W_sp = (1-f) * W
+
+  The CPU overhead difference between self-play (~1ms/move for game logic) and reanalysis (~0.3ms/position for buffer
+  I/O) is <1% of the GPU-dominated time, so the simple proportional split is accurate.
+
+  Why eval_batch should equal W * S (not larger):
+
+  The CUDA graph large-graph tier activates at ~87.5% fill. If eval_batch = W * S, synchronized workers fill the batch
+  100% -- large graph every time. If eval_batch = 2 * W * S, workers only fill 50% -- batches fall to the medium/small
+  graph tier, wasting GPU capacity on zero-padding. The 50us stall-detection spin-poll in collect_batch() naturally
+  handles desynchronization without needing extra headroom.
+
+  The buffer freshness insight is critical: Reanalysis re-evaluates positions with the current network to get improved
+  policy targets. If the buffer only holds 1-2 iterations of data, the generating network and current network are nearly
+   identical -- the KL divergence is tiny and reanalysis is wasted GPU work. You need >= 3 iterations of buffer depth
+  before the "staleness gap" produces meaningful policy improvements.
+
+  ─────────────────────────────────────────────────
+
+  Here's a summary of everything added:
+
+  New --recommend mode
+
+  # See optimal worker allocation for your config
+  uv run python alphazero-cpp/scripts/test_reanalysis_impact.py \
+      --recommend --workers 16 --reanalyze-fraction 0.25 \
+      --search-batch 16 --simulations 200 --games-per-iter 50 \
+      --buffer-size 100000
+
+  The key formulas
+
+  ┌───────────────────────┬────────────────────────────┬─────────────────────────────────────────────────────┐
+  │         What          │          Formula           │                        Notes                        │
+  ├───────────────────────┼────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Worker split          │ W_sp = (1-f)*W, W_ra = f*W │ Load-balanced completion; GPU-bottlenecked          │
+  ├───────────────────────┼────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Eval batch            │ ceil(W*S / 32) * 32        │ Matches train.py auto-sizing; W = total workers     │
+  ├───────────────────────┼────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ GPU overhead          │ 1 / (1-f)                  │ f=0.25 => 1.33x more NN evals                       │
+  ├───────────────────────┼────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Buffer threshold      │ buffer_size >= 3 * G * L   │ Need >= 3 iterations of data for meaningful KL      │
+  ├───────────────────────┼────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Batch fill sweet spot │ eval_batch = W_total * S   │ Larger wastes padding; smaller adds queuing latency │
+  └───────────────────────┴────────────────────────────┴─────────────────────────────────────────────────────┘
+
+
+    1. Optimal Self-Play vs Reanalysis Worker Distribution
+
+  The core constraint is that both worker types share the same GlobalEvaluationQueue — they compete for identical GPU
+  bandwidth. Each position requires ~`N_sims` NN evaluations whether it's fresh self-play or reanalysis.
+
+  The formula:
+
+  If F is the reanalyze fraction (fraction of training batch from reanalysis) and both paths use the same simulation
+  count:
+
+  W_ra / W_sp = F / ((1 - F) * α * (N_sims / N_sims_ra))
+
+  Where:
+  - α = efficiency ratio (reanalysis positions per sec / self-play positions per sec, per worker)
+  - N_sims = self-play simulations
+  - N_sims_ra = reanalysis simulations (can be lower)
+
+  Self-play is slower per-position because it has game overhead (move making, legality checks, position encoding with
+  history, game-over detection). Reanalysis just runs MCTS on a single already-encoded position. Empirically α ≈ 1.2–1.5
+   depending on game length.
+
+  Simplified (same sims, α ≈ 1):
+
+  W_sp = W * (1 - F)
+  W_ra = W * F
+
+  ┌────────────────────┬─────────────┬──────────────┬───────────────┐
+  │ Reanalyze Fraction │  8 Workers  │  16 Workers  │  32 Workers   │
+  ├────────────────────┼─────────────┼──────────────┼───────────────┤
+  │ F = 0.10           │ 7 sp + 1 ra │ 14 sp + 2 ra │ 29 sp + 3 ra  │
+  ├────────────────────┼─────────────┼──────────────┼───────────────┤
+  │ F = 0.25           │ 6 sp + 2 ra │ 12 sp + 4 ra │ 24 sp + 8 ra  │
+  ├────────────────────┼─────────────┼──────────────┼───────────────┤
+  │ F = 0.50           │ 4 sp + 4 ra │ 8 sp + 8 ra  │ 16 sp + 16 ra │
+  └────────────────────┴─────────────┴──────────────┴───────────────┘
+
+  With different reanalysis sims (e.g., N_sims_ra = N_sims / 2 — reanalysis needs fewer sims since it just updates
+  policy, not explores deeply):
+
+  W_ra = W * F / (F + (1-F) * α * N_sims_ra/N_sims)
+
+  This means fewer reanalysis workers are needed if they use fewer sims, because each worker produces positions faster.
+
+  Buffer size consideration: The buffer size constrains how many unique positions are available for reanalysis. If
+  buffer_size < W_ra * positions_per_worker_per_iteration, workers will re-reanalyze the same positions — wasted GPU.
+  So:
+
+  W_ra ≤ buffer_size / (positions_per_worker_per_iteration)
+       = buffer_size / (target_reanalyzed_per_iter / W_ra)
+
+  Practically: ensure F * games_per_iter * avg_game_length ≤ buffer_size.
+
+  2. Batch Size ≥ Total Workers × Search Batch
+
+  The current code already auto-computes this:
+
+  input_batch_size = round_up(workers * search_batch, 32)
+
+  This is optimal for self-play only. When adding reanalysis workers, the formula should become:
+
+  input_batch_size = round_up((W_sp + W_ra) * search_batch, 32)
+
+  Why this matters:
+
+  The GPU thread's collect_batch() has a spin-poll phase (~50μs stall window) where it waits for the batch to fill. If
+  eval_batch < total_workers * search_batch:
+
+  1. Some workers' leaves spill to the next batch → pipeline bubbles
+  2. Workers wait on worker_wait_ms → throughput drops
+  3. Queue backpressure triggers at 75% fill → cooldown stalls everyone
+
+  If eval_batch > total_workers * search_batch:
+
+  1. Batches never fully fill → CUDA graph padding waste
+  2. The CUDA graph routing compensates (small/medium/large graphs), but you're always hitting the "padded" path
+
+  The sweet spot is eval_batch = total_workers * search_batch — which gives full batches with zero padding. The
+  32-alignment is for GPU memory coalescing.
+
+  3. Why GPU Utilization Is Zero
+
+  The system does not track actual NVIDIA GPU SM utilization (no nvidia-smi integration or CUDA profiling). What it
+  tracks are proxy metrics. These are now persisted in training_log.jsonl alongside game/training metrics:
+
+  ┌──────────────────────────┬─────────────────────────────────────┬────────────┐
+  │        Metric            │         Where It Lives              │ Persisted? │
+  ├──────────────────────────┼─────────────────────────────────────┼────────────┤
+  │ batch_fill_ratio         │ training_log.jsonl + live dashboard │ Yes        │
+  ├──────────────────────────┼─────────────────────────────────────┼────────────┤
+  │ gpu_wait_ms              │ training_log.jsonl + live dashboard │ Yes        │
+  ├──────────────────────────┼─────────────────────────────────────┼────────────┤
+  │ worker_wait_ms           │ training_log.jsonl + live dashboard │ Yes        │
+  ├──────────────────────────┼─────────────────────────────────────┼────────────┤
+  │ batch_fill_p50/p90       │ training_log.jsonl + live dashboard │ Yes        │
+  ├──────────────────────────┼─────────────────────────────────────┼────────────┤
+  │ nn_evals_per_sec         │ training_log.jsonl + live dashboard │ Yes        │
+  ├──────────────────────────┼─────────────────────────────────────┼────────────┤
+  │ gpu_memory_allocated_mb  │ training_log.jsonl + live dashboard │ Yes        │
+  ├──────────────────────────┼─────────────────────────────────────┼────────────┤
+  │ cuda_graph_pct           │ training_log.jsonl + live dashboard │ Yes        │
+  └──────────────────────────┴─────────────────────────────────────┴────────────┘
+
+  The closest proxy for GPU utilization is batch_fill_ratio:
+  - > 0.8 → GPU saturated (close to 100% utilized)
+  - 0.3–0.8 → balanced
+  - < 0.3 → GPU underutilized (workers can't feed it fast enough)
+
+  To see actual SM utilization during training, you'd need to run nvidia-smi alongside training, or add a metric that
+  samples torch.cuda.utilization().
+  3. Add torch.cuda.utilization() sampling to get actual GPU SM % during training?
+
+

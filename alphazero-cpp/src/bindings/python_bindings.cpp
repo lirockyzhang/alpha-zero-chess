@@ -555,6 +555,12 @@ public:
             : 0.0;
         result["buffer_swaps"] = total_batches;
 
+        // Spin-poll stall detection metric (average spin time per batch)
+        uint64_t spin_polls = qm.spin_poll_count.load(std::memory_order_relaxed);
+        uint64_t spin_total_us = qm.spin_poll_total_us.load(std::memory_order_relaxed);
+        result["spin_poll_avg_us"] = spin_polls > 0
+            ? static_cast<double>(spin_total_us) / static_cast<double>(spin_polls) : 0.0;
+
         // Tree depth metrics
         result["max_search_depth"] = m.max_search_depth;
         result["min_search_depth"] = m.min_search_depth;

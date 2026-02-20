@@ -216,6 +216,12 @@ private:
     float completed_q(const Node* child) const;   // Q_hat(a) with V(root) interpolation
     float sigma_q(float q, float min_q, float max_q, int max_visits) const; // Value transform
 
+    // Virtual losses: temporarily add pessimistic visits (value=-1.0) along the
+    // root→leaf path so PUCT strongly avoids re-selecting in-flight leaves.
+    // Only used in the async pipeline (collect_leaves_async).
+    void add_virtual_visits(Node* leaf);
+    void remove_virtual_visits(Node* leaf);
+
     NodePool& pool_;
     BatchSearchConfig config_;
     std::mt19937 rng_;

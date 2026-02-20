@@ -84,6 +84,8 @@ struct alignas(64) QueueMetrics {
     std::atomic<uint64_t> submission_drops{0};        // Total leaves dropped due to pool exhaustion
     std::atomic<uint64_t> pool_resets{0};             // Times pool was reset
     std::atomic<uint64_t> submission_waits{0};        // Times workers waited for queue space (backpressure)
+    std::atomic<uint64_t> spin_poll_total_us{0};     // Cumulative spin-poll time (microseconds)
+    std::atomic<uint64_t> spin_poll_count{0};        // Number of spin-poll phases
 
     double avg_batch_size() const {
         uint64_t batches = total_batches.load(std::memory_order_relaxed);
@@ -107,6 +109,8 @@ struct alignas(64) QueueMetrics {
         submission_drops = 0;
         pool_resets = 0;
         submission_waits = 0;
+        spin_poll_total_us = 0;
+        spin_poll_count = 0;
     }
 };
 
@@ -257,6 +261,12 @@ private:
     float* staging_obs_buffer_;    // queue_capacity × OBS_SIZE
     float* staging_mask_buffer_;   // queue_capacity × POLICY_SIZE
     std::atomic<int32_t> staging_write_head_{0};
+
+    // Monotonic counter of total submissions (across all workers).
+    // GPU thread spin-polls this (relaxed) to detect when enough leaves
+    // have arrived to fill a batch. alignas(64) prevents false sharing
+    // with staging_write_head_ (which workers write under lock).
+    alignas(64) std::atomic<uint64_t> total_submissions_{0};
 
     // Per-slot ready flags: workers set after memcpy completes (lock-free signaling)
     // GPU thread spin-waits on these before reading staging data

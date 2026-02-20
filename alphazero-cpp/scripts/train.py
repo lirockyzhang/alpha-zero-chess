@@ -16,7 +16,7 @@ Output Directory Structure:
         ├── model_iter_001.pt            # Checkpoints (every N iterations)
         ├── model_iter_005.pt
         ├── model_final.pt               # Final checkpoint
-        ├── training_metrics.json        # Loss, games, moves per iteration
+        ├── training_log.jsonl           # Append-only JSONL: config + per-iteration metrics
         ├── summary.html                 # Training summary (default, unless --no-visualization)
         └── evaluation_results.json      # Evaluation metrics per checkpoint
 
@@ -597,25 +597,109 @@ def parse_resume_path(resume_arg: str) -> Tuple[str, Optional[str]]:
     return run_dir, checkpoint_path
 
 
-def load_metrics_history(run_dir: str) -> Dict[str, Any]:
-    """Load training metrics history from a run directory.
+def append_training_log(run_dir: str, record: Dict[str, Any]):
+    """Append one JSON record to training_log.jsonl (crash-safe).
 
-    Args:
-        run_dir: Path to the run directory
+    Each call writes a single compact JSON line followed by newline,
+    then flushes and fsyncs so the record survives process crashes.
+    """
+    log_path = os.path.join(run_dir, "training_log.jsonl")
+    with open(log_path, 'a') as f:
+        f.write(json.dumps(record, separators=(',', ':')) + '\n')
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def load_training_log(run_dir: str) -> tuple:
+    """Load training log from JSONL (or legacy JSON fallback).
 
     Returns:
-        Metrics history dictionary
+        (config_record, iteration_list) — config may be {} if absent.
     """
-    metrics_path = os.path.join(run_dir, "training_metrics.json")
-    if os.path.exists(metrics_path):
+    log_path = os.path.join(run_dir, "training_log.jsonl")
+    if os.path.exists(log_path):
+        config_record = {}
+        iterations = []
+        with open(log_path, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    if rec.get("type") == "config":
+                        config_record = rec
+                    elif rec.get("type") == "iteration":
+                        iterations.append(rec)
+                except (json.JSONDecodeError, ValueError):
+                    print(f"  Warning: Skipping malformed line {line_num} in training_log.jsonl")
+        return config_record, iterations
+
+    # Fallback: read legacy training_metrics.json
+    legacy_path = os.path.join(run_dir, "training_metrics.json")
+    if os.path.exists(legacy_path):
         try:
-            with open(metrics_path, 'r') as f:
+            with open(legacy_path, 'r') as f:
                 data = json.load(f)
                 if isinstance(data, dict):
-                    return data
+                    config_record = {"type": "config"}
+                    config_record.update(data.get("config", {}))
+                    iterations = data.get("iterations", [])
+                    # Tag legacy records with type for consistency
+                    for rec in iterations:
+                        rec.setdefault("type", "iteration")
+                    return config_record, iterations
         except (json.JSONDecodeError, ValueError):
-            print(f"  Warning: Could not parse {metrics_path}, starting fresh")
-    return {"iterations": [], "config": {}}
+            print(f"  Warning: Could not parse {legacy_path}")
+
+    return {}, []
+
+
+def truncate_training_log(run_dir: str, start_iter: int) -> int:
+    """Remove iteration records >= start_iter from training_log.jsonl.
+
+    Rewrites via temp file + os.replace() for atomicity.
+    Preserves the config record.
+
+    Returns:
+        Number of iteration records removed.
+    """
+    log_path = os.path.join(run_dir, "training_log.jsonl")
+    if not os.path.exists(log_path):
+        return 0
+
+    kept_lines = []
+    removed = 0
+    with open(log_path, 'r') as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                rec = json.loads(stripped)
+                if rec.get("type") == "iteration" and rec.get("iteration", 0) >= start_iter:
+                    removed += 1
+                    continue
+            except (json.JSONDecodeError, ValueError):
+                pass  # Keep malformed lines (don't silently discard)
+            kept_lines.append(stripped + '\n')
+
+    if removed > 0:
+        tmp_path = log_path + ".tmp"
+        with open(tmp_path, 'w') as f:
+            f.writelines(kept_lines)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, log_path)
+
+    return removed
+
+
+def write_config_record(run_dir: str, config: Dict[str, Any]):
+    """Write a config record as the first line of training_log.jsonl (new runs only)."""
+    record = {"type": "config"}
+    record.update(config)
+    append_training_log(run_dir, record)
 
 
 def safe_torch_save(obj: dict, path: str):
@@ -629,44 +713,6 @@ def safe_torch_save(obj: dict, path: str):
     torch.save(obj, tmp_path)
     # On Windows, os.replace is atomic if src and dst are on the same volume
     os.replace(tmp_path, path)
-
-
-def save_metrics_history(run_dir: str, metrics_history: Dict[str, Any]):
-    """Save training metrics history to a run directory.
-
-    Args:
-        run_dir: Path to the run directory
-        metrics_history: Metrics history dictionary
-    """
-    metrics_path = os.path.join(run_dir, "training_metrics.json")
-    with open(metrics_path, 'w') as f:
-        json.dump(metrics_history, f, indent=2)
-
-
-def truncate_history_to_iteration(
-    metrics_history: Dict[str, Any],
-    start_iter: int
-) -> int:
-    """Truncate metrics history to discard records from reverted iterations.
-
-    When resuming from an earlier checkpoint (e.g., after model collapse),
-    records at or after start_iter are stale and should be removed so new
-    training data replaces them cleanly.
-
-    Args:
-        metrics_history: Training metrics dictionary (modified in-place)
-        start_iter: First iteration that will be (re-)trained; records with
-                    iteration >= start_iter are discarded
-
-    Returns:
-        Number of metrics records removed
-    """
-    old_metrics = metrics_history.get("iterations", [])
-    new_metrics = [r for r in old_metrics if r.get("iteration", 0) < start_iter]
-    metrics_removed = len(old_metrics) - len(new_metrics)
-    metrics_history["iterations"] = new_metrics
-
-    return metrics_removed
 
 
 # =============================================================================
@@ -1313,6 +1359,67 @@ def calibrate_cuda_graphs(
     }
 
 
+def collect_hardware_stats(coordinator, batch_size_histogram, cuda_graph_stats, device):
+    """Merge C++ live stats + Python-side metrics into a unified hardware dict.
+
+    Aggregates two sources that are otherwise inaccessible at the metrics
+    append site: C++ atomic counters (via coordinator.get_live_stats()) and
+    Python-side closure variables (batch histogram, CUDA graph routing, GPU mem).
+    """
+    hw = {}
+
+    # --- From coordinator.get_live_stats() (C++ side) ---
+    try:
+        stats = coordinator.get_live_stats()
+    except Exception:
+        stats = {}
+
+    hw["gpu_wait_ms"]           = stats.get("gpu_wait_ms", 0.0)
+    hw["worker_wait_ms"]        = stats.get("worker_wait_ms", 0.0)
+    hw["batch_fill_ratio"]      = stats.get("batch_fill_ratio", 0.0)
+    hw["pool_exhaustion_count"] = stats.get("pool_exhaustion_count", 0)
+    hw["submission_drops"]      = stats.get("submission_drops", 0)
+    hw["root_retries"]          = stats.get("root_retries", 0)
+    hw["avg_search_depth"]      = stats.get("avg_search_depth", 0.0)
+    hw["max_search_depth"]      = stats.get("max_search_depth", 0)
+    hw["nn_evals_per_sec"]      = stats.get("nn_evals_per_sec", 0.0)
+    hw["positions_per_sec"]     = stats.get("moves_per_sec", 0.0)
+
+    # --- From batch_size_histogram (Python side) ---
+    counts = batch_size_histogram.get("counts", {})
+    if counts:
+        all_sizes = []
+        for sz, cnt in counts.items():
+            all_sizes.extend([int(sz)] * cnt)
+        all_sizes.sort()
+        hw["batch_count"]    = len(all_sizes)
+        hw["batch_size_min"] = all_sizes[0]
+        hw["batch_size_max"] = all_sizes[-1]
+        hw["batch_fill_p50"] = all_sizes[len(all_sizes) // 2]
+        hw["batch_fill_p90"] = all_sizes[int(len(all_sizes) * 0.9)]
+
+    # --- From cuda_graph_stats (Python side) ---
+    total_fires = sum(cuda_graph_stats.get(k, 0) for k in
+        ["large_graph_fires", "medium_graph_fires", "small_graph_fires",
+         "mini_graph_fires", "eager_fires"])
+    if total_fires > 0:
+        hw["cuda_large_fires"]  = cuda_graph_stats.get("large_graph_fires", 0)
+        hw["cuda_small_fires"]  = (cuda_graph_stats.get("small_graph_fires", 0)
+                                   + cuda_graph_stats.get("mini_graph_fires", 0))
+        hw["cuda_eager_fires"]  = cuda_graph_stats.get("eager_fires", 0)
+        graph_fires = total_fires - hw["cuda_eager_fires"]
+        hw["cuda_graph_pct"]    = round(100.0 * graph_fires / total_fires, 1)
+        total_ms = cuda_graph_stats.get("total_infer_time_ms", 0.0)
+        hw["avg_inference_ms"]  = round(total_ms / total_fires, 2)
+
+    # --- GPU memory (Python side, torch.cuda) ---
+    if device == "cuda":
+        hw["gpu_memory_allocated_mb"] = round(torch.cuda.memory_allocated() / (1024*1024), 1)
+        hw["gpu_memory_reserved_mb"]  = round(torch.cuda.memory_reserved() / (1024*1024), 1)
+
+    return hw
+
+
 def run_parallel_selfplay(
     network: nn.Module,
     replay_buffer,
@@ -1321,7 +1428,7 @@ def run_parallel_selfplay(
     iteration: int,
     progress_callback=None,
     live_dashboard=None,
-) -> IterationMetrics:
+):
     """Run parallel self-play using cross-game batching.
 
     This achieves 2-5x higher GPU utilization by:
@@ -1338,7 +1445,7 @@ def run_parallel_selfplay(
         live_dashboard: Optional live dashboard for real-time updates
 
     Returns:
-        IterationMetrics with self-play statistics
+        Tuple of (IterationMetrics, sample_game_dict, hw_stats_dict)
     """
     network.eval()
     metrics = IterationMetrics(iteration=iteration)
@@ -1918,7 +2025,7 @@ def run_parallel_selfplay(
     if result is None:
         # Interrupted before any results - return minimal metrics
         metrics.selfplay_time = time.time() - selfplay_start
-        return metrics
+        return metrics, None, {}
     elif isinstance(result, dict):
         # Check for C++ thread errors surfaced from the coordinator
         if result.get('cpp_error'):
@@ -2023,7 +2130,10 @@ def run_parallel_selfplay(
     except Exception:
         pass
 
-    return metrics, sample_game
+    # Collect hardware/performance stats from both C++ and Python sources
+    hw_stats = collect_hardware_stats(coordinator, batch_size_histogram, cuda_graph_stats, device)
+
+    return metrics, sample_game, hw_stats
 
 
 # =============================================================================
@@ -2395,7 +2505,6 @@ Examples:
     # ==========================================================================
     # Determine run directory: either resume from existing or create new
     start_iter = 0
-    metrics_history = {"iterations": [], "config": {}}
 
     if args.resume:
         # Resume from existing run
@@ -2408,10 +2517,26 @@ Examples:
             sys.exit(1)
         print(f"Resuming from: {run_dir}", flush=True)
 
-        # Load existing metrics history
-        print("  Loading metrics history...", end=" ", flush=True)
-        metrics_history = load_metrics_history(run_dir)
-        print(f"done ({len(metrics_history['iterations'])} iterations)", flush=True)
+        # Load training log (JSONL or legacy JSON fallback)
+        print("  Loading training log...", end=" ", flush=True)
+        loaded_config, loaded_iterations = load_training_log(run_dir)
+        print(f"done ({len(loaded_iterations)} iterations)", flush=True)
+
+        # One-time migration: if only legacy JSON exists, convert to JSONL
+        jsonl_path = os.path.join(run_dir, "training_log.jsonl")
+        legacy_path = os.path.join(run_dir, "training_metrics.json")
+        if not os.path.exists(jsonl_path) and os.path.exists(legacy_path):
+            print("  Migrating training_metrics.json -> training_log.jsonl...", end=" ", flush=True)
+            # Batch-write all records in a single open/flush/fsync (avoid per-record fsync)
+            with open(jsonl_path, 'w') as f:
+                if loaded_config:
+                    f.write(json.dumps(loaded_config, separators=(',', ':')) + '\n')
+                for rec in loaded_iterations:
+                    rec.setdefault("type", "iteration")
+                    f.write(json.dumps(rec, separators=(',', ':')) + '\n')
+                f.flush()
+                os.fsync(f.fileno())
+            print(f"done ({len(loaded_iterations)} records migrated)")
     else:
         # Create new run directory
         os.makedirs(args.save_dir, exist_ok=True)
@@ -2419,7 +2544,7 @@ Examples:
         checkpoint_path = None
         print(f"Created run directory: {run_dir}")
 
-    # Store config in metrics history
+    # Config dict (used for display, dashboard, and JSONL config record)
     config = {
         "filters": args.filters,
         "blocks": args.blocks,
@@ -2431,7 +2556,10 @@ Examples:
         "train_batch": args.train_batch,
         "epochs": args.epochs,
     }
-    metrics_history["config"] = config
+
+    # Write config record for new runs (resume already has one)
+    if not args.resume:
+        write_config_record(run_dir, config)
 
     # Print configuration
     print("=" * 70)
@@ -2576,12 +2704,10 @@ Examples:
         if not buffer_loaded:
             print("  No replay buffer file found (starting with empty buffer)")
 
-        # Truncate metrics history to discard records from reverted iterations
-        metrics_removed = truncate_history_to_iteration(metrics_history, start_iter)
+        # Truncate training log to discard records from reverted iterations
+        metrics_removed = truncate_training_log(run_dir, start_iter)
         if metrics_removed > 0:
-            print(f"  Truncated metrics: kept {len(metrics_history['iterations'])} of "
-                  f"{len(metrics_history['iterations']) + metrics_removed} records")
-            save_metrics_history(run_dir, metrics_history)
+            print(f"  Truncated training log: removed {metrics_removed} records >= iteration {start_iter}")
 
     # Create evaluator and self-play (only needed for sequential mode)
     evaluator = None
@@ -2811,9 +2937,8 @@ Examples:
         # Save replay buffer
         save_replay_buffer()
 
-        # Save metrics history
-        save_metrics_history(run_dir, metrics_history)
-        print(f"  Saved metrics to: {run_dir}")
+        # Note: training_log.jsonl is already flushed+fsynced per append — no extra save needed
+        print(f"  Training log already persisted (JSONL append-only)")
 
         # Save Claude resume summary (if enabled)
         if claude_iface is not None:
@@ -3019,7 +3144,7 @@ Examples:
             # ================================================================
             # Uses ParallelSelfPlayCoordinator for high GPU utilization
             # All games run concurrently, NN evals batched across games
-            parallel_metrics, sample_game = run_parallel_selfplay(
+            parallel_metrics, sample_game, hw_stats = run_parallel_selfplay(
                 network=network,
                 replay_buffer=replay_buffer,
                 device=device,
@@ -3054,7 +3179,7 @@ Examples:
                           f"({fillup_rounds * args.games_per_iter} games), training with available data")
                     break
                 print(f"  Buffer fill-up: {fillup_reason()}, playing {args.games_per_iter} more games...")
-                extra_metrics, _ = run_parallel_selfplay(
+                extra_metrics, _, _ = run_parallel_selfplay(
                     network=network,
                     replay_buffer=replay_buffer,
                     device=device,
@@ -3247,6 +3372,7 @@ Examples:
 
             # Make sample_game available for claude logging
             sample_game = seq_sample_game
+            hw_stats = {}  # No hardware metrics in sequential mode
 
         # Create selfplay_done safety lock (before training begins)
         selfplay_done_path = None
@@ -3333,13 +3459,16 @@ Examples:
         metrics_tracker.add_iteration(metrics)
         metrics_tracker.print_iteration_summary(metrics, args)
 
-        # Append to metrics history (for JSON persistence)
-        metrics_history["iterations"].append({
+        # Append iteration record to JSONL (crash-safe, no in-memory dict)
+        record = {
+            "type": "iteration",
             "iteration": iteration + 1,
             "timestamp": datetime.now().isoformat(),
+            # Training losses
             "loss": metrics.loss,
             "policy_loss": metrics.policy_loss,
             "value_loss": metrics.value_loss,
+            # Self-play game stats
             "games": metrics.num_games,
             "moves": metrics.total_moves,
             "simulations": metrics.total_simulations,
@@ -3360,7 +3489,15 @@ Examples:
             "train_time": metrics.train_time,
             "total_time": metrics.total_time,
             "per_beta": metrics.per_beta,
-        })
+            # Training diagnostics
+            "risk_beta": metrics.risk_beta,
+            "grad_norm_avg": metrics.grad_norm_avg,
+            "grad_norm_max": metrics.grad_norm_max,
+            "learning_rate": optimizer.param_groups[0]['lr'],
+        }
+        # Merge hardware/performance stats (empty dict in sequential mode)
+        record.update(hw_stats)
+        append_training_log(run_dir, record)
 
         # Log iteration to Claude JSONL (if enabled)
         if claude_iface is not None:
@@ -3439,9 +3576,7 @@ Examples:
             }, checkpoint_save_path)
             print(f"  Saved checkpoint: {checkpoint_save_path}")
 
-            # Save training metrics JSON
-            save_metrics_history(run_dir, metrics_history)
-            print(f"  Saved training metrics: {os.path.join(run_dir, 'training_metrics.json')}")
+            # Note: training_log.jsonl already flushed per-iteration (no batch save needed)
 
             # Generate summary.html (at save_interval)
             if not args.no_visualization:

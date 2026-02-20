@@ -178,21 +178,20 @@ int GlobalEvaluationQueue::submit_for_evaluation(
         // until the GPU explicitly lifts the flag at 50% capacity, giving the
         // GPU "clean air" to process with zero submission contention.
         if (timeout_ms > 0) {
-            int current_head = staging_write_head_.load(std::memory_order_relaxed);
-            if (current_head + num_leaves > static_cast<int>(queue_capacity_)) {
-                // Queue is full — activate cool-down
+            // Loop ensures workers that wake from cooldown but find the queue
+            // full again (thundering herd after notify_all) go back to sleep
+            // rather than falling through to the slot-claiming code and dropping.
+            while (staging_write_head_.load(std::memory_order_relaxed) + num_leaves
+                   > static_cast<int>(queue_capacity_))
+            {
                 cooldown_active_.store(true, std::memory_order_release);
                 metrics_.submission_waits.fetch_add(1, std::memory_order_relaxed);
 
-                // Block until GPU drains queue and lifts cooldown, or shutdown.
-                // No timeout — workers wait as long as needed rather than dropping evals.
                 queue_space_cv_.wait(lock, [this]() {
                     return !cooldown_active_.load(std::memory_order_acquire) ||
                            shutdown_.load(std::memory_order_acquire);
                 });
 
-                // If woken by shutdown, exit immediately — don't claim slots
-                // for requests that will never be evaluated.
                 if (shutdown_.load(std::memory_order_acquire)) {
                     return 0;
                 }
@@ -226,6 +225,7 @@ int GlobalEvaluationQueue::submit_for_evaluation(
         }
 
         metrics_.total_requests_submitted.fetch_add(actual_leaves, std::memory_order_relaxed);
+        total_submissions_.fetch_add(actual_leaves, std::memory_order_relaxed);
 
         if (actual_leaves < num_leaves && actual_leaves > 0) {
             metrics_.partial_submissions.fetch_add(1, std::memory_order_relaxed);
@@ -469,17 +469,16 @@ int GlobalEvaluationQueue::collect_batch(
             }
         }
 
-        // TWO-PHASE WAIT with stall detection (UNCHANGED — it works well).
+        // MULTI-PHASE BATCH COLLECTION:
         //
-        // Phase 1: Wait for ANY request (full timeout).
-        //   Handles the idle GPU case (between iterations, shutdown).
-        //
-        // Phase 2: Stall-detecting accumulation.
-        //   Keep waiting as long as workers are actively submitting
-        //   (queue growing). Once no new submissions arrive within 1ms,
-        //   fire immediately with whatever we have.
+        // Phase 1a [LOCK]:   CV wait for first request (full timeout).
+        //                    Handles the idle GPU case (between iterations, shutdown).
+        // Phase 1b [LOCK]:   Full batch? → skip spin-poll.
+        // Phase 1c [UNLOCK]: Spin-poll total_submissions_ (50µs stall window).
+        //                    Workers can submit freely while GPU spins.
+        // Phase 1d [RE-LOCK]: Extract metadata from staged_requests_.
 
-        // Phase 1: Wait for at least 1 request
+        // Phase 1a: Wait for at least 1 request
         queue_cv_.wait_for(
             lock,
             std::chrono::milliseconds(timeout_ms),
@@ -493,34 +492,72 @@ int GlobalEvaluationQueue::collect_batch(
             return 0;
         }
 
-        // Phase 2: Accumulate while workers are still submitting
-        {
-            auto outer_deadline = std::chrono::steady_clock::now()
-                + std::chrono::milliseconds(timeout_ms);
+        // Phase 1b: Check if batch is already full — skip spin-poll
+        size_t initial_size = staged_requests_.size();
+        bool need_spin = (initial_size < max_batch_size_) &&
+                         !shutdown_.load(std::memory_order_acquire);
 
-            while (staged_requests_.size() < max_batch_size_ &&
-                   std::chrono::steady_clock::now() < outer_deadline &&
-                   !shutdown_.load(std::memory_order_acquire))
-            {
-                size_t prev_size = staged_requests_.size();
+        if (need_spin) {
+            uint64_t snapshot = total_submissions_.load(std::memory_order_relaxed);
+            uint64_t need = max_batch_size_ - initial_size;
 
-                // Wait for a new submission or 1ms stall timeout
-                queue_cv_.wait_for(
-                    lock,
-                    std::chrono::milliseconds(1),
-                    [this, prev_size]() {
-                        return staged_requests_.size() > prev_size ||
-                               staged_requests_.size() >= max_batch_size_ ||
-                               shutdown_.load(std::memory_order_acquire);
+            // Phase 1c: Spin-poll OUTSIDE the lock — workers can submit freely
+            lock.unlock();
+
+            auto spin_start = std::chrono::steady_clock::now();
+            auto stall_start = spin_start;
+            uint64_t last_seen = snapshot;
+            int spin_count = 0;
+            auto outer_deadline = spin_start + std::chrono::milliseconds(timeout_ms);
+
+            // saw_growth defers the now() call to the less-frequent clock check,
+            // avoiding steady_clock overhead (~20-30ns/call) in the hot inner loop.
+            bool saw_growth = false;
+
+            while (std::chrono::steady_clock::now() < outer_deadline) {
+                _mm_pause();
+                ++spin_count;
+
+                // Sample counter every ~16 pauses (~160ns on Skylake).
+                // relaxed is sufficient: this counter is a hint to stop spinning,
+                // not a data synchronization point. The lock.lock() in Phase 1d
+                // provides the acquire barrier before we touch staged_requests_.
+                if ((spin_count & 15) == 0) {
+                    uint64_t cur = total_submissions_.load(std::memory_order_relaxed);
+                    if (cur - snapshot >= need) break;  // full batch
+                    if (cur > last_seen) {
+                        last_seen = cur;
+                        saw_growth = true;
                     }
-                );
+                }
 
-                // Stall detected: no new submissions in 1ms → fire now
-                if (staged_requests_.size() == prev_size) {
-                    break;
+                // Check stall + shutdown every ~256 pauses (~2.5us).
+                // All steady_clock::now() calls consolidated here to minimize
+                // syscall/VDSO overhead (can increase mask to & 511 if jittery).
+                if ((spin_count & 255) == 0) {
+                    if (shutdown_.load(std::memory_order_relaxed)) break;
+                    auto now = std::chrono::steady_clock::now();
+                    if (saw_growth) {
+                        stall_start = now;   // reset stall timer on observed growth
+                        saw_growth = false;
+                    } else if (now - stall_start
+                               > std::chrono::microseconds(50)) {
+                        break;  // 50us stall window — no new submissions
+                    }
                 }
             }
+
+            // Metrics
+            auto spin_elapsed = std::chrono::steady_clock::now() - spin_start;
+            metrics_.spin_poll_total_us.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(spin_elapsed).count(),
+                std::memory_order_relaxed);
+            metrics_.spin_poll_count.fetch_add(1, std::memory_order_relaxed);
+
+            // Phase 1d: Re-acquire lock to extract metadata
+            lock.lock();
         }
+        // Falls through to metadata extraction below
 
         // Collect up to max_batch_size requests — METADATA ONLY
         batch_size = std::min(staged_requests_.size(), max_batch_size_);
@@ -820,6 +857,7 @@ void GlobalEvaluationQueue::reset() {
     batch_mapping_.clear();
     batch_staging_slots_.clear();
     staging_write_head_.store(0, std::memory_order_release);
+    total_submissions_.store(0, std::memory_order_relaxed);
     current_policy_buffer_ = 0;
     needs_compaction_ = false;
     cooldown_active_.store(false, std::memory_order_relaxed);

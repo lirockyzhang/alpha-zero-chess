@@ -1,283 +1,288 @@
-"""Benchmark BatchCoordinator with realistic MCTS workload.
+"""Benchmark ParallelSelfPlayCoordinator with realistic workloads.
 
-This benchmark properly tests the BatchCoordinator by:
-1. Multiple games submitting eval requests concurrently
-2. A batch collector thread collecting batches when threshold is met
-3. Simulated neural network evaluation
-4. Result processing and distribution back to games
+Measures end-to-end throughput of the evaluation queue pipeline:
+  - Workers submit MCTS leaves via submit_for_evaluation()
+  - GPU thread collects batches via collect_batch() (with spin-poll stall detection)
+  - Simulated NN evaluation
+  - Results distributed back to workers
 
-This establishes the baseline for lock-free queue optimization.
+Tests various configurations to show how batch fill, throughput, and spin-poll
+latency change with worker count, search batch size, and GPU latency.
+
+Usage:
+    uv run python alphazero-cpp/tests/benchmark_batch_coordinator_realistic.py
 """
 
 import numpy as np
 import sys
 import os
 import time
-import json
 import threading
-import queue
+import json
 
 # Add build directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'build', 'Release'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'build'))
 
 import alphazero_cpp
 
-class MockNeuralNetwork:
-    """Mock neural network for benchmarking."""
 
-    def __init__(self, eval_time_ms=0.1):
-        self.eval_time_ms = eval_time_ms
+def make_evaluator(latency_ms=0.5):
+    """Create a mock NN evaluator with configurable latency.
 
-    def evaluate_batch(self, fens):
-        """Simulate neural network evaluation."""
-        # Simulate GPU inference time
-        time.sleep(self.eval_time_ms / 1000.0)
+    Returns (evaluator_fn, call_count_ref) where call_count_ref[0]
+    is incremented on each batch evaluation.
+    """
+    call_count = [0]
 
-        # Return mock policy and value for each position
-        batch_size = len(fens)
-        policies = np.random.rand(batch_size, 1858).astype(np.float32)
-        values = np.random.rand(batch_size).astype(np.float32) * 2 - 1  # [-1, 1]
+    def evaluator(obs, masks, batch_size, out_policies=None, out_values=None):
+        call_count[0] += 1
+        if latency_ms > 0:
+            time.sleep(latency_ms / 1000.0)
 
-        return policies, values
+        policies = np.full((batch_size, 4672), 1.0 / 4672, dtype=np.float32)
+        # WDL: slight white advantage
+        wdl = np.zeros((batch_size, 3), dtype=np.float32)
+        wdl[:, 0] = 0.35
+        wdl[:, 1] = 0.40
+        wdl[:, 2] = 0.25
 
-def batch_collector_worker(coordinator, nn_model, stop_event, stats_dict):
-    """Worker thread that collects batches and processes them."""
-    batches_collected = 0
-    total_positions = 0
-    batch_times = []
+        if out_policies is not None and out_values is not None:
+            np.copyto(np.asarray(out_policies), policies)
+            np.copyto(np.asarray(out_values), wdl)
+            return None
+        return policies, wdl
 
-    while not stop_event.is_set():
-        try:
-            # This would normally block until a batch is ready
-            # For benchmark, we'll use a timeout to check stop_event
-            # In real implementation, collect_batch() would block properly
+    return evaluator, call_count
 
-            # Simulate batch collection (in real impl, this would call coordinator.collect_batch())
-            time.sleep(0.001)  # 1ms wait
 
-            # Get coordinator stats to see if there are pending evals
-            stats = coordinator.get_stats()
-            if stats['pending_evals'] == 0:
-                continue
+def benchmark_config(name, num_workers, games_per_worker, simulations,
+                     mcts_batch_size, gpu_batch_size, gpu_timeout_ms=20,
+                     queue_capacity=8192, latency_ms=0.5, use_gumbel=True):
+    """Run a single benchmark configuration and return metrics."""
+    total_games = num_workers * games_per_worker
+    evaluator, call_count = make_evaluator(latency_ms)
 
-            # Simulate collecting a batch
-            batch_start = time.perf_counter()
+    buffer = alphazero_cpp.ReplayBuffer(200000)
 
-            # In real implementation:
-            # batch = coordinator.collect_batch()
-            # For benchmark, we simulate this
-            batch_size = min(stats['pending_evals'], 256)
-
-            # Simulate neural network evaluation
-            fens = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"] * batch_size
-            policies, values = nn_model.evaluate_batch(fens)
-
-            # Simulate result processing
-            # In real implementation:
-            # results = [EvalResult(game_id=i, policy=policies[i], value=values[i]) for i in range(batch_size)]
-            # coordinator.process_results(results)
-
-            batch_elapsed = time.perf_counter() - batch_start
-            batch_times.append(batch_elapsed * 1000)  # Convert to ms
-
-            batches_collected += 1
-            total_positions += batch_size
-
-        except Exception as e:
-            print(f"Batch collector error: {e}")
-            break
-
-    stats_dict['batches_collected'] = batches_collected
-    stats_dict['total_positions'] = total_positions
-    stats_dict['batch_times'] = batch_times
-
-def game_worker(coordinator, game_id, num_simulations, fens, stop_event, stats_dict):
-    """Worker thread simulating a single game doing MCTS."""
-    simulations_done = 0
-    request_times = []
-
-    while simulations_done < num_simulations and not stop_event.is_set():
-        # Select a random position
-        fen = fens[simulations_done % len(fens)]
-
-        # Simulate MCTS tree traversal (select leaf)
-        traversal_start = time.perf_counter()
-        time.sleep(0.00001)  # 10μs of tree traversal
-        traversal_time = time.perf_counter() - traversal_start
-
-        # Submit eval request
-        request_start = time.perf_counter()
-
-        # In real implementation:
-        # coordinator.submit_eval_request(EvalRequest(game_id=game_id, node=node, board=board))
-        # For benchmark, we just measure the overhead
-
-        request_time = time.perf_counter() - request_start
-        request_times.append(request_time * 1000000)  # Convert to μs
-
-        # Wait for result (in real impl, this would be signaled by coordinator)
-        # For benchmark, we simulate this with a small sleep
-        time.sleep(0.0001)  # 100μs wait for result
-
-        simulations_done += 1
-
-    stats_dict[game_id] = {
-        'simulations_done': simulations_done,
-        'avg_request_time_us': np.mean(request_times) if request_times else 0,
-        'total_time_ms': sum(request_times) / 1000,
-    }
-
-def benchmark_coordinator_with_workload(num_games=64, simulations_per_game=100, batch_size=256):
-    """Benchmark the BatchCoordinator with realistic MCTS workload."""
-    print(f"Benchmarking BatchCoordinator with realistic workload:")
-    print(f"  - {num_games} concurrent games")
-    print(f"  - {simulations_per_game} simulations per game")
-    print(f"  - Batch size: {batch_size}")
-    print()
-
-    # Prepare test data
-    fens = [
-        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
-        "rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 2",
-        "rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR b KQkq - 0 2",
-        "rnbqkb1r/ppp1pppp/5n2/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq - 1 3",
-    ]
-
-    # Create coordinator
-    coordinator = alphazero_cpp.BatchCoordinator(
-        batch_size=batch_size,
-        batch_threshold=0.9
+    coordinator = alphazero_cpp.ParallelSelfPlayCoordinator(
+        num_workers=num_workers,
+        games_per_worker=games_per_worker,
+        num_simulations=simulations,
+        mcts_batch_size=mcts_batch_size,
+        gpu_batch_size=gpu_batch_size,
+        gpu_timeout_ms=gpu_timeout_ms,
+        queue_capacity=queue_capacity,
+        use_gumbel=use_gumbel,
+        gumbel_top_k=mcts_batch_size if use_gumbel else 16,
     )
+    coordinator.set_replay_buffer(buffer)
 
-    # Add games
-    for game_id in range(num_games):
-        coordinator.add_game(game_id, fens[0])
+    # Collect live stats in background to capture spin_poll_avg_us over time
+    live_stats_history = []
+    stop_monitoring = threading.Event()
 
-    # Create mock neural network
-    nn_model = MockNeuralNetwork(eval_time_ms=0.1)
+    def monitor():
+        while not stop_monitoring.is_set():
+            try:
+                stats = coordinator.get_live_stats()
+                if stats:
+                    live_stats_history.append(stats)
+            except Exception:
+                pass
+            time.sleep(0.5)
 
-    # Start timer
-    start_time = time.perf_counter()
+    mon = threading.Thread(target=monitor, daemon=True)
+    mon.start()
 
-    # Create stop event
-    stop_event = threading.Event()
+    start = time.perf_counter()
+    result = coordinator.generate_games(evaluator)
+    elapsed = time.perf_counter() - start
 
-    # Launch batch collector thread
-    collector_stats = {}
-    collector_thread = threading.Thread(
-        target=batch_collector_worker,
-        args=(coordinator, nn_model, stop_event, collector_stats)
-    )
-    collector_thread.start()
+    stop_monitoring.set()
+    mon.join(timeout=2)
 
-    # Launch game worker threads
-    game_threads = []
-    game_stats = {}
+    # Extract key metrics
+    games_completed = result.get('games_completed', 0)
+    total_moves = result.get('total_moves', 0)
+    total_batches = result.get('total_batches', 0)
+    avg_batch = result.get('avg_batch_size', 0)
+    total_leaves = result.get('total_leaves', 0)
+    drops = result.get('submission_drops', 0)
+    waits = result.get('submission_waits', 0)
+    pool_exhaust = result.get('pool_exhaustion_count', 0)
 
-    for game_id in range(num_games):
-        thread = threading.Thread(
-            target=game_worker,
-            args=(coordinator, game_id, simulations_per_game, fens, stop_event, game_stats)
-        )
-        game_threads.append(thread)
-        thread.start()
+    # Spin-poll metric from live stats
+    spin_values = [s.get('spin_poll_avg_us', -1) for s in live_stats_history
+                   if 'spin_poll_avg_us' in s and s.get('spin_poll_avg_us', -1) >= 0]
+    spin_avg = np.mean(spin_values) if spin_values else -1
+    spin_last = spin_values[-1] if spin_values else -1
 
-    # Wait for all games to complete
-    for thread in game_threads:
-        thread.join()
-
-    # Stop batch collector
-    stop_event.set()
-    collector_thread.join()
-
-    # End timer
-    elapsed_time = time.perf_counter() - start_time
-
-    # Calculate statistics
-    total_simulations = sum(stats['simulations_done'] for stats in game_stats.values())
-    avg_request_time = np.mean([stats['avg_request_time_us'] for stats in game_stats.values()])
-
-    # Get coordinator stats
-    coord_stats = coordinator.get_stats()
-
-    print(f"Results:")
-    print(f"  Total time: {elapsed_time:.3f}s")
-    print(f"  Total simulations: {total_simulations}")
-    print(f"  Simulations per second: {total_simulations / elapsed_time:.1f}")
-    print(f"  Avg request submission time: {avg_request_time:.3f}μs")
-    print(f"  Batches collected: {collector_stats.get('batches_collected', 0)}")
-    print(f"  Total positions evaluated: {collector_stats.get('total_positions', 0)}")
-    if collector_stats.get('batch_times'):
-        print(f"  Avg batch processing time: {np.mean(collector_stats['batch_times']):.3f}ms")
-    print(f"  Coordinator stats:")
-    print(f"    - Active games: {coord_stats['active_games']}")
-    print(f"    - Pending evals: {coord_stats['pending_evals']}")
-    print(f"    - Batch counter: {coord_stats['batch_counter']}")
-    print()
+    # Throughput
+    batches_per_sec = total_batches / elapsed if elapsed > 0 else 0
+    leaves_per_sec = total_leaves / elapsed if elapsed > 0 else 0
+    moves_per_sec = total_moves / elapsed if elapsed > 0 else 0
+    drop_rate = drops / max(total_leaves + drops, 1)
 
     return {
-        'num_games': num_games,
-        'simulations_per_game': simulations_per_game,
-        'batch_size': batch_size,
-        'total_time_s': elapsed_time,
-        'total_simulations': total_simulations,
-        'simulations_per_second': total_simulations / elapsed_time,
-        'avg_request_time_us': avg_request_time,
-        'batches_collected': collector_stats.get('batches_collected', 0),
-        'total_positions': collector_stats.get('total_positions', 0),
-        'avg_batch_time_ms': np.mean(collector_stats['batch_times']) if collector_stats.get('batch_times') else 0,
-        'coordinator_stats': coord_stats,
+        'name': name,
+        'num_workers': num_workers,
+        'games_per_worker': games_per_worker,
+        'simulations': simulations,
+        'mcts_batch_size': mcts_batch_size,
+        'gpu_batch_size': gpu_batch_size,
+        'latency_ms': latency_ms,
+        'use_gumbel': use_gumbel,
+        'queue_capacity': queue_capacity,
+        # Results
+        'elapsed_s': elapsed,
+        'games_completed': games_completed,
+        'total_games': total_games,
+        'total_moves': total_moves,
+        'total_batches': total_batches,
+        'total_leaves': total_leaves,
+        'avg_batch_size': avg_batch,
+        'batch_fill_pct': (avg_batch / gpu_batch_size * 100) if gpu_batch_size > 0 else 0,
+        'batches_per_sec': batches_per_sec,
+        'leaves_per_sec': leaves_per_sec,
+        'moves_per_sec': moves_per_sec,
+        'submission_drops': drops,
+        'drop_rate_pct': drop_rate * 100,
+        'submission_waits': waits,
+        'pool_exhaustion': pool_exhaust,
+        'spin_poll_avg_us': spin_avg,
+        'spin_poll_last_us': spin_last,
+        'nn_eval_calls': call_count[0],
+        'buffer_samples': buffer.size(),
+        'cpp_error': result.get('cpp_error', ''),
     }
+
+
+def print_result(r):
+    """Pretty-print a single benchmark result."""
+    print(f"\n  {'='*56}")
+    print(f"  {r['name']}")
+    print(f"  {'='*56}")
+    print(f"  Config: {r['num_workers']}w x {r['games_per_worker']}g, "
+          f"sims={r['simulations']}, batch={r['mcts_batch_size']}, "
+          f"gpu_batch={r['gpu_batch_size']}, latency={r['latency_ms']}ms")
+    print(f"  Time: {r['elapsed_s']:.1f}s")
+    print(f"  Games: {r['games_completed']}/{r['total_games']}")
+    print(f"  Throughput:")
+    print(f"    Batches/sec:  {r['batches_per_sec']:>8.1f}")
+    print(f"    Leaves/sec:   {r['leaves_per_sec']:>8.0f}")
+    print(f"    Moves/sec:    {r['moves_per_sec']:>8.1f}")
+    print(f"  Batch fill:     {r['avg_batch_size']:.1f} / {r['gpu_batch_size']} "
+          f"({r['batch_fill_pct']:.1f}%)")
+    print(f"  Spin-poll:      avg={r['spin_poll_avg_us']:.0f}us, "
+          f"last={r['spin_poll_last_us']:.0f}us")
+    print(f"  Pipeline:")
+    print(f"    Drops:        {r['submission_drops']} ({r['drop_rate_pct']:.2f}%)")
+    print(f"    Waits:        {r['submission_waits']}")
+    print(f"    Pool exhaust: {r['pool_exhaustion']}")
+    print(f"    NN calls:     {r['nn_eval_calls']}")
+    if r['cpp_error']:
+        print(f"  ERROR: {r['cpp_error']}")
+
 
 def main():
     print("=" * 70)
-    print("Benchmark: BatchCoordinator with Realistic Workload (Baseline)")
+    print("Benchmark: ParallelSelfPlayCoordinator Pipeline Throughput")
     print("=" * 70)
+    print(f"alphazero_cpp version: {alphazero_cpp.__version__}")
     print()
-    print("This benchmark tests the BatchCoordinator with a realistic MCTS workload:")
-    print("  1. Multiple games submitting eval requests concurrently")
-    print("  2. Batch collector thread collecting and processing batches")
-    print("  3. Simulated neural network evaluation")
-    print("  4. Result distribution back to games")
-    print()
-    print("This establishes the baseline for lock-free queue optimization.")
+    print("Measures end-to-end throughput of the evaluation queue pipeline")
+    print("including the lock-free spin-poll stall detection in collect_batch().")
     print()
 
-    # Test different game counts
-    test_configs = [
-        {'num_games': 32, 'simulations_per_game': 100, 'batch_size': 256},
-        {'num_games': 64, 'simulations_per_game': 100, 'batch_size': 256},
-        {'num_games': 128, 'simulations_per_game': 100, 'batch_size': 256},
-        {'num_games': 256, 'simulations_per_game': 100, 'batch_size': 256},
+    configs = [
+        # Baseline: moderate workers, Gumbel search_batch=16
+        dict(name="Baseline: 16w x 4g, sb=16, Gumbel",
+             num_workers=16, games_per_worker=4, simulations=100,
+             mcts_batch_size=16, gpu_batch_size=512, latency_ms=0.5),
+
+        # Scale workers: 32 workers
+        dict(name="Scale workers: 32w x 2g, sb=16, Gumbel",
+             num_workers=32, games_per_worker=2, simulations=100,
+             mcts_batch_size=16, gpu_batch_size=512, latency_ms=0.5),
+
+        # Scale workers: 48 workers
+        dict(name="Scale workers: 48w x 2g, sb=16, Gumbel",
+             num_workers=48, games_per_worker=2, simulations=80,
+             mcts_batch_size=16, gpu_batch_size=512, latency_ms=0.5),
+
+        # PUCT mode: search_batch=1 (many small submissions)
+        dict(name="PUCT mode: 32w x 2g, sb=1",
+             num_workers=32, games_per_worker=2, simulations=100,
+             mcts_batch_size=1, gpu_batch_size=256, latency_ms=0.3,
+             use_gumbel=False),
+
+        # Low latency: fast GPU
+        dict(name="Low latency: 32w x 2g, sb=16, 0.1ms GPU",
+             num_workers=32, games_per_worker=2, simulations=100,
+             mcts_batch_size=16, gpu_batch_size=512, latency_ms=0.1),
+
+        # Zero latency: stress spin-poll
+        dict(name="Zero latency: 32w x 2g, sb=16, 0ms GPU",
+             num_workers=32, games_per_worker=2, simulations=80,
+             mcts_batch_size=16, gpu_batch_size=512, latency_ms=0),
+
+        # Small queue: backpressure stress
+        dict(name="Small queue: 32w x 2g, sb=16, q=2048",
+             num_workers=32, games_per_worker=2, simulations=80,
+             mcts_batch_size=16, gpu_batch_size=256, queue_capacity=2048,
+             latency_ms=0.5),
+
+        # Max workers: 64 workers
+        dict(name="Max workers: 64w x 1g, sb=16, Gumbel",
+             num_workers=64, games_per_worker=1, simulations=60,
+             mcts_batch_size=16, gpu_batch_size=512, latency_ms=0.5,
+             gpu_timeout_ms=30),
     ]
 
     results = []
+    for config in configs:
+        print(f"\nRunning: {config['name']}...")
+        r = benchmark_config(**config)
+        print_result(r)
+        results.append(r)
 
-    for config in test_configs:
-        print(f"Testing with {config['num_games']} games...")
-        result = benchmark_coordinator_with_workload(**config)
-        results.append(result)
-        print()
+    # Summary table
+    print(f"\n{'='*70}")
+    print(f"SUMMARY TABLE")
+    print(f"{'='*70}")
+    print(f"{'Config':<45} {'Batch/s':>8} {'Leaf/s':>8} {'Fill%':>6} {'Spin':>6}")
+    print(f"{'-'*45} {'-'*8} {'-'*8} {'-'*6} {'-'*6}")
+    for r in results:
+        name = r['name'][:44]
+        print(f"{name:<45} {r['batches_per_sec']:>8.1f} {r['leaves_per_sec']:>8.0f} "
+              f"{r['batch_fill_pct']:>5.1f}% {r['spin_poll_avg_us']:>5.0f}us")
 
     # Save results
-    with open('benchmark_batch_coordinator_realistic_baseline.json', 'w') as f:
-        json.dump(results, f, indent=2)
+    output_path = os.path.join(os.path.dirname(__file__),
+                               'benchmark_results.json')
+    # Convert for JSON serialization (remove non-serializable types)
+    json_results = []
+    for r in results:
+        jr = {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v)
+              for k, v in r.items()}
+        json_results.append(jr)
 
-    print("Results saved to: benchmark_batch_coordinator_realistic_baseline.json")
-    print()
+    with open(output_path, 'w') as f:
+        json.dump(json_results, f, indent=2)
+    print(f"\nResults saved to: {output_path}")
 
-    # Print summary
-    print("=" * 70)
-    print("Summary")
-    print("=" * 70)
-    for result in results:
-        print(f"{result['num_games']} games: {result['simulations_per_second']:.1f} sims/sec, "
-              f"{result['avg_request_time_us']:.3f}μs per request, "
-              f"{result['batches_collected']} batches")
-    print()
+    # Check for failures
+    failures = [r for r in results if r['games_completed'] < r['total_games']]
+    if failures:
+        print(f"\nWARNING: {len(failures)} configs did not complete all games!")
+        for r in failures:
+            print(f"  {r['name']}: {r['games_completed']}/{r['total_games']}")
+        return 1
 
-    return results
+    print(f"\nAll {len(results)} configurations completed successfully.")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

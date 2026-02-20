@@ -130,8 +130,16 @@ target_link_libraries(training PUBLIC
     Threads::Threads
 )
 
-# NOTE: MCTS test executables disabled - they use deprecated API
+# NOTE: Old MCTS test executables disabled - they use deprecated API
 # Use alphazero-cpp/scripts/test_performance.py instead for testing
+
+# Virtual visits test (current API)
+add_executable(virtual_visits_test tests/virtual_visits_test.cpp)
+target_link_libraries(virtual_visits_test PRIVATE mcts_core encoding)
+target_include_directories(virtual_visits_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/chess-library/include
+)
 
 # Python bindings with pybind11
 find_package(Python COMPONENTS Interpreter Development)
