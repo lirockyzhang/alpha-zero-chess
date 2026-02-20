@@ -30,6 +30,9 @@ void Reanalyzer::set_indices(const std::vector<size_t>& indices) {
 }
 
 void Reanalyzer::start() {
+    // Guard against double-start: join any existing workers first
+    wait();
+
     shutdown_.store(false, std::memory_order_release);
     work_cursor_.store(0, std::memory_order_release);
     eval_queue_.reset();
@@ -39,7 +42,6 @@ void Reanalyzer::start() {
         last_error_.clear();
     }
 
-    worker_threads_.clear();
     worker_threads_.reserve(config_.num_workers);
     for (int i = 0; i < config_.num_workers; ++i) {
         worker_threads_.emplace_back(&Reanalyzer::worker_func, this, i);
@@ -70,7 +72,10 @@ void Reanalyzer::worker_func(int worker_id) {
     try {
         mcts::NodePool node_pool;
 
-        // Pre-allocate buffers
+        // Pre-allocate buffers — sized for single-leaf evaluation only.
+        // Reanalysis always processes one leaf at a time (hardcoded at collect_leaves
+        // call below). config_.mcts_batch_size controls the search batch for Sequential
+        // Halving rounds but leaf collection is single-leaf for simplicity.
         std::vector<float> obs_buffer(encoding::PositionEncoder::TOTAL_SIZE);
         std::vector<float> mask_buffer(encoding::MoveEncoder::POLICY_SIZE);
         std::vector<float> policy_buffer(encoding::MoveEncoder::POLICY_SIZE);
@@ -113,6 +118,10 @@ void Reanalyzer::worker_func(int worker_id) {
 
             // Read stored observation (full history encoding from original game)
             const float* stored_obs = buffer_.get_observation_ptr(index);
+            if (!stored_obs) {
+                stats_.positions_skipped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
             std::memcpy(obs_buffer.data(), stored_obs,
                         encoding::PositionEncoder::TOTAL_SIZE * sizeof(float));
 
@@ -263,10 +272,10 @@ void Reanalyzer::worker_func(int worker_id) {
         shutdown_.store(true, std::memory_order_release);
     }
 
-    workers_active_.fetch_sub(1, std::memory_order_relaxed);
-
     // Last worker signals that reanalysis is done
-    if (workers_active_.load(std::memory_order_acquire) == 0) {
+    // Use acq_rel + return value to avoid TOCTOU race (fetch_sub + separate load)
+    int prev = workers_active_.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev == 1) {
         eval_queue_.shutdown();
     }
 }

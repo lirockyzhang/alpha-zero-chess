@@ -593,7 +593,7 @@ void ReplayBuffer::update_priorities(
 #pragma pack(push, 1)
 struct RpbfHeader {
     char magic[4];          // "RPBF"
-    uint32_t version;       // 2
+    uint32_t version;       // 3 = PER priorities, 4 = FEN + Zobrist hashes
     uint64_t capacity;
     uint64_t num_samples;
     uint64_t write_pos;

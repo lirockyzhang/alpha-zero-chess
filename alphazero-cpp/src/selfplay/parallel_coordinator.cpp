@@ -231,12 +231,12 @@ void ParallelSelfPlayCoordinator::worker_thread_func(int worker_id) {
         shutdown_.store(true, std::memory_order_release);
     }
 
-    workers_active_.fetch_sub(1, std::memory_order_relaxed);
-
     // If this is the last self-play worker:
     // - Always shut down primary queue (no more self-play leaves)
     // - GPU thread stays alive if secondary queue is connected (reanalysis continues)
-    if (workers_active_.load(std::memory_order_acquire) == 0) {
+    // Use acq_rel + return value to avoid TOCTOU race (fetch_sub + separate load)
+    int prev_active = workers_active_.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev_active == 1) {
         eval_queue_.shutdown();
     }
 }
@@ -261,6 +261,11 @@ void ParallelSelfPlayCoordinator::gpu_thread_func() {
             }
 
             // === Secondary queue (reanalysis, fills spare capacity) ===
+            // IMPORTANT: secondary queue's gpu_batch_size MUST equal the primary's.
+            // collect_batch dequeues up to max_batch_size items; if we cap with sec_max,
+            // excess dequeued items would be lost (workers timeout). With equal batch
+            // sizes, collect_batch never returns more than gpu_batch_size total, and
+            // sec_max = gpu_batch_size - primary_count, so no excess is possible.
             int secondary_count = 0;
             auto* sec_queue = secondary_queue_.load(std::memory_order_acquire);
             if (sec_queue && !sec_queue->is_shutdown()) {
