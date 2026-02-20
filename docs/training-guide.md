@@ -140,6 +140,13 @@ Parameters are grouped by which phase of training they affect:
 | `--priority-exponent` | 0.0 | Priority exponent α (0=uniform/disabled, 0.6=recommended) |
 | `--per-beta` | 0.4 | IS correction β (0=none, 0.4=moderate, 1.0=full). See operation manual Section 10q |
 
+#### MCTS Reanalysis
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--reanalyze-fraction` | 0.0 | Fraction of buffer to reanalyze each iteration (0=disabled, 0.25=recommended) |
+| `--reanalyze-simulations-ratio` | 0.25 | Reanalysis sims as fraction of self-play sims |
+| `--reanalyze-workers` | 0 | Reanalysis workers (0=auto: half of self-play workers) |
+
 #### Visualization & Evaluation
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -297,6 +304,11 @@ Each training iteration follows this flow:
 │     └────────────────────────────────────────────────────────────────┘  │
 │                                                                          │
 │     Store results in REPLAY BUFFER (--buffer-size)                       │
+│                                                                          │
+│  1b. CONCURRENT REANALYSIS (optional, --reanalyze-fraction > 0)          │
+│      Re-search existing buffer positions with current network            │
+│      Shares GPU thread with self-play (fills spare batch capacity)       │
+│      Updates policy targets only (value/WDL stays as game outcome)       │
 │                                                                          │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  4. TRAINING PHASE                                                       │
@@ -1144,6 +1156,16 @@ evaluate.py --checkpoint checkpoints/f192-b15_.../model_final.pt --opponent rand
 | Parallel Eval | `--eval-batch` | auto | Auto-computed GPU batch size (workers x search_batch, rounded to 32) |
 | Training | `--train-batch` | 256 | Samples per gradient step |
 
+### New in v4.0
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| MCTS Reanalysis | `--reanalyze-fraction 0` (disabled) | Re-search buffer positions concurrently with self-play. Enable with `--reanalyze-fraction 0.25` |
+| FEN + Zobrist storage | Auto when reanalysis enabled | Stores FEN strings and 8 Zobrist hashes per sample for position reconstruction |
+| Dual-queue GPU thread | Auto | Reanalysis fills spare GPU batch capacity during self-play (zero additional wall-clock time) |
+| RPBF v4 format | Auto | Buffer files include FEN + hash sections when FEN storage enabled |
+| Coordinator lifecycle split | New API | `start_generation` / `wait_for_workers` / `shutdown_gpu_thread` for concurrent workloads |
+
 ### New in v3.1
 
 | Feature | Default | Description |
@@ -1183,7 +1205,7 @@ evaluate.py --checkpoint checkpoints/f192-b15_.../model_final.pt --opponent rand
 
 ---
 
-**Last Updated**: 2026-02-18
+**Last Updated**: 2026-02-19
 
 
 │ GPU Batch Collection & Evaluation Pipeline Redesign                                                                           │

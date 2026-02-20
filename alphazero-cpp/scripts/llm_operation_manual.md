@@ -237,6 +237,9 @@ To change them, stop training and restart with `--resume`:
 | `--workers` | int | Number of parallel self-play workers |
 | `--priority-exponent` | float | PER priority exponent α (default 0.0=disabled, 0.6=recommended). Allocates sum-tree on startup. |
 | `--per-beta` | float | PER IS correction β (default 0.4). Fixed value, not annealed. See Section 10q for selection guide. |
+| `--reanalyze-fraction` | float | Fraction of buffer to reanalyze each iteration (default 0.0=disabled, 0.25=recommended). Enables FEN storage on startup. See Section 10r. |
+| `--reanalyze-simulations-ratio` | float | Reanalysis sims as fraction of self-play sims (default 0.25). |
+| `--reanalyze-workers` | int | Number of reanalysis workers (default 0=auto: half of self-play workers). |
 
 **CRITICAL: `--resume` does NOT preserve CLI arguments.** When using `--resume`, you MUST re-specify ALL parameters (`--filters`, `--blocks`, `--se-reduction`, `--workers`, `--simulations`, `--search-algorithm`, `--train-batch`, `--epochs`, `--games-per-iter`, etc.). Only the model weights, optimizer state, and replay buffer are loaded from the checkpoint. Omitting parameters causes them to revert to defaults (e.g., workers=1, simulations=800, train_batch=256), which can silently produce terrible results.
 
