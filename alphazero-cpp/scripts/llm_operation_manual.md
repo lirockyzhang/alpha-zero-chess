@@ -135,6 +135,23 @@ Written on shutdown when `--claude` is enabled. Contains:
 
 ## 3. Taking Action
 
+> **CRITICAL — DO NOT EDIT SCRIPTS**
+>
+> You must **never** modify `train.py`, `monitor_iteration.py`, or any other
+> source code / script file. Your interaction with training is strictly through
+> control files. The **only** files you may write are:
+>
+> | Permitted Write | Purpose |
+> |-----------------|---------|
+> | `param_updates.json` | Hot-reload hyperparameters (see 3a) |
+> | `claude_decisions.md` | Log your reasoning and decisions (see Section 7) |
+> | Delete `selfplay_done` | Signal that you have reviewed self-play (see 3b) |
+> | Delete `awaiting_review` | Signal that training may resume (see 3b) |
+> | Create `stop` | Request a graceful training shutdown |
+>
+> Everything else is **read-only**. If you believe a code change is needed,
+> document it in `claude_decisions.md` and flag it for human review.
+
 ### 3a. Parameter Updates (Hot-Reload)
 
 Write a JSON file using atomic rename:
@@ -345,6 +362,10 @@ Create this file on first change; append for subsequent changes.
 Training blocks after each iteration, waiting for your review.
 Two signal files must both be deleted to resume (dual-signal safety).
 Repeat this synchronous loop:
+
+> **Reminder:** This workflow is **read-only with respect to all scripts and
+> source code.** You read logs/metrics and write only the control files listed
+> in Section 3 (`param_updates.json`, `claude_decisions.md`, signal files).
 
 1. **Wait** for `<run_dir>/awaiting_review` to appear
 2. **Read** the latest iteration:

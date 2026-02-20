@@ -20,7 +20,4 @@ logs/
 *.rpbf
 
 # checkpoints
-checkpoints/
-
-# worktrees
-.worktrees/
+checkpoints/.worktrees/

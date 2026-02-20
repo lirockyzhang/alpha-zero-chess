@@ -327,6 +327,18 @@ Only enter this phase if ELO 2300-2400 reached but not 2500 yet.
 
 #### The Review Loop
 
+> **CRITICAL — DO NOT EDIT SCRIPTS**
+>
+> During the review loop the autonomous trainer must **never** modify
+> `train.py`, `monitor_iteration.py`, or any other source code. Its only
+> permitted write actions are:
+> - `param_updates.json` — hot-reload hyperparameters
+> - `claude_decisions.md` — decision log
+> - Signal file management (`selfplay_done` / `awaiting_review` deletion, `stop` creation)
+>
+> If a code change appears necessary, log the recommendation in
+> `claude_decisions.md` and flag it for human review.
+
 For each training iteration:
 
 **1. Launch training** with `--claude` flag (see phase launch commands above).
@@ -488,7 +500,7 @@ Buffet (temp=80) on a draw-biased model produced 99% draws and collapsed value_l
 
 ---
 
-### Run 2: Fresh Buffet Start (planned, not yet executed)
+### Run 2: Fresh Buffet Start (preliminary test only)
 
 **Date:** 2026-02-18 (preliminary test only)
 **Phase:** Phase 1 (Buffet) — fresh start from random weights
@@ -511,6 +523,93 @@ Buffet (temp=80) on a draw-biased model produced 99% draws and collapsed value_l
 
 ---
 
+### Run 3: `f256-b20-se4_2026-02-18_23-43-17`
+
+**Date:** 2026-02-18 to 2026-02-19
+**Phase:** Phase 1 (Buffet) — fresh start from random weights, full training run
+**Starting point:** Random initialization
+
+**Parameters (Planned vs Actual):**
+
+| Parameter | Planned | Actual | Note |
+|-----------|---------|--------|------|
+| `simulations` | 64 | 64 | Match |
+| `temperature_moves` | 80 | 80 (→50 at iter 14) | Match initially, lowered during recovery |
+| `games_per_iter` | 128 | **64** | Half the planned games — fewer decisive samples per iteration |
+| `workers` | 32 | 32 | Match |
+| `train_batch` | 1024 | 1024 | Match |
+| `epochs` | 1 | 1 | Match |
+| `lr` | 0.001 | 0.001 | Match |
+| `risk_beta` | 0 | 0 (→0.3 at iter 14) | Applied during recovery attempt |
+| PER | disabled | **enabled (α=0.6, β=0.4)** | Deviation — not planned for Phase 1 |
+| `claude_timeout` | 1800 | **3600** | Longer review window |
+
+**Iteration Data:**
+
+| Iter | Loss | Policy | Value | W | B | D | Draw% | 50-move | Rep | AvgLen | Notes |
+|------|------|--------|-------|---|---|---|-------|---------|-----|--------|-------|
+| 1 | 9.65 | 8.47 | 1.18 | 3 | 3 | 58 | 90.6% | 13 | 8 | 313 | Initial random play |
+| 2 | 5.94 | 8.37 | 0.83 | 4 | 5 | 55 | 85.9% | 17 | 8 | 348 | Big loss drop |
+| 3 | 5.44 | 8.32 | 0.58 | 5 | 3 | 56 | 87.5% | 15 | 10 | 327 | |
+| 4 | 5.21 | 8.24 | 0.49 | 3 | 10 | 51 | 79.7% | 11 | 5 | 353 | |
+| 5 | 5.04 | 8.19 | 0.43 | 4 | 6 | 54 | 84.4% | 6 | 13 | 329 | Buffer full (100K) |
+| 6 | 7.85 | 8.12 | 0.38 | 5 | 6 | 53 | 82.8% | 10 | 14 | 356 | PER loss inflation artifact |
+| 7 | 7.89 | 8.07 | 0.39 | 6 | 10 | 48 | **75.0%** | 9 | 11 | 335 | **Best iteration** — snapshot saved |
+| 8 | 7.84 | 8.01 | 0.44 | 9 | 10 | 45 | **70.3%** | 7 | 15 | 316 | Best draw rate |
+| 9 | 7.53 | 7.95 | 0.45 | 6 | 7 | 51 | 79.7% | 6 | 16 | 354 | |
+| 10 | 7.62 | 7.90 | 0.44 | 6 | 2 | 56 | 87.5% | 14 | 15 | 377 | Draw rate climbing |
+| 11 | 7.34 | 7.85 | 0.48 | 10 | 7 | 47 | 73.4% | 24 | 9 | 343 | Brief recovery |
+| 12 | 7.16 | 7.80 | 0.40 | 4 | 4 | 56 | 87.5% | 15 | 6 | 340 | |
+| 13 | 7.13 | 7.74 | 0.32 | 0 | 0 | 64 | **100%** | 56 | 0 | 353 | **Stagnation onset** |
+| 14 | 6.95 | 7.65 | 0.27 | 0 | 0 | 64 | 100% | 64 | 0 | 315 | Applied temp=50, risk_beta=0.3 |
+| 15 | 6.89 | 7.59 | 0.19 | 0 | 0 | 64 | 100% | 57 | 0 | 368 | Recovery not yet visible |
+| 16 | 6.46 | 7.54 | **0.07** | 0 | 0 | 64 | 100% | 59 | 0 | 387 | **Value head near-collapse** |
+| 17 | 6.23 | 7.45 | 0.15 | 7 | 8 | 49 | 76.6% | 41 | 2 | 383 | Risk_beta shock — brief recovery |
+| 18 | 6.69 | 7.40 | 0.23 | 7 | 3 | 54 | 84.4% | 32 | 10 | 348 | Snapshot saved, training stopped |
+| 19 | 6.68 | 7.34 | 0.30 | 4 | 4 | 56 | 87.5% | 43 | 4 | 398 | Resumed from iter 18 |
+| 20 | 6.35 | 7.29 | 0.31 | 4 | 2 | 58 | 90.6% | 55 | 1 | 467 | Draw rate climbing again |
+| 21 | 6.32 | 7.19 | 0.19 | 0 | 3 | 61 | **95.3%** | 57 | 3 | 504 | **Re-collapse — training stopped** |
+
+**Buffer composition (key moments):**
+- Iter 7 (best): W=3,344 (3.3%) D=89,504 (89.5%) L=7,152 (7.2%)
+- Iter 16 (worst): W=291 (0.3%) D=99,709 (99.7%) L=0 (0%)
+- Iter 21 (final): ~W=3,500 (3.5%) D=94,500 (94.5%) L=2,000 (2.0%)
+
+**Snapshots preserved:**
+- `milestone_iter005_healthy.pt` + `replay_buffer_iter005_healthy.rpbf` — value_loss=0.43, 15.6% decisive
+- `milestone_iter007_best.pt` + `replay_buffer_iter007_best.rpbf` — value_loss=0.39, 25% decisive, best overall health
+- `milestone_iter018_recovery.pt` + `replay_buffer_iter018_recovery.rpbf` — recovery attempt checkpoint
+
+**What happened:**
+
+1. **Iters 1-8 — Healthy training.** Policy loss improved monotonically (8.47 → 8.01). Value loss declined but stayed in healthy range (1.18 → 0.44). Decisive games peaked at 29.7% (iter 8), with draw rate bottoming at 70.3%. The Buffet strategy was working.
+
+2. **Iters 9-12 — Gradual decline.** Draw rate oscillated but trended upward (80% → 88%). Value loss stayed around 0.40-0.48. Fifty-move draws increased (6 → 24 → 15). The model was learning to survive random positions.
+
+3. **Iters 13-16 — Fifty-move stagnation.** Draw rate hit 100% at iter 13, entirely via fifty-move rule (no repetitions — Gumbel prevents those). Value loss collapsed: 0.32 → 0.27 → 0.19 → **0.069**. Applied recovery (temp=50, risk_beta=0.3) at iter 14. Buffer became 99.7% draws at iter 16.
+
+4. **Iters 17-18 — Brief risk_beta recovery.** The risk-seeking shock produced 15 decisive games at iter 17 (best since iter 8). Value loss began recovering (0.07 → 0.15 → 0.23). But this was temporary — the model was adapting to play aggressively without losing.
+
+5. **Iters 19-21 — Recovery failed.** Decisive games declined each iteration (8 → 6 → 3). Value loss plateaued at 0.30 then dropped back to 0.19. Game length ballooned to 504 plies. The model learned to survive risky positions, neutralizing risk_beta's effect. The "too smart to lose, too dumb to win" pattern re-established.
+
+**Why:**
+
+Three compounding factors caused the stagnation:
+
+1. **Low simulations (64) cannot find checkmates.** Delivering checkmate requires 5-10 move tactical sequences. With sims=64, the search sees 2-3 moves ahead — enough to avoid blunders but not to execute mating plans. This is both an exploration problem and a search depth problem.
+
+2. **Defense improves faster than offense.** Avoiding checkmate requires recognizing 1-2 bad moves; delivering checkmate requires coordinating a multi-move plan. The model's defensive skill outpaced its attacking skill, creating the asymmetry.
+
+3. **Fifty-move draws poison the buffer.** Each fifty-move draw trains the value head to predict "draw" for that position. With 90%+ draws in the buffer, the value head converges to predicting draws for everything (value_loss → 0). This creates a death spiral: more draws → more draw predictions → even more draws.
+
+4. **risk_beta provides a temporary shock, not a structural fix.** The ERM mechanism makes the model prefer risky lines, but within 3-4 iterations the policy adapts to play "aggressive defense" — taking risks without actually losing. The decisive rate declines back to near-zero.
+
+5. **games_per_iter=64 was half the planned 128.** With only 64 games and 90% draws, each iteration added ~6 decisive positions. Too few to overcome the 95K draws in the buffer.
+
+**Outcome:** Failed — the Buffet strategy with sims=64 cannot sustain decisive games past ~12 iterations. Led to Lessons L8, L9, L10. Iter 7 snapshot (`milestone_iter007_best.pt`) preserved as recovery point with healthy value head (VL=0.39) and best policy available at that state (PL=8.07).
+
+---
+
 ## Lessons Learned
 
 ### L1. Buffet Requires Fresh Weights `CONFIRMED` → Run 1
@@ -529,10 +628,49 @@ With sims=64, the plan predicted 10-20 second self-play. Actual: ~20 minutes. Th
 
 In all runs so far, the value head collapses toward "always predict draw" within 3-10 iterations. The policy head improves steadily. The bottleneck is not learning to play chess — it's learning to EVALUATE positions. This is why the Buffet approach (which maximizes decisive training signal for the value head) is the right strategy.
 
-### L5. PER Is Most Valuable After Phase 1 `THEORY`
+### L5. PER Is Most Valuable After Phase 1 `CONFIRMED` → Run 3
 
-PER (Prioritized Experience Replay) samples positions proportional to training loss, focusing gradient updates on positions the model struggles with. During Phase 1 (Buffet), all positions have similarly high loss — PER provides no benefit and wastes overhead. From Phase 3 onward, the buffer contains a wide mix of easy and hard positions — PER significantly improves training efficiency. Enable with `--priority-exponent 0.6 --per-beta 0.4` on restart. Use `--per-beta 0.6` in Phase 4+ for smoother convergence. PER can also help with value head collapse by amplifying gradient signal from the minority of decisive positions in a draw-heavy buffer (use `--per-beta 0.3` in that case for maximum amplification). See `llm_operation_manual.md` Section 10q for the full beta selection guide.
+PER (Prioritized Experience Replay) samples positions proportional to training loss, focusing gradient updates on positions the model struggles with. During Phase 1 (Buffet), all positions have similarly high loss — PER provides no benefit and inflates reported loss metrics (see L6). Run 3 confirmed: PER enabled from iter 1 did not prevent value head collapse and did not amplify decisive-position signal effectively when the buffer was 95%+ draws. **Enable PER from Phase 2 onward** when the buffer has meaningful loss distribution. Use `--priority-exponent 0.6 --per-beta 0.4` on restart. Use `--per-beta 0.6` in Phase 4+ for smoother convergence. See `llm_operation_manual.md` Section 10q and L11.
 
-### L6. Buffer Persistence Fixed `RESOLVED`
+### L6. PER Inflates All Reported Loss Metrics `CONFIRMED` → Code Analysis
+
+**When PER is active, reported loss/policy_loss/value_loss are all higher than the true uniform-sample values.** This is a reporting artifact, not a real problem — unless game quality metrics also deteriorate.
+
+**Why:** PER oversamples high-loss positions. The `policy_loss` and `value_loss` logged in `train.py` (lines 2124-2125) are unweighted `.mean()` over the PER-sampled batch — the code comment says "comparable regardless of PER" but this is wrong because the batch itself is biased. The IS-weighted `loss` (line 2119) partially corrects with `per_beta`, but with beta < 1.0 the correction is incomplete.
+
+**Diagnostic — is the loss increase PER artifact or real overfitting?**
+
+| Signal | PER Artifact | Real Problem |
+|--------|-------------|--------------|
+| Loss jumped when PER was enabled | Yes — sampling bias | No |
+| Loss gradually increasing over iterations | Less likely | Yes — overfitting |
+| Draw rate, game length, puzzle accuracy | Stable or improving | Deteriorating |
+| Policy loss vs value loss | Both inflated equally | Value loss rising disproportionately |
+
+**Action:** When PER is active, rely on game quality metrics (draw rate, ELO, endgame puzzles) as ground truth — these are PER-independent. Only reduce LR if game quality deteriorates alongside rising loss.
+
+### L7. Buffer Persistence Fixed `RESOLVED`
 
 Buffer persistence was previously only saved at checkpoint time (inside the `save_checkpoint_now` block), which meant it could be skipped entirely if training crashed or was interrupted before reaching a save interval. Now fixed: `replay_buffer.rpbf` is saved after every self-play phase and during emergency saves (Ctrl+C, crash, stop file). A single fixed filename replaces the old per-iteration `buffer_iter_NNN.rpbf` naming.
+
+### L8. ERM (risk_beta) Recovery Is Temporary `CONFIRMED` → Run 3
+
+Applying `risk_beta=0.3` during fifty-move stagnation produces a 1-2 iteration "shock" of decisive games (Run 3 iter 17: 15 decisive after 4 iterations of 0). But the model's policy adapts within 3-4 iterations to play "aggressive defense" — taking risky lines without actually losing. Decisive rate declines back toward zero (15 → 10 → 8 → 6 → 3). **risk_beta is a band-aid, not a structural fix.** It buys time but does not solve the underlying problem of insufficient search depth or draw-biased training data.
+
+### L9. Fifty-Move Draws: Exploration Problem AND Value Collapse `CONFIRMED` → Run 3
+
+Fifty-move draws at low simulations have two components:
+
+1. **Execution problem (low sims):** The model may "know" a position is winning (value head says +0.6) but sims=64 can't calculate the 5-10 move mating sequence. This is identifiable when value_loss stays HIGH (>0.3) with fifty-move draws — the value head maintains discrimination but search can't convert.
+
+2. **Value collapse:** Each fifty-move draw trains the value head to predict "draw," poisoning the buffer. This is identifiable when value_loss DROPS alongside rising fifty-move draws — the model stops believing positions can be decisive.
+
+In Run 3, BOTH were present. The solution must address both: higher simulations (for execution) AND a healthy value head (for evaluation). Increasing sims alone won't help if the value head is collapsed; fixing the value head alone won't help if search is too shallow to find mates.
+
+### L10. Defense Outpaces Offense in Self-Play `CONFIRMED` → Run 3
+
+The model learns to avoid checkmate (recognize 1-2 bad moves) much faster than it learns to deliver checkmate (execute a 5-10 move plan). This creates the "too smart to lose, too dumb to win" asymmetry. In Run 3, the draw rate bottomed at 70% (iter 8) then climbed back toward 100% over the next 5 iterations as defensive skill caught up. **Implication:** to sustain decisive games, the model needs enough search depth (sims) to find mating sequences, not just enough to avoid blunders.
+
+### L11. PER Cannot Rescue a Draw-Saturated Buffer `CONFIRMED` → Run 3
+
+PER was enabled from iteration 1 in Run 3. It did not prevent value head collapse because PER amplifies signal proportional to what exists in the buffer — when 95%+ of the buffer is draws, even PER-amplified decisive positions are too few to maintain the value head. PER also inflated reported loss metrics (L6), making monitoring harder. **However**, PER should help when the buffer has meaningful decisive content (>5-10%). With a healthier buffer and higher simulations generating more decisive games, PER's prioritization of hard positions actively supports value head health. **Key condition:** PER is beneficial when the buffer's decisive fraction can be sustained by self-play; it cannot create signal that doesn't exist.
