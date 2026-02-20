@@ -12,6 +12,7 @@
 #include "selfplay/coordinator.hpp"
 #include "selfplay/parallel_coordinator.hpp"
 #include "selfplay/evaluation_queue.hpp"
+#include "selfplay/reanalyzer.hpp"
 #include "training/replay_buffer.hpp"
 #include "training/trainer.hpp"
 #include "../third_party/chess-library/include/chess.hpp"
@@ -838,10 +839,185 @@ public:
         return config_.num_workers * config_.games_per_worker;
     }
 
+    // =========================================================================
+    // Lifecycle Methods (for concurrent reanalysis)
+    // =========================================================================
+
+    // Start generation (non-blocking) — use with set_secondary_queue for reanalysis
+    void start_generation(py::object evaluator) {
+        active_coordinator_ = std::make_unique<selfplay::ParallelSelfPlayCoordinator>(
+            config_, replay_buffer_
+        );
+
+        // Store evaluator to prevent garbage collection during async operation
+        stored_evaluator_ = evaluator;
+
+        // Create C++ evaluator callback that wraps stored Python callable
+        cpp_evaluator_ = [this](
+            const float* observations,
+            const float* legal_masks,
+            int batch_size,
+            float* out_policies,
+            float* out_values)
+        {
+            py::gil_scoped_acquire acquire;
+
+            constexpr int CH = encoding::PositionEncoder::CHANNELS;
+            py::array_t<float> obs_array(
+                {batch_size, 8, 8, CH},
+                {8 * 8 * CH * (int)sizeof(float), 8 * CH * (int)sizeof(float),
+                 CH * (int)sizeof(float), (int)sizeof(float)},
+                const_cast<float*>(observations),
+                py::capsule(observations, [](void*) {})
+            );
+
+            py::array_t<float> mask_array(
+                {batch_size, 4672},
+                {4672 * (int)sizeof(float), (int)sizeof(float)},
+                const_cast<float*>(legal_masks),
+                py::capsule(legal_masks, [](void*) {})
+            );
+
+            py::array_t<float> out_policy_array(
+                {batch_size, 4672},
+                {4672 * (int)sizeof(float), (int)sizeof(float)},
+                out_policies,
+                py::capsule(out_policies, [](void*) {})
+            );
+            py::array_t<float> out_value_array(
+                {batch_size, 3},
+                {3 * (int)sizeof(float), (int)sizeof(float)},
+                out_values,
+                py::capsule(out_values, [](void*) {})
+            );
+
+            try {
+                py::object result = stored_evaluator_(obs_array, mask_array, batch_size,
+                                                      out_policy_array, out_value_array);
+                if (!result.is_none()) {
+                    py::tuple result_tuple = result.cast<py::tuple>();
+                    py::array_t<float> py_policies = result_tuple[0].cast<py::array_t<float>>();
+                    py::array_t<float> py_values = result_tuple[1].cast<py::array_t<float>>();
+
+                    auto policies_buf = py_policies.request();
+                    auto values_buf = py_values.request();
+
+                    std::memcpy(out_policies, policies_buf.ptr,
+                               batch_size * 4672 * sizeof(float));
+                    std::memcpy(out_values, values_buf.ptr,
+                               batch_size * 3 * sizeof(float));
+                }
+            } catch (py::error_already_set& e) {
+                fprintf(stderr, "[WARNING] Evaluator 5-arg call failed: %s\n", e.what());
+                fflush(stderr);
+                PyErr_Clear();
+                py::object result = stored_evaluator_(obs_array, mask_array, batch_size);
+
+                py::tuple result_tuple = result.cast<py::tuple>();
+                py::array_t<float> py_policies = result_tuple[0].cast<py::array_t<float>>();
+                py::array_t<float> py_values = result_tuple[1].cast<py::array_t<float>>();
+
+                auto policies_buf = py_policies.request();
+                auto values_buf = py_values.request();
+
+                std::memcpy(out_policies, policies_buf.ptr,
+                           batch_size * 4672 * sizeof(float));
+                std::memcpy(out_values, values_buf.ptr,
+                           batch_size * 3 * sizeof(float));
+            }
+        };
+
+        // Start generation (non-blocking) — release GIL so GPU thread can acquire it
+        py::gil_scoped_release release;
+        active_coordinator_->start(cpp_evaluator_);
+    }
+
+    void set_secondary_queue_from_reanalyzer(selfplay::Reanalyzer& reanalyzer) {
+        if (active_coordinator_) {
+            active_coordinator_->set_secondary_queue(&reanalyzer.get_eval_queue());
+        }
+    }
+
+    void clear_secondary_queue() {
+        if (active_coordinator_) {
+            active_coordinator_->clear_secondary_queue();
+        }
+    }
+
+    void wait_for_workers_impl() {
+        if (active_coordinator_) {
+            active_coordinator_->wait_for_workers();
+        }
+    }
+
+    void shutdown_gpu_thread_impl() {
+        if (active_coordinator_) {
+            active_coordinator_->shutdown_gpu_thread();
+        }
+    }
+
+    void clear_stored_evaluator() {
+        stored_evaluator_ = py::none();
+        cpp_evaluator_ = nullptr;
+    }
+
+    py::dict get_generation_stats() {
+        py::dict result;
+        if (!active_coordinator_) return result;
+
+        const auto& stats = active_coordinator_->get_stats();
+        const auto& queue_metrics = active_coordinator_->get_queue_metrics();
+
+        result["games_completed"] = stats.games_completed.load();
+        result["total_moves"] = stats.total_moves.load();
+        result["white_wins"] = stats.white_wins.load();
+        result["black_wins"] = stats.black_wins.load();
+        result["draws"] = stats.draws.load();
+        result["standard_wins"] = stats.standard_wins.load();
+        result["opponent_wins"] = stats.opponent_wins.load();
+        result["asymmetric_draws"] = stats.asymmetric_draws.load();
+        result["mcts_failures"] = stats.mcts_failures.load();
+        result["gpu_errors"] = stats.gpu_errors.load();
+        result["total_simulations"] = stats.total_simulations.load();
+        result["total_nn_evals"] = stats.total_nn_evals.load();
+        result["root_retries"] = stats.root_retries.load();
+        result["stale_results_flushed"] = stats.stale_results_flushed.load();
+
+        result["draws_repetition"] = stats.draws_repetition.load();
+        result["draws_stalemate"] = stats.draws_stalemate.load();
+        result["draws_fifty_move"] = stats.draws_fifty_move.load();
+        result["draws_insufficient"] = stats.draws_insufficient.load();
+        result["draws_max_moves"] = stats.draws_max_moves.load();
+        result["draws_early_repetition"] = stats.draws_early_repetition.load();
+
+        result["cpp_error"] = active_coordinator_->get_last_error();
+
+        result["pool_exhaustion_count"] = queue_metrics.pool_exhaustion_count.load();
+        result["partial_submissions"] = queue_metrics.partial_submissions.load();
+        result["submission_drops"] = queue_metrics.submission_drops.load();
+        result["pool_resets"] = queue_metrics.pool_resets.load();
+        result["submission_waits"] = queue_metrics.submission_waits.load();
+        result["avg_batch_size"] = queue_metrics.avg_batch_size();
+        result["total_batches"] = queue_metrics.total_batches.load();
+        result["total_leaves"] = queue_metrics.total_leaves.load();
+
+        result["max_search_depth"] = stats.max_search_depth.load();
+        result["min_search_depth"] = stats.min_search_depth.load() == INT64_MAX
+            ? 0 : stats.min_search_depth.load();
+        int64_t total_depth = stats.total_max_depth.load();
+        int64_t depth_samples = stats.depth_sample_count.load();
+        result["avg_search_depth"] = depth_samples > 0
+            ? static_cast<double>(total_depth) / depth_samples : 0.0;
+
+        return result;
+    }
+
 private:
     selfplay::ParallelSelfPlayConfig config_;
     training::ReplayBuffer* replay_buffer_;
     std::unique_ptr<selfplay::ParallelSelfPlayCoordinator> active_coordinator_;
+    py::object stored_evaluator_;
+    selfplay::NeuralEvaluatorFn cpp_evaluator_;
 };
 
 PYBIND11_MODULE(alphazero_cpp, m) {
@@ -1011,7 +1187,88 @@ PYBIND11_MODULE(alphazero_cpp, m) {
             // Error is primarily surfaced via cpp_error key in generate_games() result dict
             return "";
         },
-        "Get last C++ error (use cpp_error key in generate_games result instead)");
+        "Get last C++ error (use cpp_error key in generate_games result instead)")
+        // Lifecycle methods for concurrent reanalysis
+        .def("start_generation", &PyParallelSelfPlayCoordinator::start_generation,
+             py::arg("evaluator"),
+             "Start self-play generation (non-blocking).\n"
+             "Use with set_secondary_queue + reanalyzer for concurrent reanalysis.\n"
+             "evaluator: same callable as generate_games()")
+        .def("set_secondary_queue", &PyParallelSelfPlayCoordinator::set_secondary_queue_from_reanalyzer,
+             py::arg("reanalyzer"),
+             "Connect reanalyzer's eval queue as secondary GPU queue.\n"
+             "GPU thread fills spare batch capacity from reanalysis workers.")
+        .def("clear_secondary_queue", &PyParallelSelfPlayCoordinator::clear_secondary_queue,
+             "Disconnect the secondary (reanalysis) eval queue")
+        .def("wait_for_workers", [](PyParallelSelfPlayCoordinator& self) {
+                 py::gil_scoped_release release;
+                 self.wait_for_workers_impl();
+             },
+             "Wait for self-play workers to finish (GPU thread keeps running for reanalysis)")
+        .def("shutdown_gpu_thread", [](PyParallelSelfPlayCoordinator& self) {
+                 {
+                     py::gil_scoped_release release;
+                     self.shutdown_gpu_thread_impl();
+                 }
+                 // GIL held: safe to clear Python objects
+                 self.clear_stored_evaluator();
+             },
+             "Shut down GPU thread after reanalysis completes.\n"
+             "Call after reanalyzer.wait() and clear_secondary_queue().")
+        .def("get_generation_stats", &PyParallelSelfPlayCoordinator::get_generation_stats,
+             "Get self-play stats after start_generation workflow.\n"
+             "Returns same dict as generate_games() when using replay buffer.");
+
+    // Reanalysis configuration
+    py::class_<selfplay::ReanalysisConfig>(m, "ReanalysisConfig")
+        .def(py::init<>())
+        .def_readwrite("num_workers", &selfplay::ReanalysisConfig::num_workers)
+        .def_readwrite("num_simulations", &selfplay::ReanalysisConfig::num_simulations)
+        .def_readwrite("mcts_batch_size", &selfplay::ReanalysisConfig::mcts_batch_size)
+        .def_readwrite("c_puct", &selfplay::ReanalysisConfig::c_puct)
+        .def_readwrite("fpu_base", &selfplay::ReanalysisConfig::fpu_base)
+        .def_readwrite("risk_beta", &selfplay::ReanalysisConfig::risk_beta)
+        .def_readwrite("use_gumbel", &selfplay::ReanalysisConfig::use_gumbel)
+        .def_readwrite("gumbel_top_k", &selfplay::ReanalysisConfig::gumbel_top_k)
+        .def_readwrite("gumbel_c_visit", &selfplay::ReanalysisConfig::gumbel_c_visit)
+        .def_readwrite("gumbel_c_scale", &selfplay::ReanalysisConfig::gumbel_c_scale)
+        .def_readwrite("gpu_batch_size", &selfplay::ReanalysisConfig::gpu_batch_size)
+        .def_readwrite("worker_timeout_ms", &selfplay::ReanalysisConfig::worker_timeout_ms)
+        .def_readwrite("queue_capacity", &selfplay::ReanalysisConfig::queue_capacity);
+
+    // Reanalyzer — runs MCTS re-searches on replay buffer positions
+    py::class_<selfplay::Reanalyzer>(m, "Reanalyzer")
+        .def(py::init<training::ReplayBuffer&, const selfplay::ReanalysisConfig&>(),
+             py::arg("buffer"), py::arg("config"),
+             "Create reanalyzer for MCTS re-search of replay buffer positions.\n"
+             "Uses coordinator's GPU thread via secondary eval queue (no own GPU thread).")
+        .def("set_indices", &selfplay::Reanalyzer::set_indices,
+             py::arg("indices"),
+             "Set buffer indices to reanalyze (call before start)")
+        .def("start", &selfplay::Reanalyzer::start,
+             "Start reanalysis workers (non-blocking)")
+        .def("wait", [](selfplay::Reanalyzer& self) {
+                 py::gil_scoped_release release;
+                 self.wait();
+             },
+             "Wait for all reanalysis positions to be processed")
+        .def("stop", [](selfplay::Reanalyzer& self) {
+                 py::gil_scoped_release release;
+                 self.stop();
+             },
+             "Graceful shutdown (can be called from another thread)")
+        .def("get_stats", [](selfplay::Reanalyzer& self) {
+                 const auto& s = self.get_stats();
+                 py::dict d;
+                 d["positions_completed"] = s.positions_completed.load();
+                 d["total_simulations"] = s.total_simulations.load();
+                 d["total_nn_evals"] = s.total_nn_evals.load();
+                 d["positions_skipped"] = s.positions_skipped.load();
+                 return d;
+             },
+             "Get reanalysis statistics")
+        .def("get_last_error", &selfplay::Reanalyzer::get_last_error,
+             "Get last error message (empty if no errors)");
 
     // Replay Buffer
     py::class_<training::ReplayBuffer>(m, "ReplayBuffer")
@@ -1233,7 +1490,16 @@ PYBIND11_MODULE(alphazero_cpp, m) {
         py::arg("indices"), py::arg("priorities"),
         "Update priorities for sampled indices.\n"
         "indices: uint32 array from sample_prioritized\n"
-        "priorities: float32 array of new priorities (typically loss + epsilon)");
+        "priorities: float32 array of new priorities (typically loss + epsilon)")
+        // FEN storage for MCTS reanalysis
+        .def("enable_fen_storage", &training::ReplayBuffer::enable_fen_storage,
+             "Enable FEN string storage for reanalysis.\n"
+             "Allocates FEN + Zobrist hash buffers. Call before adding samples.")
+        .def("fen_storage_enabled", &training::ReplayBuffer::fen_storage_enabled,
+             "Check if FEN storage is enabled")
+        .def("get_fen", &training::ReplayBuffer::get_fen,
+             py::arg("index"),
+             "Get FEN string at buffer index (empty if FEN storage disabled or index invalid)");
 
     // Trainer
     py::class_<training::Trainer::Config>(m, "TrainerConfig")

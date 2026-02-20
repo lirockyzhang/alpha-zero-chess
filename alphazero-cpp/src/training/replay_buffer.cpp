@@ -63,7 +63,10 @@ void ReplayBuffer::add_sample(
     float value,
     const float* wdl_target,
     const float* soft_value,
-    const SampleMeta* meta
+    const SampleMeta* meta,
+    const char* fen,
+    const uint64_t* history_hashes,
+    uint8_t num_history
 ) {
     // Validate sizes (no lock needed for validation)
     if (observation.size() != OBS_SIZE) {
@@ -112,6 +115,34 @@ void ReplayBuffer::add_sample(
         new_meta = {current_iteration_, 1, static_cast<uint8_t>(Termination::UNKNOWN), 0, 0};
     }
     update_composition_counters(pos, new_meta);
+
+    // FEN + history hash storage (only when enabled and data provided)
+    if (store_fens_ && fen != nullptr) {
+        char* slot = fens_.data() + pos * FEN_SLOT_SIZE;
+        size_t len = std::strlen(fen);
+        if (len >= FEN_SLOT_SIZE) len = FEN_SLOT_SIZE - 1;
+        std::memcpy(slot, fen, len);
+        slot[len] = '\0';
+
+        if (history_hashes != nullptr && num_history > 0) {
+            uint8_t n = std::min(num_history, static_cast<uint8_t>(HISTORY_DEPTH));
+            std::memcpy(history_hashes_.data() + pos * HISTORY_DEPTH,
+                        history_hashes, n * sizeof(uint64_t));
+            // Zero remaining slots
+            for (uint8_t h = n; h < HISTORY_DEPTH; ++h) {
+                history_hashes_[pos * HISTORY_DEPTH + h] = 0;
+            }
+            num_history_[pos] = n;
+        } else {
+            std::memset(history_hashes_.data() + pos * HISTORY_DEPTH, 0, HISTORY_DEPTH * sizeof(uint64_t));
+            num_history_[pos] = 0;
+        }
+    } else if (store_fens_) {
+        // FEN storage enabled but no FEN provided: clear the slot
+        fens_[pos * FEN_SLOT_SIZE] = '\0';
+        std::memset(history_hashes_.data() + pos * HISTORY_DEPTH, 0, HISTORY_DEPTH * sizeof(uint64_t));
+        num_history_[pos] = 0;
+    }
 
     // PER: assign max priority to new sample (O(1) leaf-only write)
     if (sum_tree_) {
@@ -306,6 +337,13 @@ void ReplayBuffer::clear() {
     sentinel.game_result = 0xFF;
     std::fill(metadata_.begin(), metadata_.end(), sentinel);
 
+    // Clear FEN data
+    if (store_fens_) {
+        std::fill(fens_.begin(), fens_.end(), '\0');
+        std::fill(history_hashes_.begin(), history_hashes_.end(), 0);
+        std::fill(num_history_.begin(), num_history_.end(), 0);
+    }
+
     // Clear PER state
     if (sum_tree_) {
         sum_tree_->clear();
@@ -334,6 +372,49 @@ ReplayBuffer::Stats ReplayBuffer::get_stats() const {
         draws_count_.value.load(std::memory_order_relaxed),
         losses_count_.value.load(std::memory_order_relaxed)
     };
+}
+
+// ============================================================================
+// FEN + History Hash Storage (for MCTS Reanalysis)
+// ============================================================================
+
+void ReplayBuffer::enable_fen_storage() {
+    if (store_fens_) return;  // Already enabled
+
+    fens_.resize(capacity_ * FEN_SLOT_SIZE, '\0');
+    history_hashes_.resize(capacity_ * HISTORY_DEPTH, 0);
+    num_history_.resize(capacity_, 0);
+    store_fens_ = true;
+
+    std::cerr << "[ReplayBuffer] FEN storage enabled: "
+              << (capacity_ * (FEN_SLOT_SIZE + HISTORY_DEPTH * 8 + 1)) / (1024 * 1024)
+              << " MB allocated" << std::endl;
+}
+
+std::string ReplayBuffer::get_fen(size_t index) const {
+    if (!store_fens_ || index >= size()) return "";
+    const char* slot = fens_.data() + index * FEN_SLOT_SIZE;
+    return std::string(slot);
+}
+
+const uint64_t* ReplayBuffer::get_history_hashes(size_t index) const {
+    if (!store_fens_ || index >= size()) return nullptr;
+    return history_hashes_.data() + index * HISTORY_DEPTH;
+}
+
+uint8_t ReplayBuffer::get_num_history(size_t index) const {
+    if (!store_fens_ || index >= size()) return 0;
+    return num_history_[index];
+}
+
+const float* ReplayBuffer::get_observation_ptr(size_t index) const {
+    if (index >= size()) return nullptr;
+    return observations_.data() + index * OBS_SIZE;
+}
+
+void ReplayBuffer::update_policy(size_t index, const float* policy) {
+    if (index >= size() || policy == nullptr) return;
+    std::memcpy(policies_.data() + index * POLICY_SIZE, policy, POLICY_SIZE * sizeof(float));
 }
 
 // ============================================================================
@@ -487,7 +568,7 @@ void ReplayBuffer::update_priorities(
 //
 // Header (64 bytes):
 //   magic:        char[4] = "RPBF"
-//   version:      uint32_t = 2 or 3
+//   version:      uint32_t = 3 or 4
 //   capacity:     uint64_t   (original buffer capacity)
 //   num_samples:  uint64_t   (= size(), i.e. min(total_added, capacity))
 //   write_pos:    uint64_t
@@ -504,12 +585,15 @@ void ReplayBuffer::update_priorities(
 //   wdl_targets:  num_samples * 3 * 4 bytes
 //   soft_values:  num_samples * 4 bytes
 //   metadata:     num_samples * 8 bytes
-//   priorities:   num_samples * 4 bytes (v3 only, if has_priorities flag set)
+//   priorities:   num_samples * 4 bytes (if reserved[0] bit 0 set)
+//   fens:         num_samples * 128 bytes (if reserved[0] bit 1 set, v4+)
+//   hist_hashes:  num_samples * 8 * 8 bytes (if reserved[0] bit 1 set, v4+)
+//   num_history:  num_samples * 1 byte (if reserved[0] bit 1 set, v4+)
 
 #pragma pack(push, 1)
 struct RpbfHeader {
     char magic[4];          // "RPBF"
-    uint32_t version;       // 2
+    uint32_t version;       // 3 = PER priorities, 4 = FEN + Zobrist hashes
     uint64_t capacity;
     uint64_t num_samples;
     uint64_t write_pos;
@@ -534,7 +618,7 @@ bool ReplayBuffer::save(const std::string& path) const {
     // Write header
     RpbfHeader header{};
     header.magic[0] = 'R'; header.magic[1] = 'P'; header.magic[2] = 'B'; header.magic[3] = 'F';
-    header.version = 3;
+    header.version = 4;
     header.capacity = static_cast<uint64_t>(capacity_);
     header.num_samples = num_samples;
     header.write_pos = write_pos_.value.load(std::memory_order_relaxed);
@@ -546,6 +630,10 @@ bool ReplayBuffer::save(const std::string& path) const {
     // reserved[0] bit 0: has_priorities flag
     if (sum_tree_ && num_samples > 0) {
         header.reserved[0] |= 0x01;
+    }
+    // reserved[0] bit 1: has_fens flag
+    if (store_fens_ && num_samples > 0) {
+        header.reserved[0] |= 0x02;
     }
 
     out.write(reinterpret_cast<const char*>(&header), sizeof(header));
@@ -569,7 +657,7 @@ bool ReplayBuffer::save(const std::string& path) const {
     out.write(reinterpret_cast<const char*>(metadata_.data()),
               num_samples * sizeof(SampleMeta));
 
-    // Write priorities if PER is enabled (v3)
+    // Write priorities if PER is enabled
     if (sum_tree_ && num_samples > 0) {
         std::vector<float> priorities(num_samples);
         for (uint64_t i = 0; i < num_samples; ++i) {
@@ -577,6 +665,15 @@ bool ReplayBuffer::save(const std::string& path) const {
         }
         out.write(reinterpret_cast<const char*>(priorities.data()),
                   num_samples * sizeof(float));
+    }
+
+    // Write FEN + history hashes if enabled (v4)
+    if (store_fens_ && num_samples > 0) {
+        out.write(fens_.data(), num_samples * FEN_SLOT_SIZE);
+        out.write(reinterpret_cast<const char*>(history_hashes_.data()),
+                  num_samples * HISTORY_DEPTH * sizeof(uint64_t));
+        out.write(reinterpret_cast<const char*>(num_history_.data()),
+                  num_samples * sizeof(uint8_t));
     }
 
     out.close();
@@ -587,7 +684,8 @@ bool ReplayBuffer::save(const std::string& path) const {
     }
 
     std::cerr << "[ReplayBuffer] Saved " << num_samples << " samples to " << path
-              << (sum_tree_ ? " (with priorities)" : "") << std::endl;
+              << (sum_tree_ ? " (with priorities)" : "")
+              << (store_fens_ ? " (with FENs)" : "") << std::endl;
     return true;
 }
 
@@ -613,14 +711,15 @@ bool ReplayBuffer::load(const std::string& path) {
         return false;
     }
 
-    // Validate version (v3 only)
-    if (header.version != 3) {
+    // Validate version (v3 or v4)
+    if (header.version != 3 && header.version != 4) {
         std::cerr << "[ReplayBuffer] Unsupported version " << header.version
-                  << " (expected 3) in: " << path << std::endl;
+                  << " (expected 3 or 4) in: " << path << std::endl;
         return false;
     }
 
     bool has_priorities = (header.reserved[0] & 0x01) != 0;
+    bool has_fens = (header.reserved[0] & 0x02) != 0;
 
     // Validate sizes
     if (header.obs_size != OBS_SIZE || header.policy_size != POLICY_SIZE) {
@@ -707,6 +806,33 @@ bool ReplayBuffer::load(const std::string& path) {
         }
         sum_tree_->rebuild();
         tree_needs_rebuild_ = false;
+    }
+
+    // Load FEN + history hashes if present (v4)
+    if (has_fens && store_fens_) {
+        in.read(fens_.data(), num_samples * FEN_SLOT_SIZE);
+        if (num_samples < file_samples) {
+            in.seekg((file_samples - num_samples) * FEN_SLOT_SIZE, std::ios::cur);
+        }
+        in.read(reinterpret_cast<char*>(history_hashes_.data()),
+                num_samples * HISTORY_DEPTH * sizeof(uint64_t));
+        if (num_samples < file_samples) {
+            in.seekg((file_samples - num_samples) * HISTORY_DEPTH * sizeof(uint64_t), std::ios::cur);
+        }
+        in.read(reinterpret_cast<char*>(num_history_.data()),
+                num_samples * sizeof(uint8_t));
+        if (num_samples < file_samples) {
+            in.seekg((file_samples - num_samples) * sizeof(uint8_t), std::ios::cur);
+        }
+        std::cerr << "[ReplayBuffer] Loaded FENs for " << num_samples << " samples" << std::endl;
+    } else if (has_fens && !store_fens_) {
+        // Skip FEN sections
+        in.seekg(file_samples * FEN_SLOT_SIZE, std::ios::cur);
+        in.seekg(file_samples * HISTORY_DEPTH * sizeof(uint64_t), std::ios::cur);
+        in.seekg(file_samples * sizeof(uint8_t), std::ios::cur);
+    } else if (store_fens_) {
+        // No FENs in file but storage enabled: zero-fill (already done by enable_fen_storage)
+        std::cerr << "[ReplayBuffer] No FEN data in file (v3 compat), FEN slots empty" << std::endl;
     }
 
     if (!in.good()) {

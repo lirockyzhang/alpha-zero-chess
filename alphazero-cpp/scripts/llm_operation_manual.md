@@ -254,6 +254,9 @@ To change them, stop training and restart with `--resume`:
 | `--workers` | int | Number of parallel self-play workers |
 | `--priority-exponent` | float | PER priority exponent α (default 0.0=disabled, 0.6=recommended). Allocates sum-tree on startup. |
 | `--per-beta` | float | PER IS correction β (default 0.4). Fixed value, not annealed. See Section 10q for selection guide. |
+| `--reanalyze-fraction` | float | Fraction of buffer to reanalyze each iteration (default 0.0=disabled, 0.25=recommended). Enables FEN storage on startup. See Section 10r. |
+| `--reanalyze-simulations-ratio` | float | Reanalysis sims as fraction of self-play sims (default 0.25). |
+| `--reanalyze-workers` | int | Number of reanalysis workers (default 0=auto: half of self-play workers). |
 
 **CRITICAL: `--resume` does NOT preserve CLI arguments.** When using `--resume`, you MUST re-specify ALL parameters (`--filters`, `--blocks`, `--se-reduction`, `--workers`, `--simulations`, `--search-algorithm`, `--train-batch`, `--epochs`, `--games-per-iter`, etc.). Only the model weights, optimizer state, and replay buffer are loaded from the checkpoint. Omitting parameters causes them to revert to defaults (e.g., workers=1, simulations=800, train_batch=256), which can silently produce terrible results.
 
@@ -1074,3 +1077,63 @@ Is loss < 2.0 and you're fine-tuning for quality?
 **RPBF v3 format:** Buffer files saved with PER enabled include a priorities section after metadata (flag in `reserved[0]` bit 0). Loading a file with priorities into a PER-enabled buffer restores the priority distribution. Loading without PER enabled skips the priorities section. Files saved without PER are also valid v3 (no priorities section).
 
 **Memory overhead:** Negligible. A 100K-capacity buffer uses ~1 MB for the sum-tree vs ~3 GB for observations. On disk, priorities add 400 KB per 100K samples.
+
+### 10r. MCTS Reanalysis (Concurrent Policy Refresh)
+
+**What it does:** Each iteration, a configurable fraction of replay buffer positions are re-searched with the current (improved) neural network using full MCTS. The resulting search policies replace the original (stale) policies stored from self-play. Value and WDL targets are NOT updated — they remain the ground-truth game outcomes.
+
+**Why it helps:** As the model improves, old policy targets become stale — they reflect the search quality of a weaker network. Reanalysis refreshes these targets so the model trains on policies that match its current strength, reducing the "staleness gap" between buffer contents and the model's actual capabilities. This is particularly valuable for large replay buffers where positions persist for many iterations.
+
+**Architecture — zero additional wall-clock time:**
+
+Reanalysis runs concurrently with self-play by sharing the coordinator's GPU thread:
+
+```
+Self-play workers → PRIMARY queue ─┐
+                                    ├─ GPU thread (single inference call) → results routed back
+Reanalysis workers → SECONDARY queue─┘
+```
+
+- The GPU thread serves the primary queue (self-play) first with full timeout
+- Secondary queue (reanalysis) only fills spare batch capacity — if self-play saturates the GPU, reanalysis gets almost no slots (correct: self-play throughput matters more)
+- When self-play workers have natural gaps (search computation, result processing), reanalysis fills what would otherwise be padding zeros — free compute
+- After self-play workers finish, the GPU thread transitions to serving reanalysis only (the "reanalysis tail" phase)
+
+**CLI parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--reanalyze-fraction` | 0.0 | Fraction of buffer to reanalyze each iteration (0=disabled) |
+| `--reanalyze-simulations-ratio` | 0.25 | Reanalysis sims as fraction of self-play sims |
+| `--reanalyze-workers` | 0 (auto) | Number of reanalysis workers (0 = half of self-play workers) |
+
+**How it works internally:**
+1. Before self-play, `N = floor(buffer_size * reanalyze_fraction)` positions are randomly sampled
+2. Each position's FEN + 8 Zobrist history hashes (stored in the replay buffer) are used to reconstruct a `chess::Board` with proper repetition detection
+3. The stored observation (full 123-channel encoding from the original game) is used for root evaluation
+4. MCTS runs with NO Dirichlet noise and NO temperature — producing a pure search policy
+5. The updated policy overwrites the original in the replay buffer; value/WDL targets stay as game outcomes
+
+**FEN + Zobrist hash storage:**
+- Enabled automatically when `--reanalyze-fraction > 0`
+- Each replay buffer sample stores: FEN string (128-byte fixed slot) + 8 Zobrist hashes (64 bytes) + hash count (1 byte) = 193 bytes overhead per sample (~0.6% of the 31,488-byte observation)
+- Persisted in RPBF v4 format (backward-compatible: v3 files load correctly with empty FENs)
+- FEN storage must be enabled BEFORE loading a buffer on `--resume` (the code handles this automatically)
+
+**When to enable:**
+
+| Training Phase | Reanalysis? | Recommended Settings | Rationale |
+|---------------|-------------|---------------------|-----------|
+| Phase 1 (Buffet, iters 1-20) | No | — | Model changes rapidly, buffer is small. Positions cycle out quickly — staleness is minimal. |
+| Phase 2 (Tasting Menu, iters 20-60) | Optional | `--reanalyze-fraction 0.15` | As buffer grows and model improves, older positions have noticeably stale policies. Light reanalysis helps. |
+| Phase 3 (Real Chess, iters 60-150) | Yes | `--reanalyze-fraction 0.25` | Large buffer with significant staleness. Reanalysis provides meaningful policy improvement at negligible cost. |
+| Phase 4+ (Deep Training, iters 150+) | Yes | `--reanalyze-fraction 0.25 --reanalyze-simulations-ratio 0.5` | Deep search reanalysis is most valuable when the model is strong and positions are complex. Higher sim ratio justified. |
+
+**Interaction with PER:**
+- Reanalysis does NOT directly change PER priorities
+- Updated policy targets produce different training losses when sampled, and those losses naturally update priorities via the existing `update_priorities()` flow
+- This is correct: PER measures "how much can the model learn," which changes organically after policy refresh
+
+**Reanalysis requires restart:** Like PER, FEN storage is allocated at startup. To enable reanalysis on an existing run, stop training and restart with `--resume <run_dir> --reanalyze-fraction 0.25`. Positions generated before FEN storage was enabled will have empty FENs and will be skipped during reanalysis (counted as `positions_skipped` in stats).
+
+**Monitoring:** The training log reports per-iteration: positions updated, positions skipped, reanalysis NN evals, and tail time (seconds spent on reanalysis after self-play finished). A healthy run shows most positions completing (low skip rate) and short tail times (< 30% of self-play time).

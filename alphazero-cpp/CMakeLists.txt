@@ -101,6 +101,7 @@ add_library(selfplay STATIC
     src/selfplay/coordinator.cpp
     src/selfplay/evaluation_queue.cpp
     src/selfplay/parallel_coordinator.cpp
+    src/selfplay/reanalyzer.cpp
 )
 
 target_include_directories(selfplay PUBLIC

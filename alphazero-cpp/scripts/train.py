@@ -359,6 +359,9 @@ class IterationMetrics:
     per_beta: float = 0.0
     # Buffer metrics
     buffer_size: int = 0
+    # Reanalysis metrics
+    reanalysis_positions: int = 0
+    reanalysis_time_s: float = 0.0
     # Timing
     total_time: float = 0.0
 
@@ -1045,6 +1048,85 @@ def run_parallel_selfplay_with_interrupt(
     return result[0]
 
 
+def run_selfplay_with_reanalysis(
+    coordinator,
+    evaluator,
+    reanalyzer,
+    shutdown_handler,
+    progress_callback=None,
+    progress_interval: float = 5.0
+):
+    """Run self-play + reanalysis concurrently using coordinator lifecycle split.
+
+    Self-play workers and reanalysis workers share the same GPU thread.
+    The GPU thread fills spare batch capacity from the reanalysis queue.
+    After self-play finishes, the GPU thread continues serving reanalysis only.
+
+    Returns:
+        (selfplay_result, reanalysis_stats, reanalysis_tail_time)
+    """
+    # Start generation (non-blocking) and connect reanalysis queue
+    coordinator.start_generation(evaluator)
+    coordinator.set_secondary_queue(reanalyzer)
+    reanalyzer.start()
+
+    # Monitor progress: wait for self-play in a thread so main thread
+    # can handle Ctrl+C and push progress updates
+    selfplay_done = threading.Event()
+    selfplay_exception = [None]
+
+    def selfplay_waiter():
+        try:
+            coordinator.wait_for_workers()
+        except Exception as e:
+            selfplay_exception[0] = e
+        selfplay_done.set()
+
+    thread = threading.Thread(target=selfplay_waiter, daemon=True)
+    thread.start()
+
+    last_progress_time = time.time()
+
+    while not selfplay_done.is_set():
+        selfplay_done.wait(timeout=0.5)
+
+        now = time.time()
+        if progress_callback and (now - last_progress_time) >= progress_interval:
+            try:
+                live_stats = coordinator.get_live_stats()
+                if live_stats:
+                    progress_callback(live_stats)
+            except Exception:
+                pass
+            last_progress_time = now
+
+        if shutdown_handler.should_stop():
+            print("\n  Stopping (Ctrl+C detected)...")
+            coordinator.stop()
+            reanalyzer.stop()
+            selfplay_done.wait(timeout=5.0)
+            break
+
+    if selfplay_exception[0]:
+        reanalyzer.stop()
+        raise selfplay_exception[0]
+
+    # Self-play done. Wait for reanalysis tail (GPU thread still serving secondary queue)
+    reanalysis_tail_start = time.time()
+    reanalyzer.wait()
+    reanalysis_tail_time = time.time() - reanalysis_tail_start
+
+    # Get stats before shutdown
+    selfplay_result = coordinator.get_generation_stats()
+    reanalysis_stats = reanalyzer.get_stats()
+
+    # Clean up
+    coordinator.clear_secondary_queue()
+    coordinator.shutdown_gpu_thread()
+
+    return selfplay_result, reanalysis_stats, reanalysis_tail_time
+
+
 def calibrate_cuda_graphs(
     network: nn.Module,
     device: str,
@@ -1428,6 +1510,7 @@ def run_parallel_selfplay(
     iteration: int,
     progress_callback=None,
     live_dashboard=None,
+    reanalyzer=None,
 ):
     """Run parallel self-play using cross-game batching.
 
@@ -2015,11 +2098,20 @@ def run_parallel_selfplay(
 
     # Run generation with interrupt support (allows Ctrl+C to stop)
     # Poll C++ stats every 5 seconds, console prints at progress_interval
-    result = run_parallel_selfplay_with_interrupt(
-        coordinator, neural_evaluator, shutdown_handler,
-        progress_callback=progress_cb,
-        progress_interval=5.0
-    )
+    reanalysis_stats = None
+    if reanalyzer is not None:
+        # Concurrent reanalysis: use lifecycle split
+        result, reanalysis_stats, reanalysis_tail = run_selfplay_with_reanalysis(
+            coordinator, neural_evaluator, reanalyzer, shutdown_handler,
+            progress_callback=progress_cb,
+            progress_interval=5.0
+        )
+    else:
+        result = run_parallel_selfplay_with_interrupt(
+            coordinator, neural_evaluator, shutdown_handler,
+            progress_callback=progress_cb,
+            progress_interval=5.0
+        )
 
     # Extract stats from result dict
     if result is None:
@@ -2120,6 +2212,16 @@ def run_parallel_selfplay(
     if metrics.total_nn_evals == 0:
         # Sequential mode: each simulation = one NN eval (search_batch=1 for PUCT)
         metrics.total_nn_evals = metrics.total_simulations
+
+    # Log and record reanalysis stats
+    if reanalysis_stats is not None:
+        completed = reanalysis_stats.get('positions_completed', 0)
+        skipped = reanalysis_stats.get('positions_skipped', 0)
+        nn_evals = reanalysis_stats.get('total_nn_evals', 0)
+        metrics.reanalysis_positions = completed
+        metrics.reanalysis_time_s = reanalysis_tail
+        print(f"  Reanalysis: {completed} positions updated, {skipped} skipped, "
+              f"{nn_evals} NN evals, tail={reanalysis_tail:.1f}s")
 
     # Extract sample game for PGN export (if available)
     sample_game = None
@@ -2428,6 +2530,14 @@ Examples:
                         help="Seconds to wait for Claude review before auto-continuing (default: 600). "
                              "Set to 0 to disable blocking (async mode).")
 
+    # Reanalysis
+    parser.add_argument("--reanalyze-fraction", type=float, default=0.0,
+                        help="Fraction of buffer to reanalyze each iteration (0=disabled, 0.25=recommended)")
+    parser.add_argument("--reanalyze-simulations-ratio", type=float, default=0.25,
+                        help="Reanalysis sims as fraction of self-play sims (default: 0.25)")
+    parser.add_argument("--reanalyze-workers", type=int, default=0,
+                        help="Number of reanalysis workers (0=auto: half of self-play workers)")
+
     args = parser.parse_args()
 
     # Derive search_batch from search algorithm (no longer user-facing)
@@ -2632,6 +2742,10 @@ Examples:
     # Enable PER if requested (must be before buffer load so priorities are loaded)
     if args.priority_exponent > 0:
         replay_buffer.enable_per(args.priority_exponent)
+
+    # Enable FEN storage for reanalysis (must be before buffer load so FENs are loaded)
+    if args.reanalyze_fraction > 0:
+        replay_buffer.enable_fen_storage()
 
     # Resume from checkpoint (load model weights)
     if checkpoint_path and os.path.exists(checkpoint_path):
@@ -3144,6 +3258,37 @@ Examples:
             # ================================================================
             # Uses ParallelSelfPlayCoordinator for high GPU utilization
             # All games run concurrently, NN evals batched across games
+
+            # Set up concurrent reanalysis if enabled and buffer has data
+            reanalyzer = None
+            reanalyze_this_iter = (
+                args.reanalyze_fraction > 0
+                and replay_buffer.size() > args.train_batch
+            )
+            if reanalyze_this_iter:
+                import random as _rng
+                reanalyze_sims = max(1, int(args.simulations * args.reanalyze_simulations_ratio))
+                num_positions = int(replay_buffer.size() * args.reanalyze_fraction)
+                reanalyze_workers = args.reanalyze_workers or max(1, args.workers // 2)
+
+                reanalysis_config = alphazero_cpp.ReanalysisConfig()
+                reanalysis_config.num_simulations = reanalyze_sims
+                reanalysis_config.num_workers = reanalyze_workers
+                reanalysis_config.gpu_batch_size = args.input_batch_size
+                reanalysis_config.c_puct = args.c_explore
+                reanalysis_config.fpu_base = args.fpu_base
+                reanalysis_config.risk_beta = args.risk_beta
+                reanalysis_config.use_gumbel = (args.search_algorithm == "gumbel")
+                reanalysis_config.gumbel_top_k = args.gumbel_top_k
+                reanalysis_config.gumbel_c_visit = args.gumbel_c_visit
+                reanalysis_config.gumbel_c_scale = args.gumbel_c_scale
+
+                reanalyzer = alphazero_cpp.Reanalyzer(replay_buffer, reanalysis_config)
+                indices = _rng.sample(range(replay_buffer.size()), num_positions)
+                reanalyzer.set_indices(indices)
+                print(f"  Reanalysis: {num_positions} positions, {reanalyze_sims} sims, "
+                      f"{reanalyze_workers} workers (concurrent with self-play)")
+
             parallel_metrics, sample_game, hw_stats = run_parallel_selfplay(
                 network=network,
                 replay_buffer=replay_buffer,
@@ -3151,7 +3296,10 @@ Examples:
                 args=args,
                 iteration=iteration + 1,  # 1-indexed for display
                 live_dashboard=live_dashboard,
+                reanalyzer=reanalyzer,
             )
+            metrics.reanalysis_positions = parallel_metrics.reanalysis_positions
+            metrics.reanalysis_time_s = parallel_metrics.reanalysis_time_s
             metrics.num_games = parallel_metrics.num_games
             metrics.total_moves = parallel_metrics.total_moves
             metrics.total_simulations = parallel_metrics.total_simulations
@@ -3494,6 +3642,9 @@ Examples:
             "grad_norm_avg": metrics.grad_norm_avg,
             "grad_norm_max": metrics.grad_norm_max,
             "learning_rate": optimizer.param_groups[0]['lr'],
+            # Reanalysis metrics
+            "reanalysis_positions": metrics.reanalysis_positions,
+            "reanalysis_time_s": metrics.reanalysis_time_s,
         }
         # Merge hardware/performance stats (empty dict in sequential mode)
         record.update(hw_stats)

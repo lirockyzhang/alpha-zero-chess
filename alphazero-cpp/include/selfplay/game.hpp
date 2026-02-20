@@ -5,6 +5,7 @@
 #include "../mcts/node_pool.hpp"
 #include "../encoding/move_encoder.hpp"
 #include <array>
+#include <cstdint>
 #include <vector>
 #include <string>
 #include <random>
@@ -14,11 +15,14 @@ namespace selfplay {
 
 // Single game state for self-play trajectory
 struct GameState {
-    std::vector<float> observation;     // Position encoding (8 x 8 x 119)
+    std::vector<float> observation;     // Position encoding (8 x 8 x 123)
     std::vector<float> policy;          // MCTS visit counts as policy (4672)
     float value;                        // Game outcome from this player's perspective
     std::array<float, 3> mcts_wdl;     // MCTS root WDL distribution {P(win), P(draw), P(loss)} from side-to-move
     float soft_value;                   // ERM risk-adjusted root value; 0 if disabled
+    std::string fen;                           // Board position as FEN string (for reanalysis)
+    std::array<uint64_t, 8> history_hashes{};  // Zobrist hashes [T-1..T-8] for repetition detection
+    uint8_t num_history{0};                    // How many hashes are valid
 
     GameState() : observation(encoding::PositionEncoder::TOTAL_SIZE, 0.0f),
                   policy(encoding::MoveEncoder::POLICY_SIZE, 0.0f),
@@ -44,12 +48,18 @@ struct GameTrajectory {
     // Add a state to the trajectory
     void add_state(const std::vector<float>& obs, const std::vector<float>& pol,
                    const std::array<float, 3>& wdl = {0.0f, 0.0f, 0.0f},
-                   float sv = 0.0f) {
+                   float sv = 0.0f,
+                   const std::string& fen = "",
+                   const std::array<uint64_t, 8>& hist_hashes = {},
+                   uint8_t num_hist = 0) {
         states.emplace_back();
         states.back().observation = obs;
         states.back().policy = pol;
         states.back().mcts_wdl = wdl;
         states.back().soft_value = sv;
+        states.back().fen = fen;
+        states.back().history_hashes = hist_hashes;
+        states.back().num_history = num_hist;
         num_moves++;
     }
 

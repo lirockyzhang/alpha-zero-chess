@@ -206,8 +206,11 @@ This is the most dangerous phase — reducing temperature can trigger draw death
 | `epochs` | 3 | Network benefits from multiple passes. |
 | `priority_exponent` | 0.6 | PER enabled — buffer has 100K+ positions with wide loss distribution. |
 | `per_beta` | 0.4 | Moderate IS correction (balance prioritization vs gradient stability). See Section 10q. |
+| `reanalyze_fraction` | 0.25 | Re-search 25% of buffer each iteration with current network. See Section 10r. |
 
 **Why enable PER here:** By Phase 3 the buffer contains 100K+ positions with a wide loss distribution — many "easy" positions the model has mastered, and fewer "hard" ones. PER focuses gradient updates on the hard positions, improving training efficiency.
+
+**Why enable reanalysis here:** With a large buffer and an improving model, older policy targets become stale — they reflect the search quality of a weaker network. Reanalysis refreshes these targets concurrently with self-play at zero additional GPU cost (fills spare batch capacity). See `llm_operation_manual.md` Section 10r.
 
 **LR decay schedule:**
 
@@ -227,7 +230,7 @@ This is the most dangerous phase — reducing temperature can trigger draw death
 {"opponent_risk_min": -0.5, "opponent_risk_max": 0.5}
 ```
 
-**Launch command (stop and restart required for PER):**
+**Launch command (stop and restart required for PER + reanalysis):**
 ```bash
 touch <run_dir>/stop
 # Wait for graceful shutdown, then:
@@ -243,6 +246,7 @@ uv run python alphazero-cpp/scripts/train.py \
   --buffer-size 100000 \
   --temperature-moves 30 \
   --priority-exponent 0.6 --per-beta 0.4 \
+  --reanalyze-fraction 0.25 \
   --live
 ```
 
@@ -274,6 +278,8 @@ uv run python alphazero-cpp/scripts/train.py \
 | `epochs` | 5 | Multiple passes for extraction. |
 | `priority_exponent` | 0.6 | PER continues. |
 | `per_beta` | 0.6 | Smoother convergence at this stage. |
+| `reanalyze_fraction` | 0.25 | Continue reanalysis with deeper sims (0.5 ratio = 800 sims). |
+| `reanalyze_simulations_ratio` | 0.5 | Higher ratio justified — stronger model benefits from deeper reanalysis. |
 | `opponent_risk` | -0.3:0.3 | Asymmetric self-play for robustness. |
 
 **LR decay:** 0.0001 → 0.00005 → 0.00002 → 0.00001 (at each loss plateau)
@@ -293,6 +299,7 @@ uv run python alphazero-cpp/scripts/train.py \
   --buffer-size 100000 \
   --temperature-moves 20 \
   --priority-exponent 0.6 --per-beta 0.6 \
+  --reanalyze-fraction 0.25 --reanalyze-simulations-ratio 0.5 \
   --opponent-risk "-0.3:0.3" \
   --live
 ```
@@ -404,7 +411,7 @@ Training unblocks only when **both** files are absent. If neither Claude Code no
 
 Keys prefixed with `_` (e.g., `_reason`) are treated as metadata — logged but not applied. Unknown keys are logged as warnings and skipped. Values are clamped to their valid range.
 
-**Not hot-reloadable (require restart):** `--priority-exponent`, `--per-beta`, `--filters`, `--blocks`, `--se-reduction`, `--buffer-size`, `--workers`, `--search-algorithm`. To change these, stop training and restart with `--resume`.
+**Not hot-reloadable (require restart):** `--priority-exponent`, `--per-beta`, `--reanalyze-fraction`, `--reanalyze-simulations-ratio`, `--reanalyze-workers`, `--filters`, `--blocks`, `--se-reduction`, `--buffer-size`, `--workers`, `--search-algorithm`. To change these, stop training and restart with `--resume`.
 
 #### Monitor Exit Codes
 
