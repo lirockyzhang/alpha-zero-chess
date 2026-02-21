@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+.worktrees/
 
 # Virtual environments
 .venv
@@ -20,4 +21,6 @@ logs/
 *.rpbf
 
 # checkpoints
-checkpoints/.worktrees/
+checkpoints/
+checkpoints/
+

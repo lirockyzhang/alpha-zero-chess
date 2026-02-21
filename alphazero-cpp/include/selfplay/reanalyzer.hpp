@@ -50,11 +50,24 @@ struct ReanalysisStats {
     std::atomic<int64_t> total_nn_evals{0};
     std::atomic<int64_t> positions_skipped{0};  // Terminal or missing FEN
 
+    // KL divergence accumulator: fixed-point (×1e7) sum of KL(old || new) per position.
+    // Divide by positions_completed to get mean KL.
+    static constexpr int64_t KL_SCALE = 10'000'000;
+    std::atomic<int64_t> total_kl_fixed{0};
+
     void reset() {
         positions_completed = 0;
         total_simulations = 0;
         total_nn_evals = 0;
         positions_skipped = 0;
+        total_kl_fixed = 0;
+    }
+
+    double mean_kl() const {
+        int64_t n = positions_completed.load(std::memory_order_relaxed);
+        if (n == 0) return 0.0;
+        return static_cast<double>(total_kl_fixed.load(std::memory_order_relaxed))
+               / (static_cast<double>(n) * KL_SCALE);
     }
 };
 

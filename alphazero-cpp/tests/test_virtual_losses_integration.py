@@ -59,7 +59,7 @@ def test_gumbel_selfplay():
         gpu_timeout_ms=100,
         worker_timeout_ms=5000,
         queue_capacity=256,
-        root_eval_retries=3,
+
         fpu_base=0.3,
         risk_beta=0.0,
         opponent_risk_min=0.0,
@@ -123,7 +123,7 @@ def test_puct_selfplay():
         gpu_timeout_ms=100,
         worker_timeout_ms=5000,
         queue_capacity=256,
-        root_eval_retries=3,
+
         fpu_base=0.3,
         risk_beta=0.0,
         opponent_risk_min=0.0,
@@ -182,7 +182,7 @@ def test_gumbel_with_replay_buffer():
         gpu_timeout_ms=100,
         worker_timeout_ms=5000,
         queue_capacity=256,
-        root_eval_retries=3,
+
         fpu_base=0.3,
         risk_beta=0.0,
         opponent_risk_min=0.0,

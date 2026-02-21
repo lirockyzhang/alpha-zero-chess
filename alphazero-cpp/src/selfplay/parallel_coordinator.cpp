@@ -110,7 +110,8 @@ void ParallelSelfPlayCoordinator::shutdown_gpu_thread() {
     running_.store(false, std::memory_order_release);
 }
 
-void ParallelSelfPlayCoordinator::set_secondary_queue(GlobalEvaluationQueue* queue) {
+void ParallelSelfPlayCoordinator::set_secondary_queue(
+    GlobalEvaluationQueue* queue) {
     secondary_queue_.store(queue, std::memory_order_release);
 }
 
@@ -256,29 +257,37 @@ void ParallelSelfPlayCoordinator::gpu_thread_func() {
             int primary_count = 0;
             bool primary_done = eval_queue_.is_shutdown();
             if (!primary_done) {
+                // Dynamic fire threshold: expected concurrent submissions.
+                // As games are claimed and workers exit, threshold shrinks
+                // so batches fire faster with fewer active submitters.
+                int remaining = games_remaining_.load(std::memory_order_relaxed);
+                int eff_workers = std::min(config_.num_workers, std::max(remaining, 1));
+                int fire_threshold = eff_workers * config_.mcts_batch_size;
+
                 primary_count = eval_queue_.collect_batch(
-                    &obs_ptr, &mask_ptr, config_.gpu_timeout_ms);
+                    &obs_ptr, &mask_ptr, config_.gpu_timeout_ms,
+                    0,                  // max_items = 0 (use max_batch_size_)
+                    fire_threshold,
+                    config_.stall_detection_us);
             }
 
             // === Secondary queue (reanalysis, fills spare capacity) ===
-            // IMPORTANT: secondary queue's gpu_batch_size MUST equal the primary's.
-            // collect_batch dequeues up to max_batch_size items; if we cap with sec_max,
-            // excess dequeued items would be lost (workers timeout). With equal batch
-            // sizes, collect_batch never returns more than gpu_batch_size total, and
-            // sec_max = gpu_batch_size - primary_count, so no excess is possible.
             int secondary_count = 0;
             auto* sec_queue = secondary_queue_.load(std::memory_order_acquire);
             if (sec_queue && !sec_queue->is_shutdown()) {
-                float* sec_obs = nullptr;
-                float* sec_mask = nullptr;
-                // Primary has items → non-blocking (fill gaps only)
-                // Primary empty   → full timeout (dedicated reanalysis mode)
-                int sec_timeout = (primary_count > 0) ? 0 : config_.gpu_timeout_ms;
                 int sec_max = static_cast<int>(config_.gpu_batch_size) - primary_count;
                 if (sec_max > 0) {
+                    float* sec_obs = nullptr;
+                    float* sec_mask = nullptr;
+                    // Primary has items → non-blocking (fill gaps only)
+                    // Primary empty   → full timeout (dedicated reanalysis mode)
+                    int sec_timeout = (primary_count > 0) ? 0 : config_.gpu_timeout_ms;
+                    // max_items=sec_max ensures collect_batch never returns
+                    // more entries than spare capacity — no clamping needed.
                     secondary_count = sec_queue->collect_batch(
-                        &sec_obs, &sec_mask, sec_timeout);
-                    secondary_count = std::min(secondary_count, sec_max);
+                        &sec_obs, &sec_mask, sec_timeout, sec_max,
+                        0,                          // fire_threshold = 0 (default)
+                        config_.stall_detection_us);
 
                     if (secondary_count > 0) {
                         if (primary_count > 0) {
@@ -332,7 +341,6 @@ void ParallelSelfPlayCoordinator::gpu_thread_func() {
                         wdl.data() + primary_count * 3);
                 }
             } catch (const std::exception& e) {
-                // Track error for debugging GPU thread issues
                 stats_.gpu_errors.fetch_add(1, std::memory_order_relaxed);
                 fprintf(stderr, "[ERROR] GPU thread evaluator exception: %s\n", e.what());
                 fflush(stderr);
@@ -341,6 +349,60 @@ void ParallelSelfPlayCoordinator::gpu_thread_func() {
                     if (last_error_.empty()) {
                         last_error_ = std::string("GPU thread: ") + e.what();
                     }
+                }
+
+                // Retry until success — batch data in obs_ptr/mask_ptr is still
+                // valid (only overwritten on next collect_batch). 100ms delay
+                // between attempts lets transient GPU errors self-resolve.
+                // Exit conditions: (1) retry succeeds, (2) shutdown requested.
+                bool retry_ok = false;
+                int retry_count = 0;
+                while (!retry_ok && !shutdown_.load(std::memory_order_acquire)) {
+                    ++retry_count;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    try {
+                        evaluator_(obs_ptr, mask_ptr, total_batch,
+                                   policies.data(), wdl.data());
+                        for (int i = 0; i < total_batch; ++i) {
+                            values[i] = mcts::wdl_to_value(
+                                wdl[i * 3 + 0], wdl[i * 3 + 1], wdl[i * 3 + 2]);
+                        }
+                        retry_ok = true;
+                        fprintf(stderr, "[INFO] GPU retry #%d succeeded for batch of %d\n",
+                                retry_count, total_batch);
+                        fflush(stderr);
+                    } catch (const std::exception& e2) {
+                        fprintf(stderr, "[ERROR] GPU retry #%d failed: %s\n",
+                                retry_count, e2.what());
+                        fflush(stderr);
+                    }
+                }
+
+                if (!retry_ok) {
+                    // Shutdown requested — submit fallback so workers can
+                    // wake up and exit cleanly.
+                    std::fill(policies.begin(), policies.begin() + total_batch * POLICY_SIZE,
+                              1.0f / POLICY_SIZE);
+                    std::fill(values.begin(), values.begin() + total_batch, 0.0f);
+                    for (int i = 0; i < total_batch; ++i) {
+                        wdl[i * 3 + 0] = 0.33f;
+                        wdl[i * 3 + 1] = 0.34f;
+                        wdl[i * 3 + 2] = 0.33f;
+                    }
+                }
+
+                // Always submit — real results on retry success, fallback on failure
+                if (primary_count > 0) {
+                    eval_queue_.submit_results(
+                        policies.data(), values.data(),
+                        primary_count, wdl.data());
+                }
+                if (secondary_count > 0 && sec_queue) {
+                    sec_queue->submit_results(
+                        policies.data() + primary_count * POLICY_SIZE,
+                        values.data() + primary_count,
+                        secondary_count,
+                        wdl.data() + primary_count * 3);
                 }
             }
         }
@@ -768,44 +830,42 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
         }
     }
 
-    // Submit root for evaluation with retry on timeout
+    // Submit root for evaluation (blocking submit with backpressure)
+    std::vector<int32_t> request_ids;
+    int submitted = eval_queue_.submit_for_evaluation(
+        worker_id,
+        obs_buffer.data(),
+        mask_buffer.data(),
+        1,
+        request_ids,
+        config_.worker_timeout_ms  // Blocking submit (backpressure)
+    );
+
+    if (submitted == 0) {
+        // Queue full or shutdown — skip this game
+        return;
+    }
+
+    // Retry loop: get_results returns 0 on timeout, retry until success or shutdown
     int got = 0;
-    for (int attempt = 0; attempt <= config_.root_eval_retries; ++attempt) {
-        if (attempt > 0) {
-            // Flush stale results from previous timed-out attempt
-            int flushed = eval_queue_.flush_worker_results(worker_id);
-            stats_.root_retries.fetch_add(1, std::memory_order_relaxed);
-            if (flushed > 0) {
-                stats_.stale_results_flushed.fetch_add(flushed, std::memory_order_relaxed);
-            }
-        }
-
-        std::vector<int32_t> request_ids;
-        eval_queue_.submit_for_evaluation(
-            worker_id,
-            obs_buffer.data(),
-            mask_buffer.data(),
-            1,
-            request_ids,
-            config_.worker_timeout_ms  // Blocking submit (backpressure)
-        );
-
+    int timeout_count = 0;
+    while (got == 0 && !shutdown_.load(std::memory_order_acquire)) {
         got = eval_queue_.get_results(
             worker_id,
             policy_buffer.data(),
             value_buffer.data(),
             1,
-            config_.worker_timeout_ms,
-            wdl_buffer.data()
+            wdl_buffer.data(),
+            config_.worker_timeout_ms
         );
-
-        if (got > 0 || shutdown_.load(std::memory_order_acquire)) {
-            break;
+        if (got == 0 && ++timeout_count % 5 == 0) {
+            fprintf(stderr, "[Worker %d] waiting for NN results (%ds)\n",
+                    worker_id, timeout_count * config_.worker_timeout_ms / 1000);
         }
     }
 
-    if (got == 0 || shutdown_.load(std::memory_order_acquire)) {
-        // All retries exhausted - caller falls back to uniform random
+    if (got == 0) {
+        // Only returns 0 on shutdown
         return;
     }
 
@@ -866,19 +926,24 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
                 continue;
             }
 
-            got = eval_queue_.get_results(
-                worker_id, policy_buffer.data(), value_buffer.data(),
-                queued, config_.worker_timeout_ms,
-                wdl_buffer.data()
-            );
+            // Retry loop: get_results returns 0 on timeout, retry until success or shutdown
+            got = 0;
+            timeout_count = 0;
+            while (got == 0 && !shutdown_.load(std::memory_order_acquire)) {
+                got = eval_queue_.get_results(
+                    worker_id, policy_buffer.data(), value_buffer.data(),
+                    queued, wdl_buffer.data(),
+                    config_.worker_timeout_ms
+                );
+                if (got == 0 && ++timeout_count % 5 == 0) {
+                    fprintf(stderr, "[Worker %d] waiting for NN results (%ds)\n",
+                            worker_id, timeout_count * config_.worker_timeout_ms / 1000);
+                }
+            }
 
             if (got == 0) {
                 search.cancel_pending_evaluations();
-                int flushed = eval_queue_.flush_worker_results(worker_id);
-                if (flushed > 0) {
-                    stats_.stale_results_flushed.fetch_add(flushed, std::memory_order_relaxed);
-                }
-                continue;
+                break;  // shutdown
             }
 
             stats_.total_nn_evals.fetch_add(got, std::memory_order_relaxed);
@@ -935,11 +1000,20 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
 
             // Step B: Get results from PREVIOUS batch
             if (prev_queued > 0) {
-                got = eval_queue_.get_results(
-                    worker_id, policy_buffer.data(), value_buffer.data(),
-                    prev_queued, config_.worker_timeout_ms,
-                    wdl_buffer.data()
-                );
+                // Retry loop: get_results returns 0 on timeout, retry until success or shutdown
+                got = 0;
+                timeout_count = 0;
+                while (got == 0 && !shutdown_.load(std::memory_order_acquire)) {
+                    got = eval_queue_.get_results(
+                        worker_id, policy_buffer.data(), value_buffer.data(),
+                        prev_queued, wdl_buffer.data(),
+                        config_.worker_timeout_ms
+                    );
+                    if (got == 0 && ++timeout_count % 5 == 0) {
+                        fprintf(stderr, "[Worker %d] waiting for NN results (%ds)\n",
+                                worker_id, timeout_count * config_.worker_timeout_ms / 1000);
+                    }
+                }
 
                 if (got > 0) {
                     stats_.total_nn_evals.fetch_add(got, std::memory_order_relaxed);
@@ -955,11 +1029,9 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
                     }
                     search.update_prev_leaves(policies, values, wdl_buffer.data());
                 } else {
+                    // got==0 only on shutdown
                     search.cancel_prev_pending();
-                    int flushed = eval_queue_.flush_worker_results(worker_id);
-                    if (flushed > 0) {
-                        stats_.stale_results_flushed.fetch_add(flushed, std::memory_order_relaxed);
-                    }
+                    break;
                 }
             }
 
@@ -986,11 +1058,20 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
 
         // Phase 3: Drain final batch
         if (prev_queued > 0) {
-            got = eval_queue_.get_results(
-                worker_id, policy_buffer.data(), value_buffer.data(),
-                prev_queued, config_.worker_timeout_ms,
-                wdl_buffer.data()
-            );
+            // Retry loop: get_results returns 0 on timeout, retry until success or shutdown
+            got = 0;
+            timeout_count = 0;
+            while (got == 0 && !shutdown_.load(std::memory_order_acquire)) {
+                got = eval_queue_.get_results(
+                    worker_id, policy_buffer.data(), value_buffer.data(),
+                    prev_queued, wdl_buffer.data(),
+                    config_.worker_timeout_ms
+                );
+                if (got == 0 && ++timeout_count % 5 == 0) {
+                    fprintf(stderr, "[Worker %d] waiting for NN results (%ds)\n",
+                            worker_id, timeout_count * config_.worker_timeout_ms / 1000);
+                }
+            }
 
             if (got > 0) {
                 stats_.total_nn_evals.fetch_add(got, std::memory_order_relaxed);
@@ -1007,7 +1088,6 @@ void ParallelSelfPlayCoordinator::run_mcts_search(
                 search.update_prev_leaves(policies, values, wdl_buffer.data());
             } else {
                 search.cancel_prev_pending();
-                eval_queue_.flush_worker_results(worker_id);
             }
         }
     }

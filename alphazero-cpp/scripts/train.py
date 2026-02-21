@@ -362,6 +362,7 @@ class IterationMetrics:
     # Reanalysis metrics
     reanalysis_positions: int = 0
     reanalysis_time_s: float = 0.0
+    reanalysis_mean_kl: float = 0.0
     # Timing
     total_time: float = 0.0
 
@@ -562,18 +563,22 @@ def find_latest_checkpoint(run_dir: str) -> Optional[str]:
     if not checkpoints:
         return None
 
-    # Sort by iteration number
+    # Sort by (iteration_number, is_regular) so non-emergency wins at same iter
     def extract_iter(path):
         name = os.path.basename(path)
+        is_emergency = '_emergency' in name
         # Handle both model_iter_001.pt and cpp_iter_1.pt formats
         try:
             if "model_iter_" in name:
-                return int(name.replace("model_iter_", "").replace(".pt", "").replace("_emergency", ""))
+                iter_num = int(name.replace("model_iter_", "").replace(".pt", "").replace("_emergency", ""))
             elif "cpp_iter_" in name:
-                return int(name.replace("cpp_iter_", "").replace(".pt", "").replace("_emergency", ""))
+                iter_num = int(name.replace("cpp_iter_", "").replace(".pt", "").replace("_emergency", ""))
+            else:
+                return (0, 0)
+            # Regular checkpoints (1) sort after emergency (0), so [-1] picks regular
+            return (iter_num, 0 if is_emergency else 1)
         except ValueError:
-            return 0
-        return 0
+            return (0, 0)
 
     checkpoints.sort(key=extract_iter)
     return checkpoints[-1]
@@ -1176,10 +1181,13 @@ def calibrate_cuda_graphs(
     network.eval()
     torch.cuda.synchronize()
 
-    # Test sizes: powers of 2, capped at eval_batch
-    test_sizes = [s for s in [8, 16, 32, 64, 128, 256, 512, 1024] if s <= eval_batch]
-    if eval_batch not in test_sizes:
-        test_sizes.append(eval_batch)
+    # Test sizes: powers of 2, capped at eval_batch // 2.
+    # Eager is only used for batches below the large graph threshold,
+    # so testing at full eval_batch wastes calibration time.
+    half_batch = eval_batch // 2
+    test_sizes = [s for s in [8, 16, 32, 64, 128, 256, 512, 1024] if s <= half_batch]
+    if half_batch > 0 and half_batch not in test_sizes:
+        test_sizes.append(half_batch)
     test_sizes = sorted(test_sizes)
 
     print("  GPU warmup...", end=" ", flush=True)
@@ -1461,7 +1469,6 @@ def collect_hardware_stats(coordinator, batch_size_histogram, cuda_graph_stats, 
     hw["batch_fill_ratio"]      = stats.get("batch_fill_ratio", 0.0)
     hw["pool_exhaustion_count"] = stats.get("pool_exhaustion_count", 0)
     hw["submission_drops"]      = stats.get("submission_drops", 0)
-    hw["root_retries"]          = stats.get("root_retries", 0)
     hw["avg_search_depth"]      = stats.get("avg_search_depth", 0.0)
     hw["max_search_depth"]      = stats.get("max_search_depth", 0)
     hw["nn_evals_per_sec"]      = stats.get("nn_evals_per_sec", 0.0)
@@ -1493,6 +1500,9 @@ def collect_hardware_stats(coordinator, batch_size_histogram, cuda_graph_stats, 
         hw["cuda_graph_pct"]    = round(100.0 * graph_fires / total_fires, 1)
         total_ms = cuda_graph_stats.get("total_infer_time_ms", 0.0)
         hw["avg_inference_ms"]  = round(total_ms / total_fires, 2)
+        total_cap = cuda_graph_stats.get("total_pad_capacity", 0)
+        if total_cap > 0:
+            hw["cuda_pad_waste_pct"] = round(100.0 * cuda_graph_stats.get("total_pad_waste", 0) / total_cap, 1)
 
     # --- GPU memory (Python side, torch.cuda) ---
     if device == "cuda":
@@ -1564,9 +1574,9 @@ def run_parallel_selfplay(
         dirichlet_epsilon=args.dirichlet_epsilon,
         temperature_moves=args.temperature_moves,
         gpu_timeout_ms=args.gpu_batch_timeout_ms,
+        stall_detection_us=args.stall_detection_us,
         worker_timeout_ms=args.worker_timeout_ms,
         queue_capacity=queue_capacity,
-        root_eval_retries=args.root_eval_retries,
         fpu_base=args.fpu_base,
         risk_beta=risk_beta,
         opponent_risk_min=args.opponent_risk_min,
@@ -1574,7 +1584,7 @@ def run_parallel_selfplay(
         use_gumbel=(args.search_algorithm == "gumbel"),
         gumbel_top_k=args.gumbel_top_k,
         gumbel_c_visit=args.gumbel_c_visit,
-        gumbel_c_scale=args.gumbel_c_scale
+        gumbel_c_scale=args.gumbel_c_scale,
     )
 
     # Set replay buffer so data is stored directly
@@ -1583,7 +1593,7 @@ def run_parallel_selfplay(
     print(f"  Parallel: {args.workers} workers × {games_per_worker} games = {actual_total_games} games")
     print(f"  eval_batch={args.eval_batch} GPU-effective "
           f"(input={args.input_batch_size}), gpu_timeout={args.gpu_batch_timeout_ms}ms, "
-          f"queue_capacity={queue_capacity}, root_eval_retries={args.root_eval_retries}")
+          f"stall={args.stall_detection_us}µs, queue_capacity={queue_capacity}")
     if args.search_algorithm == "gumbel":
         print(f"  Search: Gumbel Top-k SH (top_k={args.gumbel_top_k}, "
               f"c_visit={args.gumbel_c_visit}, c_scale={args.gumbel_c_scale})")
@@ -1653,21 +1663,23 @@ def run_parallel_selfplay(
         if r_sq < 0.5:
             print(f"  Calibration unreliable after retry (R²={r_sq:.3f}), using defaults")
             (mini_graph_size, small_graph_size, medium_graph_size,
-             large_graph_threshold, mini_threshold, small_threshold,
-             medium_threshold) = _use_default_calibration(gpu_batch_size)
+             *_unused) = _use_default_calibration(gpu_batch_size)
         else:
             mini_graph_size = calibration['mini_graph_size']
             small_graph_size = calibration['small_graph_size']
             medium_graph_size = calibration['medium_graph_size']
-            large_graph_threshold = calibration['large_graph_threshold']
-            mini_threshold = calibration.get('mini_threshold', 0)
-            small_threshold = calibration.get('small_threshold', 0)
-            medium_threshold = calibration.get('medium_threshold', 0)
             print(f"  Calibration completed in {calibration_time:.1f}s\n")
     else:
         (mini_graph_size, small_graph_size, medium_graph_size,
-         large_graph_threshold, mini_threshold, small_threshold,
-         medium_threshold) = _use_default_calibration(gpu_batch_size)
+         *_unused) = _use_default_calibration(gpu_batch_size)
+
+    # Large graph fires only when batch fills ≥75% of expected worker output.
+    # During end-of-iteration wind-down, batch sizes shrink below this
+    # threshold and fall through to the eager path (less padding waste).
+    large_graph_threshold = (args.workers * args.search_batch * 3) // 4
+    mini_threshold = 0
+    small_threshold = 0
+    medium_threshold = 0
 
     use_cuda_graph = (device == "cuda")
 
@@ -1778,8 +1790,8 @@ def run_parallel_selfplay(
 
             medium_str = f", medium={medium_graph_size}" if cuda_graph_medium is not None else ""
             print(f"  CUDA Graphs captured: large={gpu_batch_size}{medium_str}, small={small_graph_size}, mini={mini_graph_size}")
-            medium_route = f", batch<={medium_graph_size}(>={medium_threshold})->medium" if cuda_graph_medium is not None else ""
-            print(f"  Routing: batch>{large_graph_threshold}->large{medium_route}, batch<={small_graph_size}(>={small_threshold})->small, batch<={mini_graph_size}(>={mini_threshold})->mini, else->eager")
+            medium_route = f", <={medium_graph_size}->medium" if cuda_graph_medium is not None else ""
+            print(f"  Routing: <={mini_graph_size}->mini, <={small_graph_size}->small{medium_route}, >={large_graph_threshold}->large, else->eager")
             print(f"  Total buffer memory: {total_mem_mb:.1f} MB")
         except Exception as e:
             print(f"  CUDA Graph capture failed ({e}), falling back to eager mode")
@@ -1803,6 +1815,9 @@ def run_parallel_selfplay(
         'small_graph_time_ms': 0.0,
         'mini_graph_time_ms': 0.0,
         'eager_time_ms': 0.0,
+        # Padding waste tracking (graph_size - actual_batch_size)
+        'total_pad_waste': 0,
+        'total_pad_capacity': 0,
     }
 
     # Batch size histogram for distribution analysis
@@ -1829,12 +1844,15 @@ def run_parallel_selfplay(
         if len(batch_size_histogram['samples']) < batch_size_histogram['sample_limit']:
             batch_size_histogram['samples'].append((time.time(), batch_size))
 
-        # Route batch to the tightest-fitting graph (smallest first) using crossover thresholds
+        # Route batch to smallest CUDA graph that fits (no eager gap on CUDA).
+        # CUDA graph replay (~0.5ms) beats eager (~3-5ms) even with padding waste.
         path_taken = 'eager'
+        graph_size_used = 0
 
-        if use_cuda_graph and batch_size <= mini_graph_size and batch_size >= mini_threshold and cuda_graph_mini is not None:
-            # MINI GRAPH PATH: tiny batches — tightest fit
+        if use_cuda_graph and batch_size <= mini_graph_size and cuda_graph_mini is not None:
+            # MINI GRAPH PATH: tightest fit for tiny batches
             path_taken = 'mini'
+            graph_size_used = mini_graph_size
             cuda_graph_stats['mini_graph_fires'] += 1
 
             # permute is zero-copy metadata swap: NHWC → channels_last NCHW
@@ -1844,9 +1862,10 @@ def run_parallel_selfplay(
             policies = static_policy_mini[:batch_size]
             wdl_logits = static_wdl_mini[:batch_size]
 
-        elif use_cuda_graph and batch_size <= small_graph_size and batch_size >= small_threshold and cuda_graph_small is not None:
+        elif use_cuda_graph and batch_size <= small_graph_size and cuda_graph_small is not None:
             # SMALL GRAPH PATH: batch fits in small graph
             path_taken = 'small'
+            graph_size_used = small_graph_size
             cuda_graph_stats['small_graph_fires'] += 1
 
             static_obs_small[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]).permute(0, 3, 1, 2))
@@ -1855,9 +1874,10 @@ def run_parallel_selfplay(
             policies = static_policy_small[:batch_size]
             wdl_logits = static_wdl_small[:batch_size]
 
-        elif use_cuda_graph and batch_size <= medium_graph_size and batch_size >= medium_threshold and cuda_graph_medium is not None:
+        elif use_cuda_graph and batch_size <= medium_graph_size and cuda_graph_medium is not None:
             # MEDIUM GRAPH PATH: mid-range batches
             path_taken = 'medium'
+            graph_size_used = medium_graph_size
             cuda_graph_stats['medium_graph_fires'] += 1
 
             static_obs_medium[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]).permute(0, 3, 1, 2))
@@ -1866,9 +1886,11 @@ def run_parallel_selfplay(
             policies = static_policy_medium[:batch_size]
             wdl_logits = static_wdl_medium[:batch_size]
 
-        elif use_cuda_graph and batch_size > large_graph_threshold and cuda_graph_large is not None:
-            # LARGE GRAPH PATH: near-full batches — minimal padding waste
+        elif use_cuda_graph and cuda_graph_large is not None and batch_size >= large_graph_threshold:
+            # LARGE GRAPH PATH: only when batch fills ≥75% of expected worker output.
+            # C++ guarantees batch_size <= eval_batch (= gpu_batch_size)
             path_taken = 'large'
+            graph_size_used = gpu_batch_size
             cuda_graph_stats['large_graph_fires'] += 1
 
             static_obs_large[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]).permute(0, 3, 1, 2))
@@ -1878,9 +1900,9 @@ def run_parallel_selfplay(
             wdl_logits = static_wdl_large[:batch_size]
 
         else:
-            # EAGER PATH: batch doesn't qualify for any graph tier
+            # EAGER PATH: batch > medium but < large threshold (wind-down only),
+            # or CPU, or graph capture failed
             cuda_graph_stats['eager_fires'] += 1
-            # permute first (zero-copy), then float conversion respects channels_last
             obs_tensor = torch.from_numpy(obs_array[:batch_size]).permute(0, 3, 1, 2).float().to(device)
             mask_tensor = torch.from_numpy(mask_array[:batch_size]).float().to(device)
 
@@ -1889,6 +1911,11 @@ def run_parallel_selfplay(
                     policies, _, _, wdl_logits = network(obs_tensor, mask_tensor)
             else:
                 policies, _, _, wdl_logits = network(obs_tensor, mask_tensor)
+
+        # Track padding waste for CUDA graph tiers
+        if graph_size_used > 0:
+            cuda_graph_stats['total_pad_waste'] += graph_size_used - batch_size
+            cuda_graph_stats['total_pad_capacity'] += graph_size_used
 
         # Convert raw WDL logits to probabilities (softmax exactly once — no double softmax!)
         wdl_probs = F.softmax(wdl_logits.float(), dim=1)
@@ -2011,6 +2038,26 @@ def run_parallel_selfplay(
                 # Convert to sorted list of [bin_center, count]
                 batch_histogram_data = sorted([[k, v] for k, v in bins.items()])
 
+        # Reanalysis live stats helper (closure over reanalyzer + selfplay_start)
+        # Compute target count once from args (same formula as main loop line ~3278)
+        _reanalysis_target = int(replay_buffer.size() * args.reanalyze_fraction) if (reanalyzer is not None and args.reanalyze_fraction > 0) else 0
+
+        def _get_reanalysis_live_stats():
+            if reanalyzer is None:
+                return {}
+            try:
+                rs = reanalyzer.get_stats()
+                return {
+                    'reanalysis_completed': rs.get('positions_completed', 0),
+                    'reanalysis_skipped': rs.get('positions_skipped', 0),
+                    'reanalysis_total': _reanalysis_target,
+                    'reanalysis_nn_evals': rs.get('total_nn_evals', 0),
+                    'reanalysis_mean_kl': rs.get('mean_kl', 0.0),
+                    'reanalysis_elapsed_s': elapsed,
+                }
+            except Exception:
+                return {}
+
         # Live dashboard push (if enabled)
         if live_dashboard is not None:
             # Calculate GPU stats for dashboard (combining all graph fires)
@@ -2046,8 +2093,6 @@ def run_parallel_selfplay(
                 pool_load=live_stats.get('pool_load', 0.0),
                 avg_batch_size=live_stats.get('avg_batch_size', 0.0),
                 batch_fill_ratio=live_stats.get('batch_fill_ratio', 0.0),
-                root_retries=live_stats.get('root_retries', 0),
-                stale_flushed=live_stats.get('stale_results_flushed', 0),
                 # GPU metrics (separate counts for pie chart)
                 cuda_graph_fires=graph_fires,
                 large_graph_fires=cuda_graph_stats['large_graph_fires'],
@@ -2094,6 +2139,10 @@ def run_parallel_selfplay(
                 small_graph_time_ms=cuda_graph_stats['small_graph_time_ms'],
                 mini_graph_time_ms=cuda_graph_stats['mini_graph_time_ms'],
                 eager_time_ms=cuda_graph_stats['eager_time_ms'],
+                # Padding waste tracking
+                cuda_pad_waste_pct=round(100.0 * cuda_graph_stats['total_pad_waste'] / max(1, cuda_graph_stats['total_pad_capacity']), 1),
+                # Reanalysis live stats (if reanalyzer is active)
+                **(_get_reanalysis_live_stats()),
             )
 
     # Run generation with interrupt support (allows Ctrl+C to stop)
@@ -2149,8 +2198,6 @@ def run_parallel_selfplay(
         submission_waits = result.get('submission_waits', 0)
         avg_batch = result.get('avg_batch_size', 0)
         total_batches = result.get('total_batches', 0)
-        root_retries = result.get('root_retries', 0)
-        stale_flushed = result.get('stale_results_flushed', 0)
 
         # Calculate NN evals per move (should be ~51 for 800 sims, batch 64)
         nn_evals_per_move = metrics.total_nn_evals / max(metrics.total_moves, 1)
@@ -2178,16 +2225,14 @@ def run_parallel_selfplay(
                   f"range=[{sorted_sizes[0]}, {sorted_sizes[-1]}]")
             print(f"     Top 5: {', '.join(f'{s}({c})' for s, c in top5)}")
 
-        if mcts_failures > 0 or pool_exhaustion > 0 or partial_subs > 0 or root_retries > 0 or submission_waits > 0:
+        if mcts_failures > 0 or pool_exhaustion > 0 or partial_subs > 0 or submission_waits > 0:
             print(f"  Pipeline issues: {mcts_failures} MCTS failures ({failure_rate:.1f}%), "
                   f"pool_exhaustion={pool_exhaustion}, partial_subs={partial_subs}, "
                   f"drops={submission_drops}, resets={pool_resets}")
             if submission_waits > 0:
                 print(f"  Backpressure: {submission_waits} submission waits (workers waited for queue space)")
-            if root_retries > 0 or stale_flushed > 0:
-                print(f"  Retry stats: {root_retries} root retries, {stale_flushed} stale results flushed")
             if failure_rate > 10:
-                print(f"  HIGH FAILURE RATE - Consider increasing --worker-timeout-ms or --queue-capacity")
+                print(f"  HIGH FAILURE RATE - Consider increasing --queue-capacity")
     elif isinstance(result, list):
         # result is a list of game trajectories (if no replay buffer set)
         metrics.num_games = len(result)
@@ -2218,10 +2263,12 @@ def run_parallel_selfplay(
         completed = reanalysis_stats.get('positions_completed', 0)
         skipped = reanalysis_stats.get('positions_skipped', 0)
         nn_evals = reanalysis_stats.get('total_nn_evals', 0)
+        mean_kl = reanalysis_stats.get('mean_kl', 0.0)
         metrics.reanalysis_positions = completed
         metrics.reanalysis_time_s = reanalysis_tail
+        metrics.reanalysis_mean_kl = mean_kl
         print(f"  Reanalysis: {completed} positions updated, {skipped} skipped, "
-              f"{nn_evals} NN evals, tail={reanalysis_tail:.1f}s")
+              f"{nn_evals} NN evals, KL={mean_kl:.4f}, tail={reanalysis_tail:.1f}s")
 
     # Extract sample game for PGN export (if available)
     sample_game = None
@@ -2457,12 +2504,12 @@ Examples:
                         help="Self-play workers. 1=sequential, >1=parallel with cross-game batching (default: 1)")
     parser.add_argument("--gpu-batch-timeout-ms", type=int, default=20,
                         help="GPU batch collection timeout in ms (default: 20)")
+    parser.add_argument("--stall-detection-us", type=int, default=500,
+                        help="GPU spin-poll stall detection in µs (default: 500)")
     parser.add_argument("--worker-timeout-ms", type=int, default=2000,
                         help="Worker wait time for NN results in ms (default: 2000)")
     parser.add_argument("--queue-capacity", type=int, default=0,
                         help="Eval queue capacity. 0=auto-calculate (default: 0)")
-    parser.add_argument("--root-eval-retries", type=int, default=3,
-                        help="Max retries for root NN evaluation before falling back to uniform (default: 3)")
 
     # Risk / ERM
     parser.add_argument("--risk-beta", type=float, default=0.0,
@@ -3282,6 +3329,11 @@ Examples:
                 reanalysis_config.gumbel_top_k = args.gumbel_top_k
                 reanalysis_config.gumbel_c_visit = args.gumbel_c_visit
                 reanalysis_config.gumbel_c_scale = args.gumbel_c_scale
+                # Match primary queue capacity so collect_batch has consistent limits
+                if args.queue_capacity > 0:
+                    reanalysis_config.queue_capacity = args.queue_capacity
+                else:
+                    reanalysis_config.queue_capacity = max(8192, args.workers * args.search_batch * 16)
 
                 reanalyzer = alphazero_cpp.Reanalyzer(replay_buffer, reanalysis_config)
                 indices = _rng.sample(range(replay_buffer.size()), num_positions)
@@ -3300,6 +3352,7 @@ Examples:
             )
             metrics.reanalysis_positions = parallel_metrics.reanalysis_positions
             metrics.reanalysis_time_s = parallel_metrics.reanalysis_time_s
+            metrics.reanalysis_mean_kl = parallel_metrics.reanalysis_mean_kl
             metrics.num_games = parallel_metrics.num_games
             metrics.total_moves = parallel_metrics.total_moves
             metrics.total_simulations = parallel_metrics.total_simulations
@@ -3645,6 +3698,7 @@ Examples:
             # Reanalysis metrics
             "reanalysis_positions": metrics.reanalysis_positions,
             "reanalysis_time_s": metrics.reanalysis_time_s,
+            "reanalysis_mean_kl": metrics.reanalysis_mean_kl,
         }
         # Merge hardware/performance stats (empty dict in sequential mode)
         record.update(hw_stats)

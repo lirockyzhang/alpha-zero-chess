@@ -418,9 +418,9 @@ public:
         float dirichlet_epsilon = 0.25f,
         int temperature_moves = 30,
         int gpu_timeout_ms = 20,
+        int stall_detection_us = 500,
         int worker_timeout_ms = 2000,
         int queue_capacity = 8192,
-        int root_eval_retries = 3,
         float fpu_base = 1.0f,
         float risk_beta = 0.0f,
         float opponent_risk_min = 0.0f,
@@ -442,9 +442,9 @@ public:
         config_.dirichlet_epsilon = dirichlet_epsilon;
         config_.temperature_moves = temperature_moves;
         config_.gpu_timeout_ms = gpu_timeout_ms;
+        config_.stall_detection_us = stall_detection_us;
         config_.worker_timeout_ms = worker_timeout_ms;
         config_.queue_capacity = queue_capacity;
-        config_.root_eval_retries = root_eval_retries;
         config_.fpu_base = fpu_base;
         config_.risk_beta = risk_beta;
         config_.opponent_risk_min = opponent_risk_min;
@@ -522,10 +522,6 @@ public:
         result["pool_resets"] = qm.pool_resets.load(std::memory_order_relaxed);
         result["submission_waits"] = qm.submission_waits.load(std::memory_order_relaxed);
         result["total_leaves"] = total_leaves;
-
-        // Retry/stale result tracking
-        result["root_retries"] = stats.root_retries.load(std::memory_order_relaxed);
-        result["stale_results_flushed"] = stats.stale_results_flushed.load(std::memory_order_relaxed);
 
         // Pool load: fraction of leaves dropped (0.0 = healthy, >0 = pool bottleneck)
         result["pool_load"] = (total_leaves + drops) > 0
@@ -738,8 +734,6 @@ public:
         result["gpu_errors"] = stats.gpu_errors.load();  // Track GPU thread exceptions
         result["total_simulations"] = stats.total_simulations.load();
         result["total_nn_evals"] = stats.total_nn_evals.load();
-        result["root_retries"] = stats.root_retries.load();
-        result["stale_results_flushed"] = stats.stale_results_flushed.load();
 
         // Draw reason breakdown
         result["draws_repetition"] = stats.draws_repetition.load();
@@ -980,8 +974,6 @@ public:
         result["gpu_errors"] = stats.gpu_errors.load();
         result["total_simulations"] = stats.total_simulations.load();
         result["total_nn_evals"] = stats.total_nn_evals.load();
-        result["root_retries"] = stats.root_retries.load();
-        result["stale_results_flushed"] = stats.stale_results_flushed.load();
 
         result["draws_repetition"] = stats.draws_repetition.load();
         result["draws_stalemate"] = stats.draws_stalemate.load();
@@ -1000,6 +992,11 @@ public:
         result["avg_batch_size"] = queue_metrics.avg_batch_size();
         result["total_batches"] = queue_metrics.total_batches.load();
         result["total_leaves"] = queue_metrics.total_leaves.load();
+
+        // Batch fire reason breakdown
+        result["batches_fired_full"] = queue_metrics.batches_fired_full.load();
+        result["batches_fired_stall"] = queue_metrics.batches_fired_stall.load();
+        result["batches_fired_timeout"] = queue_metrics.batches_fired_timeout.load();
 
         result["max_search_depth"] = stats.max_search_depth.load();
         result["min_search_depth"] = stats.min_search_depth.load() == INT64_MAX
@@ -1118,9 +1115,9 @@ PYBIND11_MODULE(alphazero_cpp, m) {
              py::arg("dirichlet_epsilon") = 0.25f,
              py::arg("temperature_moves") = 30,
              py::arg("gpu_timeout_ms") = 20,
+             py::arg("stall_detection_us") = 500,
              py::arg("worker_timeout_ms") = 2000,
              py::arg("queue_capacity") = 8192,
-             py::arg("root_eval_retries") = 3,
              py::arg("fpu_base") = 1.0f,
              py::arg("risk_beta") = 0.0f,
              py::arg("opponent_risk_min") = 0.0f,
@@ -1142,9 +1139,9 @@ PYBIND11_MODULE(alphazero_cpp, m) {
              "  dirichlet_epsilon: Dirichlet noise weight (default 0.25)\n"
              "  temperature_moves: Moves with temperature=1.0 (default 30)\n"
              "  gpu_timeout_ms: GPU batch collection timeout (default 20)\n"
-             "  worker_timeout_ms: Worker wait time for NN results (default 2000)\n"
+             "  stall_detection_us: Spin-poll stall detection in microseconds (default 500)\n"
+             "  worker_timeout_ms: Worker submit backpressure timeout (default 2000)\n"
              "  queue_capacity: Evaluation queue capacity (default 8192)\n"
-             "  root_eval_retries: Max retries for root NN evaluation (default 3)\n"
              "  fpu_base: Dynamic FPU base penalty (default 1.0). penalty = fpu_base * (1 - prior)\n"
              "  risk_beta: ERM risk sensitivity (default 0.0). >0 risk-seeking, <0 risk-averse. Range [-3, 3]\n"
              "  opponent_risk_min: Min opponent risk beta for asymmetric games (default 0.0)\n"
@@ -1264,6 +1261,7 @@ PYBIND11_MODULE(alphazero_cpp, m) {
                  d["total_simulations"] = s.total_simulations.load();
                  d["total_nn_evals"] = s.total_nn_evals.load();
                  d["positions_skipped"] = s.positions_skipped.load();
+                 d["mean_kl"] = s.mean_kl();
                  return d;
              },
              "Get reanalysis statistics")

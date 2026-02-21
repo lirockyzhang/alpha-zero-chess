@@ -272,8 +272,8 @@ int GlobalEvaluationQueue::get_results(
     float* out_policies,
     float* out_values,
     int max_results,
-    int timeout_ms,
-    float* out_wdl)
+    float* out_wdl,
+    int timeout_ms)
 {
     if (worker_id < 0 || worker_id >= static_cast<int>(MAX_WORKERS)) {
         return 0;
@@ -284,15 +284,17 @@ int GlobalEvaluationQueue::get_results(
 
     std::unique_lock<std::mutex> lock(worker_mutexes_[worker_id]);
 
-    // Wait for results
-    bool success = worker_cvs_[worker_id].wait_for(
-        lock,
-        std::chrono::milliseconds(timeout_ms),
-        [this, worker_id, max_results]() {
-            return !worker_results_[worker_id].empty() ||
-                   shutdown_.load(std::memory_order_acquire);
-        }
-    );
+    // Timed wait — returns 0 on timeout (caller retries in a loop)
+    auto predicate = [this, worker_id]() {
+        return !worker_results_[worker_id].empty() ||
+               shutdown_.load(std::memory_order_acquire);
+    };
+
+    bool woke = worker_cvs_[worker_id].wait_for(
+        lock, std::chrono::milliseconds(timeout_ms), predicate);
+    if (!woke) {
+        return 0;  // Timeout — caller retries
+    }
 
     if (shutdown_.load(std::memory_order_acquire) && worker_results_[worker_id].empty()) {
         return 0;
@@ -431,10 +433,27 @@ int GlobalEvaluationQueue::flush_worker_results(int worker_id) {
 int GlobalEvaluationQueue::collect_batch(
     float** out_obs_ptr,
     float** out_mask_ptr,
-    int timeout_ms)
+    int timeout_ms,
+    int max_items,
+    int fire_threshold,
+    int stall_detection_us)
 {
     auto start = std::chrono::steady_clock::now();
     size_t batch_size = 0;
+
+    // Effective cap: max_items overrides max_batch_size_ when > 0
+    // Used by GPU thread to bound secondary queue to spare batch capacity
+    size_t effective_max = (max_items > 0)
+        ? std::min(max_batch_size_, static_cast<size_t>(max_items))
+        : max_batch_size_;
+
+    // fire_target: when to declare "batch full" and stop spinning.
+    // Clamped to effective_max (can't fire at more than we can hold).
+    // Distinction: fire_target controls *when to stop waiting*,
+    // effective_max controls *how many to take* from the queue.
+    size_t fire_target = (fire_threshold > 0)
+        ? std::min(static_cast<size_t>(fire_threshold), effective_max)
+        : effective_max;
 
     // =====================================================================
     // Phase 1 (under queue_mutex_, ~10µs): Metadata extraction
@@ -474,11 +493,11 @@ int GlobalEvaluationQueue::collect_batch(
         // Phase 1a [LOCK]:   CV wait for first request (full timeout).
         //                    Handles the idle GPU case (between iterations, shutdown).
         // Phase 1b [LOCK]:   Full batch? → skip spin-poll.
-        // Phase 1c [UNLOCK]: Spin-poll total_submissions_ (50µs stall window).
+        // Phase 1c [UNLOCK]: Spin-poll total_submissions_ (configurable stall window).
         //                    Workers can submit freely while GPU spins.
         // Phase 1d [RE-LOCK]: Extract metadata from staged_requests_.
 
-        // Phase 1a: Wait for at least 1 request
+        // Phase 1a: Wait for at least 1 request (just the idle→active transition).
         queue_cv_.wait_for(
             lock,
             std::chrono::milliseconds(timeout_ms),
@@ -492,14 +511,14 @@ int GlobalEvaluationQueue::collect_batch(
             return 0;
         }
 
-        // Phase 1b: Check if batch is already full — skip spin-poll
+        // Phase 1b: Check if batch already meets fire target — skip spin-poll
         size_t initial_size = staged_requests_.size();
-        bool need_spin = (initial_size < max_batch_size_) &&
+        bool need_spin = (initial_size < fire_target) &&
                          !shutdown_.load(std::memory_order_acquire);
 
         if (need_spin) {
             uint64_t snapshot = total_submissions_.load(std::memory_order_relaxed);
-            uint64_t need = max_batch_size_ - initial_size;
+            uint64_t need = fire_target - initial_size;
 
             // Phase 1c: Spin-poll OUTSIDE the lock — workers can submit freely
             lock.unlock();
@@ -508,6 +527,12 @@ int GlobalEvaluationQueue::collect_batch(
             auto stall_start = spin_start;
             uint64_t last_seen = snapshot;
             int spin_count = 0;
+            // Accumulation window = timeout_ms (--gpu-batch-timeout-ms, default 20ms):
+            // allows workers blocked on get_results() from the previous batch to wake up,
+            // submit their next wave of leaves, and fill the current batch before firing.
+            // The stall detection (stall_detection_us, default 500µs) breaks out immediately
+            // when no new submissions arrive, so a larger timeout only extends the window
+            // when submissions are actively trickling in.
             auto outer_deadline = spin_start + std::chrono::milliseconds(timeout_ms);
 
             // saw_growth defers the now() call to the less-frequent clock check,
@@ -540,9 +565,8 @@ int GlobalEvaluationQueue::collect_batch(
                     if (saw_growth) {
                         stall_start = now;   // reset stall timer on observed growth
                         saw_growth = false;
-                    } else if (now - stall_start
-                               > std::chrono::microseconds(50)) {
-                        break;  // 50us stall window — no new submissions
+                    } else if (now - stall_start > std::chrono::microseconds(stall_detection_us)) {
+                        break;  // stall window — no new submissions
                     }
                 }
             }
@@ -559,8 +583,8 @@ int GlobalEvaluationQueue::collect_batch(
         }
         // Falls through to metadata extraction below
 
-        // Collect up to max_batch_size requests — METADATA ONLY
-        batch_size = std::min(staged_requests_.size(), max_batch_size_);
+        // Collect up to effective_max requests — METADATA ONLY
+        batch_size = std::min(staged_requests_.size(), effective_max);
 
         batch_mapping_.clear();
         batch_mapping_.reserve(batch_size);

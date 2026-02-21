@@ -1,5 +1,6 @@
 #include "../../include/selfplay/reanalyzer.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -138,17 +139,32 @@ void Reanalyzer::worker_func(int worker_id) {
 
             // Submit for root evaluation
             std::vector<int32_t> request_ids;
-            eval_queue_.submit_for_evaluation(
+            int submitted = eval_queue_.submit_for_evaluation(
                 worker_id, obs_buffer.data(), mask_buffer.data(),
                 1, request_ids, config_.worker_timeout_ms);
 
-            int got = eval_queue_.get_results(
-                worker_id, policy_buffer.data(), value_buffer.data(),
-                1, config_.worker_timeout_ms, wdl_buffer.data());
-
-            if (got == 0 || shutdown_.load(std::memory_order_acquire)) {
+            if (submitted == 0) {
                 stats_.positions_skipped.fetch_add(1, std::memory_order_relaxed);
                 continue;
+            }
+
+            // Retry loop: get_results returns 0 on timeout, retry until success or shutdown
+            int got = 0;
+            int timeout_count = 0;
+            while (got == 0 && !shutdown_.load(std::memory_order_acquire)) {
+                got = eval_queue_.get_results(
+                    worker_id, policy_buffer.data(), value_buffer.data(),
+                    1, wdl_buffer.data(),
+                    config_.worker_timeout_ms);
+                if (got == 0 && ++timeout_count % 5 == 0) {
+                    fprintf(stderr, "[Reanalysis %d] waiting for NN results (%ds)\n",
+                            worker_id, timeout_count * config_.worker_timeout_ms / 1000);
+                }
+            }
+
+            if (got == 0) {
+                // Only returns 0 on shutdown
+                break;
             }
 
             stats_.total_nn_evals.fetch_add(1, std::memory_order_relaxed);
@@ -198,15 +214,23 @@ void Reanalyzer::worker_func(int worker_id) {
                     continue;
                 }
 
-                got = eval_queue_.get_results(
-                    worker_id, policy_buffer.data(), value_buffer.data(),
-                    queued, config_.worker_timeout_ms, wdl_buffer.data());
+                // Retry loop: get_results returns 0 on timeout, retry until success or shutdown
+                got = 0;
+                timeout_count = 0;
+                while (got == 0 && !shutdown_.load(std::memory_order_acquire)) {
+                    got = eval_queue_.get_results(
+                        worker_id, policy_buffer.data(), value_buffer.data(),
+                        queued, wdl_buffer.data(),
+                        config_.worker_timeout_ms);
+                    if (got == 0 && ++timeout_count % 5 == 0) {
+                        fprintf(stderr, "[Reanalysis %d] waiting for NN results (%ds)\n",
+                                worker_id, timeout_count * config_.worker_timeout_ms / 1000);
+                    }
+                }
 
                 if (got == 0) {
                     search.cancel_pending_evaluations();
-                    int flushed = eval_queue_.flush_worker_results(worker_id);
-                    (void)flushed;
-                    continue;
+                    break;  // shutdown
                 }
 
                 stats_.total_nn_evals.fetch_add(got, std::memory_order_relaxed);
@@ -238,6 +262,24 @@ void Reanalyzer::worker_func(int worker_id) {
                 if (total > 0.0f) {
                     for (float& p : new_policy) p /= total;
                 }
+            }
+
+            // Compute KL(old || new) before overwriting
+            const float* old_policy = buffer_.get_policy_ptr(index);
+            if (old_policy) {
+                constexpr float eps = 1e-8f;
+                double kl = 0.0;
+                for (int i = 0; i < encoding::MoveEncoder::POLICY_SIZE; ++i) {
+                    float p = old_policy[i];
+                    if (p > eps) {
+                        float q = new_policy[i] + eps;
+                        kl += static_cast<double>(p) * std::log(static_cast<double>(p) / q);
+                    }
+                }
+                // Clamp negative values from floating-point noise
+                if (kl < 0.0) kl = 0.0;
+                int64_t kl_fixed = static_cast<int64_t>(kl * ReanalysisStats::KL_SCALE);
+                stats_.total_kl_fixed.fetch_add(kl_fixed, std::memory_order_relaxed);
             }
 
             // Write updated policy back to buffer

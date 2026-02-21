@@ -161,15 +161,15 @@ public:
     int flush_worker_results(int worker_id);
 
     // Wait for and retrieve results for this worker
-    // Blocks until at least min_results are available or timeout
-    // Returns: number of results retrieved
+    // Blocks until results arrive, timeout expires, or shutdown is signaled
+    // Returns: number of results retrieved (0 on timeout or shutdown — caller retries)
     int get_results(
         int worker_id,
         float* out_policies,            // max_results x POLICY_SIZE
         float* out_values,              // max_results
         int max_results,
-        int timeout_ms = 100,
-        float* out_wdl = nullptr        // max_results x 3 (WDL probs, optional for Phase 2)
+        float* out_wdl = nullptr,       // max_results x 3 (WDL probs, optional for Phase 2)
+        int timeout_ms = 5000           // Timeout in ms (default 5s)
     );
 
     // Non-blocking result retrieval: returns immediately with whatever results are available
@@ -189,10 +189,15 @@ public:
     // Collect a batch of requests for GPU evaluation
     // Blocks until: (1) batch is full OR (2) timeout expires and queue non-empty
     // Returns: number of leaves in batch (0 if shutdown or timeout with empty queue)
+    // max_items: if > 0, caps items returned (overrides max_batch_size_).
+    //   Used by GPU thread to bound secondary queue collection to spare capacity.
     int collect_batch(
         float** out_obs_ptr,            // Pointer to observation batch
         float** out_mask_ptr,           // Pointer to mask batch
-        int timeout_ms = 5
+        int timeout_ms = 5,
+        int max_items = 0,              // 0 = use max_batch_size_ (default)
+        int fire_threshold = 0,         // Spin-poll target (0 = use effective_max)
+        int stall_detection_us = 500    // Stall detection window (µs)
     );
 
     // Submit results back after GPU evaluation

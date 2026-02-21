@@ -528,6 +528,22 @@ DASHBOARD_HTML = """
                 <div class="metric-row"><span>CUDA Graph:</span><span id="cuda-graph-status">--</span></div>
             </div>
 
+            <!-- Reanalysis Performance Card (hidden until reanalysis data arrives) -->
+            <div class="monitoring-card" id="reanalysis-perf-card" style="display:none;">
+                <h4>🔄 Reanalysis Performance</h4>
+                <div class="metric-row"><span>Speed:</span><span id="reanalysis-speed">0 pos/s</span></div>
+                <div class="metric-row"><span>Completed:</span><span id="reanalysis-completed">0</span></div>
+                <div class="metric-row"><span>Skipped:</span><span id="reanalysis-skipped">0</span></div>
+                <div class="metric-row"><span>NN Evals:</span><span id="reanalysis-nn-evals">0</span></div>
+                <div class="metric-row"><span>Mean KL:</span><span id="reanalysis-kl">0.000</span></div>
+                <div style="margin-top: 6px;">
+                    <div style="background: rgba(255,255,255,0.1); border-radius: 4px; height: 8px; overflow: hidden;">
+                        <div id="reanalysis-progress-bar" style="background: linear-gradient(90deg, #1abc9c, #2ecc71); height: 100%; width: 0%; transition: width 0.5s;"></div>
+                    </div>
+                    <div style="font-size: 0.7em; color: #95a5a6; margin-top: 2px; text-align: center;" id="reanalysis-progress-text">0%</div>
+                </div>
+            </div>
+
             <!-- Iteration Progress Card -->
             <div class="monitoring-card">
                 <h4>📊 Iteration Progress</h4>
@@ -758,6 +774,12 @@ DASHBOARD_HTML = """
             <div id="game-length-chart" class="chart"></div>
         </div>
 
+        <!-- Reanalysis -->
+        <div class="card" id="reanalysis-card" style="display:none;">
+            <h3>🔄 Reanalysis</h3>
+            <div id="reanalysis-chart" class="chart"></div>
+        </div>
+
     </div>
 
     <div class="footer">
@@ -783,6 +805,8 @@ DASHBOARD_HTML = """
             selfplayTime: [],
             trainTime: [],
             avgGameLength: [],
+            reanalysisPositions: [],
+            reanalysisKL: [],
         };
 
         let totalGames = 0;
@@ -894,6 +918,22 @@ DASHBOARD_HTML = """
                 marker: { size: 4 }
             }], {...layoutDefaults, yaxis: {...layoutDefaults.yaxis, title: 'Moves per Game'}});
 
+            // Reanalysis chart (dual y-axis: positions + KL divergence)
+            Plotly.newPlot('reanalysis-chart', [
+                { x: [], y: [], type: 'scatter', mode: 'lines+markers',
+                  name: 'Positions Updated', line: { color: colors.primary, width: 2 },
+                  marker: { size: 4 } },
+                { x: [], y: [], type: 'scatter', mode: 'lines+markers',
+                  name: 'Mean KL', line: { color: colors.tertiary, width: 2, dash: 'dot' },
+                  marker: { size: 4 }, yaxis: 'y2' }
+            ], {...layoutDefaults,
+                yaxis: {...layoutDefaults.yaxis, title: 'Positions'},
+                yaxis2: { title: 'KL Divergence', overlaying: 'y', side: 'right',
+                          gridcolor: 'rgba(255,255,255,0.05)',
+                          titlefont: { color: colors.tertiary },
+                          tickfont: { color: colors.tertiary } }
+            });
+
             // Batch size histogram
             Plotly.newPlot('batch-histogram', [{
                 x: [], y: [], type: 'bar',
@@ -974,6 +1014,8 @@ DASHBOARD_HTML = """
             data.selfplayTime.push(metrics.selfplay_time);
             data.trainTime.push(metrics.train_time);
             data.avgGameLength.push(metrics.avg_game_length);
+            data.reanalysisPositions.push(metrics.reanalysis_positions || 0);
+            data.reanalysisKL.push(metrics.reanalysis_mean_kl || 0);
             // Update cumulative stats
             totalGames += metrics.num_games;
             totalMoves += Math.round(metrics.moves_per_sec * metrics.selfplay_time);
@@ -1021,6 +1063,25 @@ DASHBOARD_HTML = """
                 { x: data.iterations.slice(), y: data.selfplayTime.slice(), type: 'bar', name: 'Self-Play', marker: { color: colors.primary } },
                 { x: data.iterations.slice(), y: data.trainTime.slice(), type: 'bar', name: 'Training', marker: { color: colors.tertiary } }
             ], {...layoutDefaults, barmode: 'stack', yaxis: {...layoutDefaults.yaxis, title: 'Seconds'}});
+
+            // Update reanalysis chart (show card only if data exists)
+            const hasReanalysis = data.reanalysisPositions.some(v => v > 0);
+            if (hasReanalysis) {
+                document.getElementById('reanalysis-card').style.display = '';
+                Plotly.react('reanalysis-chart', [
+                    { x: data.iterations.slice(), y: data.reanalysisPositions.slice(), type: 'scatter', mode: 'lines+markers',
+                      name: 'Positions Updated', line: { color: colors.primary, width: 2 }, marker: { size: 4 } },
+                    { x: data.iterations.slice(), y: data.reanalysisKL.slice(), type: 'scatter', mode: 'lines+markers',
+                      name: 'Mean KL', line: { color: colors.tertiary, width: 2, dash: 'dot' },
+                      marker: { size: 4 }, yaxis: 'y2' }
+                ], {...layoutDefaults,
+                    yaxis: {...layoutDefaults.yaxis, title: 'Positions'},
+                    yaxis2: { title: 'KL Divergence', overlaying: 'y', side: 'right',
+                              gridcolor: 'rgba(255,255,255,0.05)',
+                              titlefont: { color: colors.tertiary },
+                              tickfont: { color: colors.tertiary } }
+                });
+            }
 
             // Update header stats
             document.getElementById('iteration').textContent = iter;
@@ -1123,17 +1184,13 @@ DASHBOARD_HTML = """
                 const exhaustions = data.pool_exhaustion || 0;
                 const partials = data.partial_subs || 0;
                 const failures = data.timeout_evals || 0;
-                const retries = data.root_retries || 0;
-                const staleFlushed = data.stale_flushed || 0;
                 const totalIssues = drops + exhaustions + failures;
-                if (totalIssues === 0 && retries === 0) {
+                if (totalIssues === 0) {
                     pipelineEl.textContent = '✅ Healthy';
                     pipelineEl.style.color = '#2ecc71';
                 } else {
                     const parts = [];
                     if (failures > 0) parts.push(`${failures} timeouts`);
-                    if (retries > 0) parts.push(`${retries} root retries`);
-                    if (staleFlushed > 0) parts.push(`${staleFlushed} stale flushed`);
                     if (exhaustions > 0) parts.push(`${exhaustions.toLocaleString()} exhaustions`);
                     if (drops > 0) parts.push(`${drops.toLocaleString()} drops`);
                     pipelineEl.textContent = '⚠️ ' + parts.join(', ');
@@ -1215,6 +1272,32 @@ DASHBOARD_HTML = """
                     }
                 } else {
                     refCard.style.display = 'none';
+                }
+
+                // Reanalysis Performance card (show when reanalysis is active)
+                const reanalCompleted = data.reanalysis_completed || 0;
+                const reanalSkipped = data.reanalysis_skipped || 0;
+                const reanalTarget = data.reanalysis_total || 0;
+                const reanalNNEvals = data.reanalysis_nn_evals || 0;
+                const reanalKL = data.reanalysis_mean_kl || 0;
+                const reanalElapsed = data.reanalysis_elapsed_s || 0;
+                const reanalCard = document.getElementById('reanalysis-perf-card');
+                if (reanalTarget > 0) {
+                    reanalCard.style.display = '';
+                    const speed = reanalElapsed > 0 ? (reanalCompleted / reanalElapsed).toFixed(1) : '0';
+                    updateMetricWithHighlight('reanalysis-speed', speed + ' pos/s');
+                    updateMetricWithHighlight('reanalysis-completed', reanalCompleted.toLocaleString() + ' / ' + reanalTarget.toLocaleString());
+                    updateMetricWithHighlight('reanalysis-skipped', reanalSkipped.toLocaleString());
+                    updateMetricWithHighlight('reanalysis-nn-evals', reanalNNEvals.toLocaleString());
+                    updateMetricWithHighlight('reanalysis-kl', reanalKL > 0 ? reanalKL.toFixed(3) : '--');
+                    // Progress bar based on processed / target
+                    const processed = reanalCompleted + reanalSkipped;
+                    const pct = reanalTarget > 0 ? Math.min(100, (processed / reanalTarget) * 100) : 0;
+                    document.getElementById('reanalysis-progress-bar').style.width = pct.toFixed(1) + '%';
+                    document.getElementById('reanalysis-progress-text').textContent =
+                        pct.toFixed(0) + '% (' + processed.toLocaleString() + ' / ' + reanalTarget.toLocaleString() + ')';
+                } else {
+                    reanalCard.style.display = 'none';
                 }
 
                 // Update buffer size in header
@@ -1741,6 +1824,9 @@ class LiveDashboardServer:
             'draws_fifty_move': getattr(metrics, 'draws_fifty_move', 0),
             'draws_insufficient': getattr(metrics, 'draws_insufficient', 0),
             'draws_max_moves': getattr(metrics, 'draws_max_moves', 0),
+            'reanalysis_positions': getattr(metrics, 'reanalysis_positions', 0),
+            'reanalysis_time_s': getattr(metrics, 'reanalysis_time_s', 0.0),
+            'reanalysis_mean_kl': getattr(metrics, 'reanalysis_mean_kl', 0.0),
         }
 
         self.history.append(dashboard_metrics)
@@ -1767,8 +1853,6 @@ class LiveDashboardServer:
                        pool_load: float = 0.0,
                        avg_batch_size: float = 0.0,
                        batch_fill_ratio: float = 0.0,
-                       root_retries: int = 0,
-                       stale_flushed: int = 0,
                        # GPU metrics
                        cuda_graph_fires: int = 0,  # Deprecated: sum of all graph fires
                        large_graph_fires: int = 0,
@@ -1814,7 +1898,16 @@ class LiveDashboardServer:
                        medium_graph_time_ms: float = 0.0,
                        small_graph_time_ms: float = 0.0,
                        mini_graph_time_ms: float = 0.0,
-                       eager_time_ms: float = 0.0):
+                       eager_time_ms: float = 0.0,
+                       # Padding waste
+                       cuda_pad_waste_pct: float = 0.0,
+                       # Reanalysis live stats
+                       reanalysis_completed: int = 0,
+                       reanalysis_skipped: int = 0,
+                       reanalysis_total: int = 0,
+                       reanalysis_nn_evals: int = 0,
+                       reanalysis_mean_kl: float = 0.0,
+                       reanalysis_elapsed_s: float = 0.0):
         """Push real-time progress updates during self-play (every few seconds).
 
         Args:
@@ -1835,8 +1928,6 @@ class LiveDashboardServer:
             pool_load: Drop rate (0.0 = healthy, >0 = drops occurring)
             avg_batch_size: Average GPU batch size
             batch_fill_ratio: GPU batch fill ratio (>0.8 = GPU saturated, <0.3 = batch underfilled, 0.3-0.8 = balanced)
-            root_retries: Times root eval was retried after timeout
-            stale_flushed: Total stale results discarded via generation filtering
         """
         if not self.running or self.socketio is None:
             return
@@ -1890,8 +1981,6 @@ class LiveDashboardServer:
             'pool_load': pool_load,
             'avg_batch_size': avg_batch_size,
             'batch_fill_ratio': batch_fill_ratio,
-            'root_retries': root_retries,
-            'stale_flushed': stale_flushed,
             # GPU metrics
             'cuda_graph_fires': cuda_graph_fires,
             'large_graph_fires': large_graph_fires,
@@ -1938,6 +2027,15 @@ class LiveDashboardServer:
             'small_graph_time_ms': small_graph_time_ms,
             'mini_graph_time_ms': mini_graph_time_ms,
             'eager_time_ms': eager_time_ms,
+            # Padding waste
+            'cuda_pad_waste_pct': cuda_pad_waste_pct,
+            # Reanalysis live stats
+            'reanalysis_completed': reanalysis_completed,
+            'reanalysis_skipped': reanalysis_skipped,
+            'reanalysis_total': reanalysis_total,
+            'reanalysis_nn_evals': reanalysis_nn_evals,
+            'reanalysis_mean_kl': reanalysis_mean_kl,
+            'reanalysis_elapsed_s': reanalysis_elapsed_s,
         }
 
         self.socketio.emit('progress', progress_data)

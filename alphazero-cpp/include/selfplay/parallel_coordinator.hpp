@@ -44,13 +44,11 @@ struct ParallelSelfPlayConfig {
     // GPU batching configuration
     int gpu_batch_size = 512;           // Maximum GPU batch size
     int gpu_timeout_ms = 20;            // GPU batch timeout (ms) - synchronized with Python default
+    int stall_detection_us = 500;       // Spin-poll stall detection (µs)
     int worker_timeout_ms = 2000;       // Worker result timeout (ms) - increased for GIL/GPU latency
 
     // Queue configuration
     int queue_capacity = 8192;          // Evaluation queue capacity (increased to prevent exhaustion)
-
-    // Retry configuration
-    int root_eval_retries = 3;          // Max retries for root NN evaluation before giving up
 
     // Dynamic FPU
     float fpu_base = 0.3f;              // Dynamic FPU: penalty = fpu_base * sqrt(1 - prior)
@@ -109,10 +107,6 @@ struct ParallelSelfPlayStats {
     std::atomic<int64_t> mcts_failures{0};  // MCTS returned zero visits (eval timeout/error)
     std::atomic<int64_t> gpu_errors{0};     // GPU thread exceptions
 
-    // Retry/stale result tracking
-    std::atomic<int64_t> root_retries{0};           // Times root eval was retried (timeout recovery)
-    std::atomic<int64_t> stale_results_flushed{0};  // Total stale results discarded
-
     // Tree depth tracking (across all moves in this generation)
     std::atomic<int64_t> max_search_depth{0};        // Deepest simulation across all moves
     std::atomic<int64_t> min_search_depth{INT64_MAX}; // Shallowest simulation (sentinel: CAS naturally reduces)
@@ -144,8 +138,6 @@ struct ParallelSelfPlayStats {
         total_mcts_time_ms = 0;
         mcts_failures = 0;
         gpu_errors = 0;
-        root_retries = 0;
-        stale_results_flushed = 0;
         max_search_depth = 0;
         min_search_depth = INT64_MAX;
         total_max_depth = 0;

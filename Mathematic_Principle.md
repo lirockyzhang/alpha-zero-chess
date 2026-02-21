@@ -707,7 +707,7 @@ Each worker runs `play_single_game()`:
 
 1. **NodePool reset between moves** (not just between games) — prevents OOM on long games with 800+ simulations per move
 2. **Per-game asymmetric risk:** if configured, one side uses `risk_beta` while the opponent samples from `[opponent_risk_min, opponent_risk_max]`, randomly assigned per game to avoid color bias
-3. **Root NN evaluation with retry:** up to `root_eval_retries` attempts with stale result flushing between retries
+3. **Root NN evaluation with blocking wait:** workers block until results arrive (no timeout/retry), with a 60s watchdog abort for hung GPU threads
 
 **Temperature-based move selection:**
 ```

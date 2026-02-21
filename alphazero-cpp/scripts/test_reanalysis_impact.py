@@ -21,6 +21,12 @@ Usage:
     # Skip evaluation (just compare training metrics)
     uv run python alphazero-cpp/scripts/test_reanalysis_impact.py --skip-eval
 
+    # See optimal worker allocation for your config
+    uv run python alphazero-cpp/scripts/test_reanalysis_impact.py \
+        --recommend --workers 16 --reanalyze-fraction 0.25 \
+        --search-batch 16 --simulations 200 --games-per-iter 50 \
+        --buffer-size 100000
+
 Requires:
     - alphazero_cpp built and importable
     - --reanalyze-fraction support in train.py (for reanalysis run)
@@ -36,65 +42,23 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 SEPARATOR = "=" * 70
 
+# Default avg game length for estimation when no empirical data available.
+# With Gumbel search, games are ~300-400 moves; 300 is conservative.
+DEFAULT_AVG_GAME_LENGTH = 300
 
-def log(msg: str, label: str = "", flush: bool = True) -> None:
+
+def log(msg: str, label: str = "") -> None:
     """Print a timestamped log line. Always flushes for real-time visibility."""
     ts = datetime.now().strftime("%H:%M:%S")
     prefix = f"[{ts}]"
     if label:
         prefix += f" [{label}]"
-    print(f"{prefix} {msg}", flush=flush)
-
-
-class Heartbeat:
-    """Background thread that prints a heartbeat if no output for N seconds.
-
-    Prevents the user from thinking the script is frozen during long
-    subprocess runs where stdout may be buffered.
-    """
-
-    def __init__(self, interval: float = 30.0, label: str = ""):
-        self._interval = interval
-        self._label = label
-        self._stop = threading.Event()
-        self._last_activity = time.monotonic()
-        self._thread: Optional[threading.Thread] = None
-        self._lines = 0
-
-    def pulse(self) -> None:
-        """Call whenever there is output activity."""
-        self._last_activity = time.monotonic()
-        self._lines += 1
-
-    def start(self) -> "Heartbeat":
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        return self
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=2)
-
-    def _run(self) -> None:
-        while not self._stop.wait(self._interval):
-            idle = time.monotonic() - self._last_activity
-            if idle >= self._interval:
-                log(
-                    f"still running... ({self._lines} lines so far, "
-                    f"idle {idle:.0f}s)",
-                    label=self._label,
-                )
-
-
-# Default avg game length for estimation when no empirical data available.
-# With Gumbel search, games are ~300-400 moves; 300 is conservative.
-DEFAULT_AVG_GAME_LENGTH = 300
+    print(f"{prefix} {msg}", flush=True)
 
 
 # =============================================================================
@@ -163,27 +127,6 @@ def recommend_worker_allocation(
 
     This is pure GPU overhead.  Wall-clock increase may be less if the GPU
     was not 100% utilized (workers had CPU gaps).
-
-    Args:
-        total_workers: Total worker count (W_sp + W_ra).
-        reanalyze_fraction: Target fraction of training batch from reanalysis.
-        search_batch: Leaves per MCTS step per worker (gumbel_top_k for Gumbel).
-        buffer_size: Replay buffer capacity in positions.
-        games_per_iter: Self-play games per training iteration.
-        simulations: MCTS simulations per move.
-        avg_game_length: Estimated average game length in moves.
-
-    Returns:
-        Dict with keys:
-            w_selfplay, w_reanalysis: Recommended worker counts.
-            eval_batch: Recommended GPU batch size.
-            gpu_overhead: Multiplicative GPU overhead factor (1/(1-f)).
-            buffer_iterations: How many iterations of data the buffer holds.
-            buffer_sufficient: Whether the buffer is large enough for reanalysis.
-            nn_evals_selfplay: NN evals from self-play per iteration.
-            nn_evals_reanalysis: NN evals from reanalysis per iteration.
-            nn_evals_total: Total NN evals per iteration.
-            notes: List of advisory strings.
     """
     f = reanalyze_fraction
     W = total_workers
@@ -194,14 +137,12 @@ def recommend_worker_allocation(
     if f <= 0:
         w_sp, w_ra = W, 0
     elif f >= 1.0:
-        # Degenerate: all reanalysis, no new games.  Not useful.
         w_sp, w_ra = 1, max(0, W - 1)
         notes.append("WARNING: fraction >= 1.0 means no new self-play data.")
     else:
         w_sp = max(1, round((1 - f) * W))
         w_ra = W - w_sp
 
-    # Ensure at least 1 self-play worker
     if w_sp < 1:
         w_sp = 1
         w_ra = W - 1
@@ -237,7 +178,7 @@ def recommend_worker_allocation(
             f"Some workers will queue across 2+ GPU passes."
         )
     fill_pct = leaves_per_step / eval_batch * 100 if eval_batch > 0 else 0
-    large_threshold_pct = 87.5  # CUDA graph large-graph fill requirement
+    large_threshold_pct = 87.5
     if fill_pct < large_threshold_pct:
         notes.append(
             f"Estimated batch fill {fill_pct:.0f}% < {large_threshold_pct:.0f}% "
@@ -293,7 +234,6 @@ def print_recommendation(rec: Dict[str, Any], total_workers: int, f: float) -> N
         for note in rec["notes"]:
             print(f"    * {note}")
 
-    # Sensitivity table: show allocation across fraction values
     print(f"""
   Sensitivity (workers={total_workers}):
     Fraction   W_sp   W_ra   GPU overhead   Eval budget ratio
@@ -311,29 +251,111 @@ def print_recommendation(rec: Dict[str, Any], total_workers: int, f: float) -> N
 
 
 # =============================================================================
+# File-Based Log Tailer (replaces pipe-based approach)
+# =============================================================================
+
+def _tail_log_file(
+    log_path: str,
+    label: str,
+    stop_event: threading.Event,
+    run_dir_out: list,
+    heartbeat_interval: float = 30.0,
+) -> None:
+    """Background thread: tail a log file, print lines with prefix, parse run_dir.
+
+    Writes to stdout with flush=True for real-time display.  Prints heartbeat
+    messages during long silent periods so the user knows the process is alive.
+
+    This function is the thread target for file-based subprocess monitoring.
+    Using a file instead of a pipe avoids Windows pipe buffer deadlocks:
+    the child never blocks on write because files have unlimited capacity.
+
+    Args:
+        log_path: Path to the log file being written by the subprocess.
+        label: Display prefix (e.g., "Baseline", "Reanalysis").
+        stop_event: Set by main thread when subprocess has finished.
+        run_dir_out: Single-element list; thread stores parsed run_dir here.
+        heartbeat_interval: Seconds of silence before printing "still running".
+    """
+    # Wait for log file to appear (subprocess hasn't started writing yet)
+    while not os.path.exists(log_path):
+        if stop_event.is_set():
+            return
+        time.sleep(0.05)
+
+    last_output = time.monotonic()
+    lines_seen = 0
+
+    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+        while True:
+            line = f.readline()
+            if line:
+                line = line.rstrip("\n\r")
+                lines_seen += 1
+                last_output = time.monotonic()
+                print(f"  [{label}] {line}", flush=True)
+
+                # Parse run directory from train.py output
+                if "Run directory:" in line:
+                    path = line.split("Run directory:")[-1].strip()
+                    if path and os.path.isdir(path):
+                        run_dir_out[0] = path
+            else:
+                # No new data available
+                if stop_event.is_set():
+                    # Process finished -- do one final drain pass
+                    while True:
+                        remaining = f.readline()
+                        if not remaining:
+                            break
+                        remaining = remaining.rstrip("\n\r")
+                        print(f"  [{label}] {remaining}", flush=True)
+                        if "Run directory:" in remaining:
+                            path = remaining.split("Run directory:")[-1].strip()
+                            if path and os.path.isdir(path):
+                                run_dir_out[0] = path
+                    return
+
+                # Heartbeat: print "still running" during long silences
+                idle = time.monotonic() - last_output
+                if idle >= heartbeat_interval:
+                    log(f"still running... ({lines_seen} lines, idle {idle:.0f}s)",
+                        label=label)
+                    last_output = time.monotonic()
+
+                time.sleep(0.2)
+
+
+# =============================================================================
 # Training Subprocess
 # =============================================================================
 
-def run_training(args: argparse.Namespace, fraction: float, label: str) -> str:
-    """Run train.py as a subprocess and return the run directory path.
+def run_training(
+    args: argparse.Namespace,
+    fraction: float,
+    label: str,
+    log_dir: str,
+    timeout: int = 3600,
+) -> str:
+    """Run train.py as a subprocess, return the run directory path.
 
-    Streams stdout with a [label] prefix so both runs are distinguishable.
-    Parses the "Run directory:" line from train.py output to locate artifacts.
+    Output is redirected to a log file (not a pipe) to avoid Windows pipe
+    buffer deadlocks.  A background thread tails the file for real-time
+    display with [label] prefixes.
 
     Args:
         args: Parsed CLI arguments (iterations, games_per_iter, etc.)
-        fraction: Reanalyze fraction (0 = baseline, >0 = reanalysis)
-        label: Display label for log prefix (e.g., "Baseline", "Reanalysis")
+        fraction: Reanalyze fraction (0 = baseline, >0 = reanalysis).
+        label: Display prefix (e.g., "Baseline", "Reanalysis").
+        log_dir: Directory for subprocess log files.
+        timeout: Kill the subprocess after this many seconds.
 
     Returns:
         Absolute path to the run directory created by train.py.
 
     Raises:
-        RuntimeError: If train.py fails or run directory cannot be detected.
+        RuntimeError: If train.py fails, times out, or run_dir not detected.
     """
-    # Use -u to force unbuffered stdout in the child process.
-    # Without this, Windows pipes cause full buffering and we see nothing
-    # until the child's 4KB buffer fills or the process exits.
     cmd = [
         sys.executable, "-u", str(SCRIPTS_DIR / "train.py"),
         "--iterations", str(args.iterations),
@@ -344,70 +366,108 @@ def run_training(args: argparse.Namespace, fraction: float, label: str) -> str:
         "--no-sample-games",
     ]
 
-    # Only pass --reanalyze-fraction for non-zero values.
-    # fraction=0 is the default behavior (no reanalysis), so omitting the arg
-    # lets the baseline run work even before the feature is added to train.py.
     if fraction > 0:
         cmd.extend(["--reanalyze-fraction", str(fraction)])
 
+    log_path = os.path.join(log_dir, f"{label.lower()}_training.log")
+
     log(f"Starting training: fraction={fraction}", label=label)
     log(f"Command: {' '.join(cmd)}", label=label)
-    print(flush=True)
+    log(f"Log file: {log_path}", label=label)
 
-    run_dir = None
+    run_dir_holder: list = [None]
+    stop_event = threading.Event()
     start_time = time.monotonic()
-    hb = Heartbeat(interval=30.0, label=label).start()
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,  # Line-buffered (works with -u on child)
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
-    )
+    # Redirect stdout to a file.  The child's -u flag + PYTHONUNBUFFERED
+    # ensure writes go to the OS immediately.  The tailer thread reads
+    # the file from another handle, which sees new data through the
+    # shared filesystem cache (no pipe buffer limit).
+    with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"},
+        )
 
-    try:
-        # Use readline() instead of iteration.  On Windows, Python's
-        # ``for line in proc.stdout`` uses internal read-ahead buffering
-        # (~8 KB) regardless of bufsize, which freezes visible output
-        # until the buffer fills.  readline() returns immediately when a
-        # full line is available.
-        while True:
-            line = proc.stdout.readline()
-            if not line:
-                break
-            line = line.rstrip("\n")
-            hb.pulse()
-            print(f"  [{label}] {line}", flush=True)
+        tailer = threading.Thread(
+            target=_tail_log_file,
+            args=(log_path, label, stop_event, run_dir_holder),
+            daemon=True,
+        )
+        tailer.start()
 
-            # Parse run directory from train.py output.
-            # train.py prints it in several formats; match liberally.
-            if "Run directory:" in line:
-                # Extract path after "Run directory:" with variable whitespace
-                path = line.split("Run directory:")[-1].strip()
-                if path and os.path.isdir(path):
-                    run_dir = path
-    finally:
-        hb.stop()
-        proc.wait()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            log(f"TIMEOUT after {timeout}s -- killing process", label=label)
+            proc.kill()
+            proc.wait(timeout=10)
+            stop_event.set()
+            tailer.join(timeout=5)
+            raise RuntimeError(
+                f"[{label}] train.py timed out after {timeout}s. "
+                f"See log: {log_path}"
+            )
+
+    # Process exited.  Let the tailer drain remaining output.
+    stop_event.set()
+    tailer.join(timeout=10)
 
     elapsed = time.monotonic() - start_time
 
     if proc.returncode != 0:
-        log(f"FAILED after {elapsed:.0f}s (exit code {proc.returncode})", label=label)
+        log(f"FAILED after {elapsed:.0f}s (exit {proc.returncode})", label=label)
+        # Show last 20 lines for debugging
+        _print_log_tail(log_path, label, n=20)
         raise RuntimeError(
-            f"[{label}] train.py exited with code {proc.returncode}"
+            f"[{label}] train.py exited with code {proc.returncode}. "
+            f"See log: {log_path}"
         )
 
-    if run_dir is None:
+    # Fallback: parse run_dir from log if tailer missed it
+    if run_dir_holder[0] is None:
+        run_dir_holder[0] = _parse_run_dir_from_log(log_path)
+
+    if run_dir_holder[0] is None:
         log(f"FAILED: could not detect run directory from output", label=label)
+        _print_log_tail(log_path, label, n=10)
         raise RuntimeError(
-            f"[{label}] Could not detect run directory from train.py output"
+            f"[{label}] Could not detect run directory. See log: {log_path}"
         )
 
-    log(f"Completed in {elapsed:.0f}s. Run dir: {run_dir}", label=label)
+    log(f"Completed in {elapsed:.0f}s. Run dir: {run_dir_holder[0]}", label=label)
+    return run_dir_holder[0]
+
+
+def _parse_run_dir_from_log(log_path: str) -> Optional[str]:
+    """Scan a log file for 'Run directory:' and return the path."""
+    run_dir = None
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if "Run directory:" in line:
+                    path = line.split("Run directory:")[-1].strip()
+                    if path and os.path.isdir(path):
+                        run_dir = path
+    except OSError:
+        pass
     return run_dir
+
+
+def _print_log_tail(log_path: str, label: str, n: int = 20) -> None:
+    """Print the last N lines of a log file for debugging."""
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        if lines:
+            print(f"\n  Last {min(n, len(lines))} lines from [{label}]:", flush=True)
+            for line in lines[-n:]:
+                print(f"    {line.rstrip()}", flush=True)
+            print(flush=True)
+    except OSError:
+        pass
 
 
 # =============================================================================
@@ -415,10 +475,7 @@ def run_training(args: argparse.Namespace, fraction: float, label: str) -> str:
 # =============================================================================
 
 def load_metrics(run_dir: str) -> List[Dict[str, Any]]:
-    """Load per-iteration metrics from training_log.jsonl (or legacy JSON fallback).
-
-    Args:
-        run_dir: Path to a training run directory.
+    """Load per-iteration metrics from training_log.jsonl (or legacy JSON).
 
     Returns:
         List of per-iteration metric dicts, sorted by iteration number.
@@ -426,7 +483,6 @@ def load_metrics(run_dir: str) -> List[Dict[str, Any]]:
     Raises:
         FileNotFoundError: If neither JSONL nor JSON file is found.
     """
-    # Try JSONL first
     jsonl_path = os.path.join(run_dir, "training_log.jsonl")
     if os.path.exists(jsonl_path):
         iterations = []
@@ -444,7 +500,6 @@ def load_metrics(run_dir: str) -> List[Dict[str, Any]]:
         iterations.sort(key=lambda m: m.get("iteration", 0))
         return iterations
 
-    # Fallback: legacy JSON
     metrics_path = os.path.join(run_dir, "training_metrics.json")
     if not os.path.exists(metrics_path):
         raise FileNotFoundError(f"Metrics file not found in: {run_dir}")
@@ -466,19 +521,13 @@ def evaluate_checkpoints(
     iterations: List[int],
     eval_sims: int,
 ) -> Dict[int, Dict[str, Any]]:
-    """Evaluate checkpoints at specified iterations using evaluation.py.
+    """Evaluate checkpoints using evaluation.py --evaluators vs_random.
 
-    Runs evaluation.py --evaluators vs_random for each checkpoint and parses
-    the JSON output.
-
-    Args:
-        run_dir: Path to the training run directory.
-        iterations: Which iteration checkpoints to evaluate.
-        eval_sims: MCTS simulations for evaluation games.
+    Uses subprocess.run (blocking) with a per-checkpoint timeout.
+    Output is captured (not piped in real-time) since evaluations are short.
 
     Returns:
-        Dict mapping iteration number -> evaluation result dict.
-        Each result has keys: score, wins, losses, draws, games.
+        Dict mapping iteration number -> {score, wins, losses, draws, games}.
     """
     results = {}
 
@@ -488,7 +537,6 @@ def evaluate_checkpoints(
             log(f"WARNING: Checkpoint not found: {checkpoint_path}, skipping")
             continue
 
-        # Write results to a temp file
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", delete=False
         ) as tmp:
@@ -509,19 +557,19 @@ def evaluate_checkpoints(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=600,  # 10 minute timeout per checkpoint
+                timeout=600,
                 env={**os.environ, "PYTHONUNBUFFERED": "1"},
             )
             eval_elapsed = time.monotonic() - eval_start
 
             if proc.returncode != 0:
-                log(f"  iter {it:03d} FAILED ({eval_elapsed:.0f}s, exit code {proc.returncode})", label="Eval")
+                log(f"  iter {it:03d} FAILED ({eval_elapsed:.0f}s, exit {proc.returncode})",
+                    label="Eval")
                 if proc.stderr:
                     for line in proc.stderr.strip().split("\n")[:5]:
                         print(f"    {line}", flush=True)
                 continue
 
-            # Parse the evaluation output JSON
             with open(tmp_path, "r") as f:
                 eval_data = json.load(f)
 
@@ -537,7 +585,8 @@ def evaluate_checkpoints(
                     "games": details.get("games", 0),
                 }
                 w, g = results[it]["wins"], results[it]["games"]
-                log(f"  iter {it:03d}: {r.get('score', 0) * 100:.0f}% ({w}/{g}) [{eval_elapsed:.0f}s]", label="Eval")
+                log(f"  iter {it:03d}: {r.get('score', 0) * 100:.0f}% "
+                    f"({w}/{g}) [{eval_elapsed:.0f}s]", label="Eval")
             else:
                 log(f"  iter {it:03d}: no results [{eval_elapsed:.0f}s]", label="Eval")
 
@@ -558,13 +607,8 @@ def evaluate_checkpoints(
 # Comparison Computation
 # =============================================================================
 
-def _safe_get(metrics: List[Dict], key: str, default: float = 0.0) -> List[float]:
-    """Extract a numeric field from all iterations, using default for missing."""
-    return [m.get(key, default) for m in metrics]
-
-
 def _decisive_rate(metrics: List[Dict]) -> float:
-    """Compute overall decisive game rate across all iterations."""
+    """Overall decisive game rate across all iterations (%)."""
     total_games = sum(m.get("games", 0) for m in metrics)
     if total_games == 0:
         return 0.0
@@ -573,7 +617,7 @@ def _decisive_rate(metrics: List[Dict]) -> float:
 
 
 def _fifty_move_rate(metrics: List[Dict]) -> float:
-    """Compute overall fifty-move draw rate across all iterations."""
+    """Overall fifty-move draw rate across all iterations (%)."""
     total_games = sum(m.get("games", 0) for m in metrics)
     if total_games == 0:
         return 0.0
@@ -582,7 +626,7 @@ def _fifty_move_rate(metrics: List[Dict]) -> float:
 
 
 def _avg_game_length(metrics: List[Dict]) -> float:
-    """Compute weighted average game length across all iterations."""
+    """Weighted average game length across all iterations."""
     total_moves = sum(
         m.get("avg_game_length", 0) * m.get("games", 1) for m in metrics
     )
@@ -610,7 +654,7 @@ def _loss_per_minute(metrics: List[Dict]) -> float:
 
 
 def _delta_pct(baseline: float, reanalysis: float) -> str:
-    """Compute percentage delta string: '+12.3%' or '-5.1%'."""
+    """Percentage delta string: '+12.3%' or '-5.1%'."""
     if baseline == 0:
         return "N/A"
     delta = (reanalysis - baseline) / abs(baseline) * 100
@@ -619,7 +663,7 @@ def _delta_pct(baseline: float, reanalysis: float) -> str:
 
 
 def _delta_pp(baseline_pct: float, reanalysis_pct: float) -> str:
-    """Compute percentage-point delta string: '+10.0pp' or '-5.0pp'."""
+    """Percentage-point delta string: '+10.0pp' or '-5.0pp'."""
     delta = reanalysis_pct - baseline_pct
     sign = "+" if delta >= 0 else ""
     return f"{sign}{delta:.1f}pp"
@@ -631,7 +675,8 @@ def compute_comparison(
 ) -> Dict[str, Any]:
     """Compute all comparison values between baseline and reanalysis runs.
 
-    Returns a dict with sections: loss_curves, game_quality, compute, reanalysis_diag.
+    Returns a dict with sections: loss_curves, game_quality, compute,
+    final_loss, reanalysis_diag.
     """
     comparison: Dict[str, Any] = {}
 
@@ -705,19 +750,23 @@ def compute_comparison(
     fl_r = comparison["final_loss"]["reanalysis"]
     comparison["final_loss"]["delta"] = _delta_pct(fl_b, fl_r)
 
-    # --- Reanalysis diagnostics (fields may not exist yet) ---
+    # --- Reanalysis diagnostics ---
+    # Keys match train.py JSONL output: reanalysis_positions, reanalysis_time_s,
+    # reanalysis_mean_kl, selfplay_time
     rean_diag = []
     for m in rean_metrics:
-        positions = m.get("reanalysis_positions")
-        if positions is not None:
+        positions = m.get("reanalysis_positions", 0)
+        if positions > 0:
+            tail_time = m.get("reanalysis_time_s", 0)
+            selfplay_time = m.get("selfplay_time", 0)
             rean_diag.append({
                 "iteration": m["iteration"],
                 "positions": positions,
                 "mean_kl": m.get("reanalysis_mean_kl", 0),
-                "tail_time_s": m.get("reanalysis_tail_time_s", 0),
+                "tail_time_s": tail_time,
                 "overhead_pct": (
-                    m.get("reanalysis_tail_time_s", 0) / m.get("selfplay_time", 1) * 100
-                    if m.get("selfplay_time", 0) > 0 else 0
+                    tail_time / selfplay_time * 100
+                    if selfplay_time > 0 else 0
                 ),
             })
     comparison["reanalysis_diag"] = rean_diag
@@ -749,7 +798,6 @@ def print_report(
     print("REANALYSIS IMPACT TEST -- COMPARISON")
     print(SEPARATOR)
 
-    # Configuration
     fraction = getattr(args, "reanalyze_fraction", 0.25)
     print(f"""
 Configuration:
@@ -765,12 +813,8 @@ Configuration:
         print(f"  {'Iter':>6}    {'Baseline':>24}  {'Reanalysis':>24}  {'Delta':>8}")
         print(f"  {'----':>6}    {'--------':>24}  {'----------':>24}  {'-----':>8}")
         for lc in loss_curves:
-            bl = lc["baseline_loss"]
-            bp = lc["baseline_policy"]
-            bv = lc["baseline_value"]
-            rl = lc["reanalysis_loss"]
-            rp = lc["reanalysis_policy"]
-            rv = lc["reanalysis_value"]
+            bl, bp, bv = lc["baseline_loss"], lc["baseline_policy"], lc["baseline_value"]
+            rl, rp, rv = lc["reanalysis_loss"], lc["reanalysis_policy"], lc["reanalysis_value"]
             b_str = f"{bl:.2f} (p={bp:.2f} v={bv:.2f})"
             r_str = f"{rl:.2f} (p={rp:.2f} v={rv:.2f})"
             print(f"  {lc['iteration']:>6}    {b_str:>24}  {r_str:>24}  {lc['delta_pct']:>8}")
@@ -799,17 +843,16 @@ Configuration:
         print(f"  {'------':<22}{'--------':>12}{'----------':>14}{'-----':>10}")
 
         tw = comp.get("total_wall_s", {})
-        b_wall_str = _fmt_time(tw.get("baseline", 0))
-        r_wall_str = _fmt_time(tw.get("reanalysis", 0))
-        print(f"  {'Total wall-clock':<22}{b_wall_str:>12}{r_wall_str:>14}{tw.get('delta', 'N/A'):>10}")
+        print(f"  {'Total wall-clock':<22}{_fmt_time(tw.get('baseline', 0)):>12}"
+              f"{_fmt_time(tw.get('reanalysis', 0)):>14}{tw.get('delta', 'N/A'):>10}")
 
         ai = comp.get("avg_iter_time", {})
-        b_ai_str = f"{ai.get('baseline', 0):.1f}s"
-        r_ai_str = f"{ai.get('reanalysis', 0):.1f}s"
-        print(f"  {'Avg iter time':<22}{b_ai_str:>12}{r_ai_str:>14}{ai.get('delta', 'N/A'):>10}")
+        print(f"  {'Avg iter time':<22}{ai.get('baseline', 0):>11.1f}s"
+              f"{ai.get('reanalysis', 0):>13.1f}s{ai.get('delta', 'N/A'):>10}")
 
         lpm = comp.get("loss_per_minute", {})
-        print(f"  {'Final loss/minute':<22}{lpm.get('baseline', 0):>12.4f}{lpm.get('reanalysis', 0):>14.4f}{lpm.get('delta', 'N/A'):>10}")
+        print(f"  {'Loss/minute':<22}{lpm.get('baseline', 0):>12.4f}"
+              f"{lpm.get('reanalysis', 0):>14.4f}{lpm.get('delta', 'N/A'):>10}")
 
     # Evaluation results
     if baseline_evals or rean_evals:
@@ -821,14 +864,10 @@ Configuration:
         for it in all_iters:
             b_eval = baseline_evals.get(it)
             r_eval = rean_evals.get(it)
-            if b_eval:
-                b_str = f"{b_eval['score'] * 100:.0f}% ({b_eval['wins']}/{b_eval['games']})"
-            else:
-                b_str = "--"
-            if r_eval:
-                r_str = f"{r_eval['score'] * 100:.0f}% ({r_eval['wins']}/{r_eval['games']})"
-            else:
-                r_str = "--"
+            b_str = (f"{b_eval['score'] * 100:.0f}% ({b_eval['wins']}/{b_eval['games']})"
+                     if b_eval else "--")
+            r_str = (f"{r_eval['score'] * 100:.0f}% ({r_eval['wins']}/{r_eval['games']})"
+                     if r_eval else "--")
             print(f"  iter_{it:03d}     {b_str:>18}{r_str:>18}")
 
     # Reanalysis diagnostics
@@ -840,7 +879,7 @@ Configuration:
         for d in rean_diag:
             print(
                 f"  {d['iteration']:>6}    {d['positions']:>10}    "
-                f"{d['mean_kl']:>8.2f}    {d['tail_time_s']:>9.1f}    "
+                f"{d['mean_kl']:>8.4f}    {d['tail_time_s']:>9.1f}    "
                 f"{d['overhead_pct']:>8.1f}%"
             )
 
@@ -852,17 +891,14 @@ Configuration:
 
     lpm = comp.get("loss_per_minute", {}) if comp else {}
     lpm_delta = lpm.get("delta", "N/A")
-
     tw = comp.get("total_wall_s", {}) if comp else {}
     tw_delta = tw.get("delta", "N/A")
 
-    # Determine recommendation
     loss_better = fl_r < fl_b if fl_b > 0 else False
-    efficiency_str = lpm_delta
 
     print(f"\n-- Verdict {'-' * 59}")
     print(f"  Sample efficiency:  Reanalysis achieves {fl_delta} final loss")
-    print(f"  Compute efficiency: Reanalysis achieves {efficiency_str} loss reduction per minute")
+    print(f"  Compute efficiency: Reanalysis achieves {lpm_delta} loss reduction per minute")
 
     if loss_better:
         print(f"  Recommendation:     Reanalysis provides net benefit despite {tw_delta} time overhead")
@@ -915,18 +951,27 @@ def save_results(
 # =============================================================================
 
 def main():
+    # Ensure stdout can handle any Unicode from train.py (emojis, ×, etc.)
+    # without crashing.  Windows consoles may use GBK or other limited encodings.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+
     parser = argparse.ArgumentParser(
         description="Empirical A/B test: baseline vs. MCTS reanalysis",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Quick smoke test (~5 min)
+  # Quick smoke test
   uv run python alphazero-cpp/scripts/test_reanalysis_impact.py \\
       --iterations 3 --games-per-iter 10 --simulations 50 --workers 4 --skip-eval
 
   # Compare existing runs
   uv run python alphazero-cpp/scripts/test_reanalysis_impact.py \\
       --compare-only --baseline-dir checkpoints/run_a --reanalysis-dir checkpoints/run_b
+
+  # Worker allocation recommendation
+  uv run python alphazero-cpp/scripts/test_reanalysis_impact.py \\
+      --recommend --workers 16 --reanalyze-fraction 0.25
         """,
     )
 
@@ -959,6 +1004,8 @@ Examples:
                         help="Skip checkpoint evaluation")
     parser.add_argument("--output", type=str, default=None,
                         help="Save full comparison JSON to this path")
+    parser.add_argument("--timeout", type=int, default=3600,
+                        help="Per-run timeout in seconds (default: 3600)")
 
     # Recommender mode
     parser.add_argument("--recommend", action="store_true",
@@ -981,7 +1028,7 @@ Examples:
         if not os.path.isdir(args.reanalysis_dir):
             parser.error(f"Reanalysis directory not found: {args.reanalysis_dir}")
 
-    # --recommend mode: print allocation table and exit
+    # --recommend mode
     if args.recommend:
         print(SEPARATOR)
         print("REANALYSIS WORKER ALLOCATION RECOMMENDER")
@@ -1010,7 +1057,12 @@ Examples:
     print(f"  Eval sims:          {args.eval_sims}")
     print(f"  Compare only:       {args.compare_only}")
     print(f"  Skip eval:          {args.skip_eval}")
+    print(f"  Timeout:            {args.timeout}s per run")
     print()
+
+    # Create a directory for subprocess log files
+    log_dir = tempfile.mkdtemp(prefix="reanalysis_test_")
+    log(f"Log directory: {log_dir}")
 
     # -- Step 1: Training --------------------------------------------------
     if args.compare_only:
@@ -1023,14 +1075,16 @@ Examples:
         log("Step 1/5: Training both runs sequentially")
         overall_start = time.monotonic()
 
-        # Run baseline (no reanalysis)
         log("Starting BASELINE run (fraction=0)...")
-        baseline_dir = run_training(args, fraction=0.0, label="Baseline")
+        baseline_dir = run_training(
+            args, fraction=0.0, label="Baseline",
+            log_dir=log_dir, timeout=args.timeout,
+        )
 
-        # Run reanalysis
         log(f"Starting REANALYSIS run (fraction={args.reanalyze_fraction})...")
         reanalysis_dir = run_training(
-            args, fraction=args.reanalyze_fraction, label="Reanalysis"
+            args, fraction=args.reanalyze_fraction, label="Reanalysis",
+            log_dir=log_dir, timeout=args.timeout,
         )
 
         elapsed = time.monotonic() - overall_start
@@ -1058,9 +1112,7 @@ Examples:
     rean_evals: Dict[int, Dict] = {}
 
     if not args.skip_eval:
-        # Determine which iterations to evaluate
         eval_iters = list(range(args.eval_interval, args.iterations + 1, args.eval_interval))
-        # Always include the final iteration
         if args.iterations not in eval_iters:
             eval_iters.append(args.iterations)
 
@@ -1089,7 +1141,6 @@ Examples:
         args, baseline_dir, reanalysis_dir,
     )
 
-    # -- Save results ------------------------------------------------------
     if args.output:
         save_results(
             comparison, baseline_evals, rean_evals,

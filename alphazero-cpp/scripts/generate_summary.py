@@ -267,6 +267,14 @@ def generate_summary_html(run_dir: str, config: Dict[str, Any] = None) -> str:
         '            </div>\n'
         '        </div>\n'
         '\n'
+        '        <div class="card hidden" id="reanalysisCard">\n'
+        '            <h2>&#128260; Reanalysis</h2>\n'
+        '            <div class="chart-row">\n'
+        '                <div class="chart-container"><canvas id="reanalysisKLChart"></canvas></div>\n'
+        '                <div class="chart-container"><canvas id="reanalysisVolumeChart"></canvas></div>\n'
+        '            </div>\n'
+        '        </div>\n'
+        '\n'
         '        <div class="card">\n'
         '            <h2>&#9881;&#65039; Configuration</h2>\n'
         '            <table class="config-table">\n'
@@ -488,6 +496,18 @@ def generate_summary_html(run_dir: str, config: Dict[str, Any] = None) -> str:
         "                    ds('Grad Norm (max)', iterations.map(m => m.grad_norm_max || 0), COLORS.red, 'y'),\n"
         "                    ds('Learning Rate', iterations.map(m => m.learning_rate || 0), COLORS.green, 'y1'),\n"
         "                ], { yTitle: 'Gradient Norm', y1Title: 'Learning Rate' });\n"
+        '            }\n'
+        '\n'
+        '            // --- Reanalysis: KL divergence + volume ---\n'
+        "            if (hasField(iterations, 'reanalysis_positions')) {\n"
+        "                document.getElementById('reanalysisCard').classList.remove('hidden');\n"
+        "                makeLineChart('reanalysisKLChart', iters, [\n"
+        "                    ds('Mean KL Divergence', iterations.map(m => m.reanalysis_mean_kl || 0), COLORS.purple, 'y'),\n"
+        "                ], { yTitle: 'KL(old || new)', yZero: true });\n"
+        "                makeLineChart('reanalysisVolumeChart', iters, [\n"
+        "                    ds('Positions Reanalyzed', iterations.map(m => m.reanalysis_positions || 0), COLORS.blue, 'y'),\n"
+        "                    ds('Tail Time (s)', iterations.map(m => m.reanalysis_time_s || 0), COLORS.orange, 'y1'),\n"
+        "                ], { yTitle: 'Positions', y1Title: 'Time (s)', yZero: true, y1Zero: true });\n"
         '            }\n'
         '        }\n'
         '\n'

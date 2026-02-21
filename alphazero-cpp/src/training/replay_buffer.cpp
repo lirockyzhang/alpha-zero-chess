@@ -417,6 +417,11 @@ void ReplayBuffer::update_policy(size_t index, const float* policy) {
     std::memcpy(policies_.data() + index * POLICY_SIZE, policy, POLICY_SIZE * sizeof(float));
 }
 
+const float* ReplayBuffer::get_policy_ptr(size_t index) const {
+    if (index >= size()) return nullptr;
+    return policies_.data() + index * POLICY_SIZE;
+}
+
 // ============================================================================
 // Prioritized Experience Replay (PER)
 // ============================================================================

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Test: Evaluation Queue Stale Result Prevention & Root Eval Retry
+Test: Evaluation Queue Blocking Wait & Pipeline Health
 
-Tests for generation-based stale result filtering and root eval retry loop.
-Designed to run FAST (<60s total) with minimal simulations.
+Tests for blocking get_results() with watchdog, queue capacity, and pipeline
+health under various conditions. Designed to run FAST (<60s total).
 
 Usage:
     uv run python alphazero-cpp/tests/test_eval_queue_staleness.py
@@ -100,14 +100,14 @@ def fast_eval(delay_ms=0):
     return fn, count
 
 
-def run_games(workers=2, gpw=1, timeout_ms=5000, retries=3,
+def run_games(workers=2, gpw=1, timeout_ms=5000,
               queue_cap=8192, eval_delay=0, **kw):
     """Helper: create coordinator, run games, return result dict."""
     ev, cnt = fast_eval(eval_delay)
     merged = {**FAST, **kw}
     c = alphazero_cpp.ParallelSelfPlayCoordinator(
         num_workers=workers, games_per_worker=gpw,
-        worker_timeout_ms=timeout_ms, root_eval_retries=retries,
+        worker_timeout_ms=timeout_ms,
         queue_capacity=queue_cap, **merged)
     buf = alphazero_cpp.ReplayBuffer(capacity=50000)
     c.set_replay_buffer(buf)
@@ -120,7 +120,7 @@ def run_games(workers=2, gpw=1, timeout_ms=5000, retries=3,
 # =============================================================================
 
 def test_basic_selfplay():
-    """Test 1: Basic sanity — games complete, new stats present."""
+    """Test 1: Basic sanity — games complete, stats present."""
     print("\n" + "="*60)
     print("Test 1: Basic Parallel Self-Play Sanity")
     print("="*60)
@@ -128,20 +128,19 @@ def test_basic_selfplay():
     T.eq(r['games_completed'], 2, "2 games completed")
     T.ok(r['total_moves'] > 0, f"moves > 0 ({r['total_moves']})")
     T.ok(cnt[0] > 0, f"evaluator called ({cnt[0]}x)")
-    T.ok('root_retries' in r, "root_retries present")
-    T.ok('stale_results_flushed' in r, "stale_results_flushed present")
+    T.ok('mcts_failures' in r, "mcts_failures present")
 
 
 def test_stats_types():
-    """Test 2: New stats are correct types and non-negative."""
+    """Test 2: Stats are correct types and non-negative."""
     print("\n" + "="*60)
     print("Test 2: Stats Types and Values")
     print("="*60)
     r, _, _ = run_games(workers=2, gpw=1)
-    T.ok(isinstance(r['root_retries'], int), "root_retries is int")
-    T.ok(isinstance(r['stale_results_flushed'], int), "stale_results_flushed is int")
-    T.gte(r['root_retries'], 0, "root_retries >= 0")
-    T.gte(r['stale_results_flushed'], 0, "stale_results_flushed >= 0")
+    T.ok(isinstance(r['mcts_failures'], int), "mcts_failures is int")
+    T.ok(isinstance(r['gpu_errors'], int), "gpu_errors is int")
+    T.gte(r['mcts_failures'], 0, "mcts_failures >= 0")
+    T.gte(r['gpu_errors'], 0, "gpu_errors >= 0")
 
 
 def test_queue_capacity_param():
@@ -157,60 +156,56 @@ def test_queue_capacity_param():
         T.ok(False, f"queue_capacity rejected: {e}")
 
 
-def test_retries_param_zero():
-    """Test 4: root_eval_retries=0 works (no retries)."""
+def test_single_worker():
+    """Test 4: Single worker completes game with blocking wait."""
     print("\n" + "="*60)
-    print("Test 4: root_eval_retries=0")
+    print("Test 4: Single Worker Blocking Wait")
     print("="*60)
-    r, _, _ = run_games(workers=1, gpw=1, retries=0)
-    T.eq(r['games_completed'], 1, "game completes with retries=0")
-    T.eq(r['root_retries'], 0, "zero retries reported")
+    r, _, _ = run_games(workers=1, gpw=1)
+    T.eq(r['games_completed'], 1, "game completes with single worker")
+    T.eq(r['mcts_failures'], 0, "no MCTS failures")
 
 
-def test_retries_param_five():
-    """Test 5: root_eval_retries=5 accepted."""
+def test_multiple_games_per_worker():
+    """Test 5: Multiple games per worker complete."""
     print("\n" + "="*60)
-    print("Test 5: root_eval_retries=5")
+    print("Test 5: Multiple Games Per Worker")
     print("="*60)
-    r, _, _ = run_games(workers=1, gpw=1, retries=5)
-    T.eq(r['games_completed'], 1, "game completes with retries=5")
+    r, _, _ = run_games(workers=1, gpw=3)
+    T.eq(r['games_completed'], 3, "all 3 games completed")
 
 
-def test_no_retries_healthy():
-    """Test 6: No retries when evaluator is fast and timeout generous."""
+def test_no_failures_healthy():
+    """Test 6: No failures when evaluator is fast."""
     print("\n" + "="*60)
-    print("Test 6: No Retries Under Healthy Conditions")
+    print("Test 6: No Failures Under Healthy Conditions")
     print("="*60)
-    r, _, _ = run_games(workers=2, gpw=1, timeout_ms=10000, retries=3)
-    T.eq(r['root_retries'], 0, "zero retries with generous timeout")
-    T.eq(r['stale_results_flushed'], 0, "zero stale flushes")
+    r, _, _ = run_games(workers=2, gpw=1)
+    T.eq(r['mcts_failures'], 0, "zero MCTS failures")
+    T.eq(r['gpu_errors'], 0, "zero GPU errors")
 
 
-def test_forced_timeout_retries():
-    """Test 7: Short timeout forces retries; games still complete."""
+def test_slow_evaluator():
+    """Test 7: Slow evaluator — blocking wait handles it (no timeout)."""
     print("\n" + "="*60)
-    print("Test 7: Forced Timeout Triggers Retries")
+    print("Test 7: Slow Evaluator (Blocking Wait)")
     print("="*60)
-    # 20ms eval delay + 50ms timeout → timeouts likely; retries=5 should recover
-    r, _, _ = run_games(workers=2, gpw=1, timeout_ms=50, retries=5,
-                        eval_delay=20)
+    # 20ms eval delay — blocking wait should handle this fine
+    r, _, _ = run_games(workers=2, gpw=1, eval_delay=20)
     games = r['games_completed']
-    T.gte(games, 1, f"at least 1/2 games completed ({games})")
-    print(f"  Info: retries={r['root_retries']}, failures={r['mcts_failures']}, "
-          f"stale={r['stale_results_flushed']}")
+    T.eq(games, 2, f"both games completed ({games})")
+    T.eq(r['mcts_failures'], 0, "no MCTS failures despite slow eval")
 
 
-def test_stale_counter_nonneg():
-    """Test 8: stale_results_flushed is non-negative under stress."""
+def test_multi_worker_slow_eval():
+    """Test 8: Multiple workers with slow evaluator complete cleanly."""
     print("\n" + "="*60)
-    print("Test 8: Stale Counter Non-Negative (Short Timeout)")
+    print("Test 8: Multi-Worker Slow Evaluator")
     print("="*60)
-    r, _, _ = run_games(workers=4, gpw=1, timeout_ms=60, retries=3,
-                        eval_delay=15)
-    T.gte(r['stale_results_flushed'], 0, "stale >= 0")
-    T.gte(r['root_retries'], 0, "retries >= 0")
-    print(f"  Info: stale={r['stale_results_flushed']}, retries={r['root_retries']}, "
-          f"games={r['games_completed']}")
+    r, _, _ = run_games(workers=4, gpw=1, eval_delay=15)
+    T.eq(r['games_completed'], 4, f"all 4 games completed")
+    T.eq(r['mcts_failures'], 0, "no MCTS failures")
+    print(f"  Info: games={r['games_completed']}, failures={r['mcts_failures']}")
 
 
 def test_many_workers():
@@ -218,10 +213,10 @@ def test_many_workers():
     print("\n" + "="*60)
     print("Test 9: Many Workers (8)")
     print("="*60)
-    r, _, cnt = run_games(workers=8, gpw=1, timeout_ms=5000, retries=3)
+    r, _, cnt = run_games(workers=8, gpw=1)
     T.eq(r['games_completed'], 8, "all 8 games completed")
     T.gte(cnt[0], 1, f"evaluator called ({cnt[0]}x)")
-    print(f"  Info: retries={r['root_retries']}, stale={r['stale_results_flushed']}")
+    T.eq(r['mcts_failures'], 0, "no MCTS failures with 8 workers")
 
 
 def test_large_queue():
@@ -239,7 +234,7 @@ def test_game_integrity():
     print("\n" + "="*60)
     print("Test 11: Game Integrity (No Corruption)")
     print("="*60)
-    r, buf, _ = run_games(workers=2, gpw=2, retries=3)
+    r, buf, _ = run_games(workers=2, gpw=2)
     games = r['games_completed']
     T.eq(games, 4, "4 games completed")
 
@@ -257,11 +252,11 @@ def test_game_integrity():
 
 
 def test_default_params():
-    """Test 12: Default queue_capacity/root_eval_retries work."""
+    """Test 12: Default parameters work."""
     print("\n" + "="*60)
     print("Test 12: Default Parameters")
     print("="*60)
-    # Don't pass queue_capacity or root_eval_retries at all
+    # Don't pass queue_capacity at all
     ev, _ = fast_eval()
     c = alphazero_cpp.ParallelSelfPlayCoordinator(
         num_workers=1, games_per_worker=1, **FAST)
@@ -269,7 +264,7 @@ def test_default_params():
     c.set_replay_buffer(buf)
     r = c.generate_games(ev)
     T.eq(r['games_completed'], 1, "game completes with defaults")
-    T.ok('root_retries' in r, "root_retries in result with defaults")
+    T.ok('mcts_failures' in r, "mcts_failures in result with defaults")
 
 
 def test_live_stats():
@@ -303,9 +298,8 @@ def test_live_stats():
 
     if snapshots:
         last = snapshots[-1]
-        T.ok('root_retries' in last, "root_retries in live stats")
-        T.ok('stale_results_flushed' in last, "stale_results_flushed in live stats")
         T.ok('mcts_failures' in last, "mcts_failures in live stats")
+        T.ok('avg_batch_size' in last, "avg_batch_size in live stats")
     else:
         # Games finished too fast to poll — that's OK, just check final result
         T.ok(True, "generation too fast to poll (not a failure)")
@@ -319,7 +313,7 @@ def test_graceful_shutdown():
     ev, _ = fast_eval(delay_ms=10)
     c = alphazero_cpp.ParallelSelfPlayCoordinator(
         num_workers=2, games_per_worker=50,  # many games
-        worker_timeout_ms=2000, root_eval_retries=2,
+        worker_timeout_ms=2000,
         num_simulations=8, mcts_batch_size=4, gpu_batch_size=16,
         temperature_moves=1)
     buf = alphazero_cpp.ReplayBuffer(capacity=100000)
@@ -338,7 +332,7 @@ def test_graceful_shutdown():
     T.ok(not t.is_alive(), "thread exited after stop()")
     if holder[0] is not None:
         T.ok(holder[0]['games_completed'] < 100, f"stopped early ({holder[0]['games_completed']}/100)")
-        T.ok('root_retries' in holder[0], "stats present after stop")
+        T.ok('mcts_failures' in holder[0], "stats present after stop")
 
 
 # =============================================================================
@@ -347,7 +341,7 @@ def test_graceful_shutdown():
 
 def main():
     print("="*60)
-    print("Eval Queue Stale Result Prevention & Retry Tests")
+    print("Eval Queue Blocking Wait & Pipeline Health Tests")
     print("="*60)
     print(f"alphazero_cpp version: {alphazero_cpp.__version__}")
 
@@ -356,11 +350,11 @@ def main():
         test_basic_selfplay()
         test_stats_types()
         test_queue_capacity_param()
-        test_retries_param_zero()
-        test_retries_param_five()
-        test_no_retries_healthy()
-        test_forced_timeout_retries()
-        test_stale_counter_nonneg()
+        test_single_worker()
+        test_multiple_games_per_worker()
+        test_no_failures_healthy()
+        test_slow_evaluator()
+        test_multi_worker_slow_eval()
         test_many_workers()
         test_large_queue()
         test_game_integrity()

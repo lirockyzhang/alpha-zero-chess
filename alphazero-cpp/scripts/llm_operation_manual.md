@@ -1078,7 +1078,56 @@ Is loss < 2.0 and you're fine-tuning for quality?
 
 **Memory overhead:** Negligible. A 100K-capacity buffer uses ~1 MB for the sum-tree vs ~3 GB for observations. On disk, priorities add 400 KB per 100K samples.
 
-### 10r. MCTS Reanalysis (Concurrent Policy Refresh)
+### 10r. Buffer Draw Saturation Trap — Epochs Recovery Case Study
+
+**Status: CONFIRMED — rollback required for severe cases**
+
+**Context:** Run `f256-b20-se4-run1`, 256f/20b/SE4 architecture, Gumbel top_k=16, sims=200, buffer_size=100K.
+
+**Starting state (iter 9):** value_loss=0.68, draw_rate=71%, buffer 77.5% draws, ~30% decisive games per iteration. Model at the edge of "mild draw case" (60-80%).
+
+**Experiment: epochs=2 at iter 10 (mistake)**
+
+| Iter | epochs | Draw% | Reps | Value Loss | Buffer Draws | Intervention |
+|------|--------|-------|------|------------|--------------|-------------|
+| 9    | 1      | 71.1% | —    | 0.68       | 77.5%        | (starting point) |
+| 10   | 2      | 90.6% | 72   | 0.57       | 84.0%        | epochs=2 applied |
+| 11   | 2      | 92.2% | 58   | 0.39       | 92.2%        | Triggered stagnation |
+| 12   | 1      | 64.1% | 35   | 0.45       | 88.0%        | epochs=1 intervention |
+| 13   | 1      | 92.2% | 88   | 0.375      | 89.5%        | risk_beta=0.3 added |
+
+**Key findings:**
+
+1. **epochs=2 at 77.5% draw buffer is too aggressive.** Two training passes over a draw-heavy buffer caused value_loss to drop from 0.68 → 0.39 in two iterations. The model became overconfident about draw predictions.
+
+2. **epochs=1 produces temporary recovery, not sustained.** Iter 12 showed impressive recovery (64.1% draws, 46 decisive games), but the buffer was still 88% draws. The next training step on this buffer pulled the value head right back to draw-biased predictions. One good iteration cannot overcome a poisoned buffer.
+
+3. **risk_beta=0.3 is insufficient at value_loss < 0.4.** ERM formula `Q_β ≈ E[v] + (β/2)·Var(v)` requires value variance. At value_loss=0.375, the value head is too confident about draws — Var(v) ≈ 0 means β has no effect regardless of magnitude.
+
+4. **The oscillation trap:** Good self-play (64% draws) → train on 88% draw buffer → model reverts → bad self-play (92% draws) → buffer gets worse → cycle continues. The buffer acts as an inertial mass that dampens any single-iteration improvement.
+
+5. **Buffer saturation arithmetic explains the trap:** At 89.5% draws in a 100K buffer, producing 10 decisive games per iteration (iter 13 rate) adds ~1K decisive positions while ~38K draw positions enter. The buffer draw percentage INCREASES each iteration: a death spiral.
+
+**Why rollback to iter 9 is the correct fix:**
+
+| Metric | Iter 9 (rollback target) | Iter 13 (current) | Why it matters |
+|--------|-------------------------|-------------------|----------------|
+| Value loss | 0.68 | 0.375 | Higher = more variance for risk_beta |
+| Buffer draws | 77.5% | 89.5% | Lower = training sees more W/L signal |
+| Decisive rate | ~30% | 7.8% | Higher = buffer improves each iteration |
+| risk_beta effectiveness | High (variance exists) | Low (variance ≈ 0) | ERM needs variance to work |
+
+**With corrected parameters (epochs=1, risk_beta=0.5, temp=50, sims=200):**
+- Each iteration at iter 9's decisive rate (~30%) adds ~11K decisive positions to buffer
+- After 3-4 iterations: buffer improves from 77.5% → ~73% → ~69% draws
+- risk_beta=0.5 + value_loss=0.68 provides enough ERM signal to push for decisive play
+- This creates a virtuous cycle vs the vicious cycle at iter 13
+
+**Rule of thumb (new):** If the buffer has >85% draws AND value_loss < 0.4, parameter tuning alone cannot recover. Roll back to the last checkpoint where BOTH conditions are healthier. The buffer composition is the leading indicator — even a model that produces good self-play results will regress if trained on a draw-saturated buffer.
+
+**Relationship to Section 10n:** This confirms the epochs schedule but adds a critical finding: even following the schedule (epochs=1 for stagnation), recovery may be impossible if the buffer is already >85% draws. The epochs schedule is preventive, not curative for severe buffer saturation.
+
+### 10s. MCTS Reanalysis (Concurrent Policy Refresh)
 
 **What it does:** Each iteration, a configurable fraction of replay buffer positions are re-searched with the current (improved) neural network using full MCTS. The resulting search policies replace the original (stale) policies stored from self-play. Value and WDL targets are NOT updated — they remain the ground-truth game outcomes.
 

@@ -1061,9 +1061,9 @@ When workers wait for GPU results and time out (`worker_timeout_ms` exceeded), t
 
 | Metric | Meaning |
 |--------|---------|
-| `root_retries` | Times root eval was retried after timeout. If high but `mcts_failures` is low, the retry mechanism is working. |
-| `stale_results_flushed` | Stale results discarded. Non-zero means timeouts occurred but corruption was prevented. |
-| `mcts_failures` (Timeout Evals) | Moves where MCTS returned zero visits (all retries exhausted). Should be near zero. |
+| `mcts_failures` (Timeout Evals) | Moves where MCTS returned zero visits (shutdown-induced). Should be zero during normal operation. |
+| `pool_exhaustion` | Times the staging buffer ran out of slots. Increase `--queue-capacity` if non-zero. |
+| `submission_drops` | Leaves dropped due to pool exhaustion. Should be zero. |
 
 **If `mcts_failures` is high:**
 

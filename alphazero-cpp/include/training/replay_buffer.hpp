@@ -328,6 +328,12 @@ public:
     void update_policy(size_t index, const float* policy);
 
     /**
+     * Read the policy target at a specific buffer index.
+     * Returns nullptr if index >= size.
+     */
+    const float* get_policy_ptr(size_t index) const;
+
+    /**
      * Get buffer statistics.
      */
     struct Stats {

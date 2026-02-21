@@ -617,6 +617,57 @@ Three compounding factors caused the stagnation:
 
 ---
 
+### Run 4: `f256-b20-se4-run1` — Epochs Recovery Experiment
+
+**Date:** 2026-02-20
+**Phase:** Resumed from Run 3 iter 9 — testing recovery via epochs schedule + risk_beta
+**Starting point:** `model_iter_009.pt` from Run 3, `replay_buffer_iter009_recovery.rpbf` (W=11,855 D=77,497 L=10,648 — 77.5% draws)
+
+**Parameters (Planned vs Actual):**
+
+| Parameter | Planned | Actual | Note |
+|-----------|---------|--------|------|
+| `simulations` | 200 | 200 | Match |
+| `temperature_moves` | 50 | 50 | Match |
+| `games_per_iter` | 128 | 128 | Match |
+| `workers` | 32 | 32 | Match |
+| `train_batch` | 1024 | 1024 | Match |
+| `epochs` | 2 | 2→1 (iter 12+) | Started too high, intervention needed |
+| `lr` | 0.001 | 0.001 | Match |
+| `risk_beta` | 0 | 0→0.3 (iter 13) | Added to counter draw bias |
+| PER | disabled | disabled | Match |
+| reanalysis | disabled | disabled | Not yet available |
+
+**Iteration Data:**
+
+| Iter | epochs | Loss | Policy | Value | W | B | D | Draw% | Rep | 50-Move | Buffer Draws | Notes |
+|------|--------|------|--------|-------|---|---|---|-------|-----|---------|-------------|-------|
+| 10 | 2 | 8.16 | 7.59 | 0.57 | 9 | 3 | 116 | 90.6% | 72 | 21 | 84.0% | Draw spike |
+| 11 | 2 | 7.80 | 7.41 | 0.39 | 8 | 2 | 118 | 92.2% | 58 | 29 | 92.2% | Stagnation — set epochs=1 |
+| 12 | 1 | 7.84 | 7.39 | 0.45 | 22 | 24 | 82 | **64.1%** | 35 | 28 | 88.0% | **Recovery** |
+| 13 | 1 | 7.90 | 7.52 | 0.375 | 8 | 2 | 118 | **92.2%** | 88 | 17 | 89.5% | Regression — risk_beta=0.3 had no effect |
+
+**What happened:**
+
+1. **Iter 10-11 — epochs=2 damage.** Starting from a 77.5% draw buffer, two training passes per iteration drove value_loss from 0.68 → 0.39 in two iterations. The value head became overconfident about draw predictions. Draw rate spiked from 71% to 92%.
+
+2. **Iter 12 — Temporary recovery.** Epochs=1 intervention led to an impressive 64.1% draw rate (46 decisive games), the best iteration in this run. But the buffer was still 88% draws — one good iteration wasn't enough to shift the buffer composition.
+
+3. **Iter 13 — Buffer trap confirmed.** Despite epochs=1 + risk_beta=0.3, draw rate bounced right back to 92.2% with 88 repetition draws. The buffer at 89.5% draws pulled the model right back after one training step. risk_beta=0.3 was ineffective at value_loss=0.375 (insufficient variance for ERM).
+
+4. **CUDA graph hang.** Iter 13's first attempt (before the successful one) hung due to bad CUDA graph calibration (R²=0.517). Required stop + restart. Second attempt calibrated correctly (R²=0.996).
+
+**Why:**
+
+The core failure is the **buffer draw saturation trap**: even when an iteration produces good self-play outcomes (iter 12: 64.1% draws), training on a buffer that is 88%+ draws pulls the value head back toward draw predictions. This creates an oscillation:
+- Good self-play → train on draw-heavy buffer → value head regresses → bad self-play → buffer stays draw-heavy → repeat
+
+The buffer acts as inertial mass — at 100K positions with 89K draws, adding 10K decisive positions per iteration (best case) barely shifts the ratio. The model needs sustained high decisive rates for 5+ iterations to shift the buffer meaningfully, but the buffer prevents that sustained improvement.
+
+**Outcome:** Failed — confirmed buffer draw saturation trap. Rolled back to iter 9 with preserved buffer. Led to Lessons L12, L13. Key insight: parameter tuning (epochs, risk_beta) cannot overcome buffer draw saturation >85%. Structural interventions needed (rollback, buffer strategy, or reanalysis).
+
+---
+
 ## Lessons Learned
 
 ### L1. Buffet Requires Fresh Weights `CONFIRMED` → Run 1
@@ -681,3 +732,17 @@ The model learns to avoid checkmate (recognize 1-2 bad moves) much faster than i
 ### L11. PER Cannot Rescue a Draw-Saturated Buffer `CONFIRMED` → Run 3
 
 PER was enabled from iteration 1 in Run 3. It did not prevent value head collapse because PER amplifies signal proportional to what exists in the buffer — when 95%+ of the buffer is draws, even PER-amplified decisive positions are too few to maintain the value head. PER also inflated reported loss metrics (L6), making monitoring harder. **However**, PER should help when the buffer has meaningful decisive content (>5-10%). With a healthier buffer and higher simulations generating more decisive games, PER's prioritization of hard positions actively supports value head health. **Key condition:** PER is beneficial when the buffer's decisive fraction can be sustained by self-play; it cannot create signal that doesn't exist.
+
+### L12. Buffer Draw Saturation Is the Root Cause of Recovery Failure `CONFIRMED` → Run 4
+
+At buffer >85% draws AND value_loss < 0.4, no combination of epochs=1 + risk_beta can produce sustained recovery. The mechanism:
+1. Even a good self-play iteration (64% draws) adds ~23K draws + ~15K decisive to a 100K buffer already at 88K draws
+2. Training on this buffer (88% draws) pulls the value head back toward draw predictions
+3. Next self-play iteration regresses to 92%+ draws
+4. The buffer draw percentage doesn't improve (or gets worse)
+
+**Critical thresholds (empirical):** Buffer >85% draws + value_loss < 0.4 = unrecoverable via parameter tuning. The only fix is rollback to a checkpoint with healthier buffer composition. Preventive: never let buffer exceed 80% draws; apply epochs=1 at the first sign of rising draw rate (>75%).
+
+### L13. risk_beta Effectiveness Depends on Value Head Variance `CONFIRMED` → Run 4
+
+risk_beta=0.3 at value_loss=0.375 had zero observable effect (iter 13 draw rate identical to iter 11 without risk_beta). ERM needs `Var(v) > 0` — when the value head confidently predicts "draw" for all positions, risk_beta has nothing to amplify. **Guideline:** risk_beta is effective when value_loss > 0.5 (moderate uncertainty). At value_loss < 0.4, the value head is too confident for ERM to shift MCTS behavior. In this regime, fix the value head first (rollback, buffer composition), then apply risk_beta.
