@@ -1,4 +1,5 @@
 #include "../../include/selfplay/reanalyzer.hpp"
+#include "../../include/selfplay/chess_extensions.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -97,8 +98,8 @@ void Reanalyzer::worker_func(int worker_id) {
                 continue;
             }
 
-            // Reconstruct board from FEN
-            chess::Board board;
+            // Reconstruct board from FEN (ReanalysisBoard adds pushHistoryHash)
+            selfplay::ReanalysisBoard board;
             board.setFen(fen);
 
             // Inject Zobrist history hashes for repetition detection
