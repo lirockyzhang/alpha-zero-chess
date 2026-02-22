@@ -265,10 +265,11 @@ void ParallelSelfPlayCoordinator::gpu_thread_func() {
             bool primary_done = eval_queue_.is_shutdown();
             if (!primary_done) {
                 // Dynamic fire threshold: expected concurrent submissions.
-                // As games are claimed and workers exit, threshold shrinks
-                // so batches fire faster with fewer active submitters.
-                int remaining = games_remaining_.load(std::memory_order_relaxed);
-                int eff_workers = std::min(config_.num_workers, std::max(remaining, 1));
+                // Use actual active worker count (not games_remaining_, which
+                // tracks unclaimed games and drops to 0 as soon as all games
+                // are distributed — long before workers finish playing).
+                int active = workers_active_.load(std::memory_order_relaxed);
+                int eff_workers = std::max(active, 1);
                 int fire_threshold = eff_workers * config_.mcts_batch_size;
 
                 primary_count = eval_queue_.collect_batch(

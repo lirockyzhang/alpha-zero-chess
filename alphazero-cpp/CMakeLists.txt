@@ -82,7 +82,6 @@ target_link_libraries(encoding PUBLIC
 # MCTS library
 add_library(mcts_core STATIC
     src/mcts/search.cpp
-    src/mcts/batch_coordinator.cpp
 )
 
 target_include_directories(mcts_core PUBLIC
@@ -97,8 +96,6 @@ target_link_libraries(mcts_core PUBLIC
 
 # Self-play library
 add_library(selfplay STATIC
-    src/selfplay/game.cpp
-    src/selfplay/coordinator.cpp
     src/selfplay/evaluation_queue.cpp
     src/selfplay/parallel_coordinator.cpp
     src/selfplay/reanalyzer.cpp

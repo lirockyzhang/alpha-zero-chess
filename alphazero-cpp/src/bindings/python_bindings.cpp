@@ -5,11 +5,8 @@
 #include <cstdio>
 #include "mcts/search.hpp"
 #include "mcts/node_pool.hpp"
-#include "mcts/batch_coordinator.hpp"
 #include "encoding/position_encoder.hpp"
 #include "encoding/move_encoder.hpp"
-#include "selfplay/game.hpp"
-#include "selfplay/coordinator.hpp"
 #include "selfplay/parallel_coordinator.hpp"
 #include "selfplay/evaluation_queue.hpp"
 #include "selfplay/reanalyzer.hpp"
@@ -21,49 +18,6 @@ namespace py = pybind11;
 
 // NOTE: Old PyMCTSSearch removed - use PyBatchedMCTSSearch instead
 // The old synchronous API is no longer supported. Use the batched API for proper AlphaZero.
-
-// Python wrapper for batch coordinator
-class PyBatchCoordinator {
-public:
-    PyBatchCoordinator(int batch_size = 256, float batch_threshold = 0.9f)
-        : coordinator_(create_config(batch_size, batch_threshold))
-    {}
-
-    void add_game(int game_id, const std::string& fen) {
-        chess::Board board(fen);
-        coordinator_.add_game(game_id, board);
-    }
-
-    bool is_game_complete(int game_id) const {
-        return coordinator_.is_game_complete(game_id);
-    }
-
-    void remove_game(int game_id) {
-        coordinator_.remove_game(game_id);
-    }
-
-    py::dict get_stats() const {
-        auto stats = coordinator_.get_stats();
-        py::dict result;
-        result["active_games"] = stats.active_games;
-        result["pending_evals"] = stats.pending_evals;
-        result["batch_counter"] = stats.batch_counter;
-        result["next_is_hard_sync"] = stats.next_is_hard_sync;
-        return result;
-    }
-
-private:
-    static mcts::BatchCoordinator::Config create_config(int batch_size, float threshold) {
-        mcts::BatchCoordinator::Config config;
-        config.batch_size = batch_size;
-        config.batch_threshold = threshold;
-        config.simulations_per_move = 800;
-        config.hard_sync_interval = 10;
-        return config;
-    }
-
-    mcts::BatchCoordinator coordinator_;
-};
 
 // Position encoding for neural network input
 // NHWC layout: (height, width, channels) = (8, 8, 123)
@@ -277,130 +231,6 @@ private:
     mcts::MCTSSearch search_;
     int batch_size_;
     std::string root_fen_;
-};
-
-// Python wrapper for self-play coordinator
-// Uses Python callable for neural network evaluation
-class PySelfPlayCoordinator {
-public:
-    PySelfPlayCoordinator(int num_workers = 4, int num_simulations = 800, int batch_size = 256)
-        : config_()
-    {
-        config_.num_workers = num_workers;
-        config_.game_config.num_simulations = num_simulations;
-        config_.game_config.batch_size = batch_size;
-        coordinator_ = std::make_unique<selfplay::SelfPlayCoordinator>(config_);
-    }
-
-    // Generate games using Python neural network evaluator
-    // evaluator: callable that takes (observations_flat: np.array, num_leaves: int)
-    //            and returns (policies: List[np.array], values: np.array)
-    py::list generate_games(py::object evaluator, int num_games) {
-        // Create C++ evaluator that calls Python
-        auto cpp_evaluator = [&evaluator](float* obs_data, int num_leaves,
-                                          std::vector<std::vector<float>>& policies,
-                                          std::vector<float>& values) {
-            // Acquire GIL before calling Python from C++ thread
-            py::gil_scoped_acquire acquire;
-
-            // Convert C++ buffer to numpy array
-            py::array_t<float> obs_array(std::vector<py::ssize_t>{num_leaves, 8, 8, encoding::PositionEncoder::CHANNELS}, obs_data);
-
-            // Call Python evaluator
-            py::object result = evaluator(obs_array, num_leaves);
-
-            // Extract results (expect tuple of (policies, values))
-            py::tuple result_tuple = result.cast<py::tuple>();
-            py::array_t<float> py_policies = result_tuple[0].cast<py::array_t<float>>();
-            py::array_t<float> py_values = result_tuple[1].cast<py::array_t<float>>();
-
-            // Convert back to C++ vectors
-            auto policies_buf = py_policies.request();
-            auto values_buf = py_values.request();
-
-            float* policies_ptr = static_cast<float*>(policies_buf.ptr);
-            float* values_ptr = static_cast<float*>(values_buf.ptr);
-
-            policies.resize(num_leaves);
-            values.resize(num_leaves);
-
-            for (int i = 0; i < num_leaves; ++i) {
-                policies[i].assign(
-                    policies_ptr + i * encoding::MoveEncoder::POLICY_SIZE,
-                    policies_ptr + (i + 1) * encoding::MoveEncoder::POLICY_SIZE
-                );
-                values[i] = values_ptr[i];
-            }
-        };
-
-        // Release GIL before calling C++ code (worker threads will reacquire as needed)
-        std::vector<selfplay::GameTrajectory> trajectories;
-        {
-            py::gil_scoped_release release;
-            trajectories = coordinator_->generate_games(cpp_evaluator, num_games);
-        }
-
-        // Convert to Python list of dictionaries
-        py::list result;
-        for (const auto& traj : trajectories) {
-            py::dict game_dict;
-
-            // Convert observations
-            py::list obs_list;
-            py::list policy_list;
-            py::list value_list;
-
-            for (const auto& state : traj.states) {
-                // Observation: shape (8, 8, 123)
-                py::array_t<float> obs_array(std::vector<py::ssize_t>{8, 8, encoding::PositionEncoder::CHANNELS});
-                std::memcpy(obs_array.mutable_data(), state.observation.data(),
-                           state.observation.size() * sizeof(float));
-                obs_list.append(obs_array);
-
-                // Policy: shape (4672,)
-                py::array_t<float> policy_array(std::vector<py::ssize_t>{encoding::MoveEncoder::POLICY_SIZE});
-                std::memcpy(policy_array.mutable_data(), state.policy.data(),
-                           state.policy.size() * sizeof(float));
-                policy_list.append(policy_array);
-
-                // Value: scalar
-                value_list.append(state.value);
-            }
-
-            game_dict["observations"] = obs_list;
-            game_dict["policies"] = policy_list;
-            game_dict["values"] = value_list;
-            game_dict["num_moves"] = traj.num_moves;
-
-            // Convert result
-            int result_value = 0;
-            if (traj.result == chess::GameResult::WIN) result_value = 1;
-            else if (traj.result == chess::GameResult::LOSE) result_value = -1;
-            game_dict["result"] = result_value;
-
-            result.append(game_dict);
-        }
-
-        return result;
-    }
-
-    // Get statistics
-    py::dict get_stats() const {
-        auto stats = coordinator_->get_stats();
-        py::dict result;
-        result["games_completed"] = stats.games_completed;
-        result["total_moves"] = stats.total_moves;
-        result["white_wins"] = stats.white_wins;
-        result["black_wins"] = stats.black_wins;
-        result["draws"] = stats.draws;
-        result["avg_game_length"] = stats.avg_game_length();
-        result["avg_game_time"] = stats.avg_game_time();
-        return result;
-    }
-
-private:
-    selfplay::CoordinatorConfig config_;
-    std::unique_ptr<selfplay::SelfPlayCoordinator> coordinator_;
 };
 
 // Python wrapper for PARALLEL self-play coordinator (cross-game batching)
@@ -1091,21 +921,6 @@ PYBIND11_MODULE(alphazero_cpp, m) {
           py::arg("index"),
           py::arg("fen"),
           "Convert policy index to UCI move");
-
-    // Self-play coordinator (original - per-game NN calls)
-    py::class_<PySelfPlayCoordinator>(m, "SelfPlayCoordinator")
-        .def(py::init<int, int, int>(),
-             py::arg("num_workers") = 4,
-             py::arg("num_simulations") = 800,
-             py::arg("batch_size") = 256,
-             "Create self-play coordinator for multi-threaded game generation")
-        .def("generate_games", &PySelfPlayCoordinator::generate_games,
-             py::arg("evaluator"),
-             py::arg("num_games"),
-             "Generate self-play games using neural network evaluator.\n"
-             "evaluator: callable(observations, num_leaves) -> (policies, values)")
-        .def("get_stats", &PySelfPlayCoordinator::get_stats,
-             "Get self-play statistics");
 
     // Parallel self-play coordinator (cross-game batching for high GPU utilization)
     py::class_<PyParallelSelfPlayCoordinator>(m, "ParallelSelfPlayCoordinator")

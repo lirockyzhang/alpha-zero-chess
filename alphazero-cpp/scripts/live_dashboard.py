@@ -1679,7 +1679,7 @@ DASHBOARD_HTML = """
 class LiveDashboardServer:
     """Live dashboard server with WebSocket support."""
 
-    def __init__(self, host: str = '127.0.0.1', port: int = 5000):
+    def __init__(self, host: str = '0.0.0.0', port: int = 5000):
         self.host = host
         self.port = port
         self.app = None
@@ -1828,7 +1828,8 @@ class LiveDashboardServer:
                 port=self.port,
                 debug=False,
                 use_reloader=False,
-                log_output=False
+                log_output=False,
+                allow_unsafe_werkzeug=True
             )
 
         self.thread = threading.Thread(target=run_server, daemon=True)

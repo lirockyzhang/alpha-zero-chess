@@ -213,91 +213,6 @@ shutdown_handler = GracefulShutdown()
 
 
 # =============================================================================
-# Periodic Progress Reporter
-# =============================================================================
-
-class ProgressReporter:
-    """Reports progress statistics at regular intervals during self-play.
-
-    Prints performance metrics every `interval` seconds without interrupting
-    the training loop.
-    """
-
-    def __init__(self, interval: float = 30.0):
-        self.interval = interval
-        self.reset()
-
-    def reset(self):
-        """Reset for a new iteration."""
-        self.start_time = time.time()
-        self.last_report_time = self.start_time
-        self.games_completed = 0
-        self.total_moves = 0
-        self.total_sims = 0
-        self.total_evals = 0
-        self.last_games = 0
-        self.last_moves = 0
-        self.last_sims = 0
-        self.last_evals = 0
-
-    def update(self, moves: int, sims: int, evals: int):
-        """Update counters after a game completes."""
-        self.games_completed += 1
-        self.total_moves += moves
-        self.total_sims += sims
-        self.total_evals += evals
-
-    def should_report(self) -> bool:
-        """Check if it's time for a progress report."""
-        return time.time() - self.last_report_time >= self.interval
-
-    def report(self, total_games: int, buffer_size: int):
-        """Print progress report with performance statistics."""
-        now = time.time()
-        elapsed_total = now - self.start_time
-        elapsed_interval = now - self.last_report_time
-
-        # Calculate interval rates (recent performance)
-        interval_games = self.games_completed - self.last_games
-        interval_moves = self.total_moves - self.last_moves
-        interval_sims = self.total_sims - self.last_sims
-        interval_evals = self.total_evals - self.last_evals
-
-        # Calculate rates
-        moves_per_sec = interval_moves / elapsed_interval if elapsed_interval > 0 else 0
-        sims_per_sec = interval_sims / elapsed_interval if elapsed_interval > 0 else 0
-        evals_per_sec = interval_evals / elapsed_interval if elapsed_interval > 0 else 0
-        games_per_hour = interval_games / elapsed_interval * 3600 if elapsed_interval > 0 else 0
-
-        # Calculate overall rates
-        overall_moves_per_sec = self.total_moves / elapsed_total if elapsed_total > 0 else 0
-
-        # ETA calculation
-        remaining_games = total_games - self.games_completed
-        if interval_games > 0:
-            eta_seconds = remaining_games / (interval_games / elapsed_interval)
-            eta_str = format_duration(eta_seconds)
-        else:
-            eta_str = "calculating..."
-
-        # Print compact progress line
-        print(f"    ⏱ {format_duration(elapsed_total)} | "
-              f"Games: {self.games_completed}/{total_games} | "
-              f"Moves: {moves_per_sec:.1f}/s | "
-              f"Sims: {sims_per_sec:,.0f}/s | "
-              f"NN: {evals_per_sec:,.0f}/s | "
-              f"Buffer: {buffer_size:,} | "
-              f"ETA: {eta_str}")
-
-        # Update last values for next interval
-        self.last_report_time = now
-        self.last_games = self.games_completed
-        self.last_moves = self.total_moves
-        self.last_sims = self.total_sims
-        self.last_evals = self.total_evals
-
-
-# =============================================================================
 # Refutation Elo
 # =============================================================================
 
@@ -721,206 +636,6 @@ def safe_torch_save(obj: dict, path: str):
     torch.save(obj, tmp_path)
     # On Windows, os.replace is atomic if src and dst are on the same volume
     os.replace(tmp_path, path)
-
-
-# =============================================================================
-# Batched Evaluator (GPU)
-# =============================================================================
-
-class BatchedEvaluator:
-    """Efficient batched neural network evaluation on GPU."""
-
-    def __init__(self, network: nn.Module, device: str, use_amp: bool = True):
-        self.network = network
-        self.device = device
-        self.use_amp = use_amp and device == "cuda"
-
-    @torch.inference_mode()
-    def evaluate(self, obs: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, float]:
-        """Evaluate single position. obs is NHWC (8, 8, 123)."""
-        # permute: (8,8,123) → unsqueeze → (1,8,8,123) → permute → (1,123,8,8) channels_last
-        obs_tensor = torch.from_numpy(obs).unsqueeze(0).permute(0, 3, 1, 2).float().to(self.device)
-        mask_tensor = torch.from_numpy(mask).float().unsqueeze(0).to(self.device)
-
-        if self.use_amp:
-            with autocast('cuda'):
-                policy, value, _, _ = self.network(obs_tensor, mask_tensor)
-        else:
-            policy, value, _, _ = self.network(obs_tensor, mask_tensor)
-
-        return policy[0].cpu().numpy(), float(value[0].item())
-
-    @torch.inference_mode()
-    def evaluate_batch(self, obs_batch: np.ndarray, mask_batch: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Evaluate batch of positions. obs_batch is NHWC (N, 8, 8, 123)."""
-        obs_tensor = torch.from_numpy(obs_batch).permute(0, 3, 1, 2).float().to(self.device)
-        mask_tensor = torch.from_numpy(mask_batch).float().to(self.device)
-
-        if self.use_amp:
-            with autocast('cuda'):
-                policies, values, _, _ = self.network(obs_tensor, mask_tensor)
-        else:
-            policies, values, _, _ = self.network(obs_tensor, mask_tensor)
-
-        return policies.cpu().numpy(), values.squeeze(-1).cpu().numpy()
-
-
-# =============================================================================
-# Self-Play with C++ MCTS
-# =============================================================================
-
-class CppSelfPlay:
-    """Self-play using C++ MCTS backend."""
-
-    def __init__(
-        self,
-        evaluator: BatchedEvaluator,
-        num_simulations: int = 800,
-        mcts_batch_size: int = 64,
-        c_explore: float = 1.5,
-        temperature_moves: int = 30,
-    ):
-        self.evaluator = evaluator
-        self.num_simulations = num_simulations
-        self.mcts_batch_size = mcts_batch_size
-        self.c_explore = c_explore
-        self.temperature_moves = temperature_moves
-
-        # Create C++ MCTS engine (BatchedMCTSSearch is the Python binding name)
-        self.mcts = alphazero_cpp.BatchedMCTSSearch(
-            num_simulations=num_simulations,
-            batch_size=mcts_batch_size,
-            c_puct=c_explore  # C++ binding kwarg stays c_puct
-        )
-
-    def play_game(self) -> Tuple[List[np.ndarray], List[np.ndarray], float, int, int, int, List[str], str]:
-        """Play a single self-play game.
-
-        Returns:
-            observations: List of board observations (8, 8, 123) NHWC format
-            policies: List of MCTS policies
-            result: Game result (1=white wins, -1=black wins, 0=draw)
-            num_moves: Number of moves played
-            total_sims: Total MCTS simulations
-            total_evals: Total NN evaluations
-            moves_uci: List of UCI move strings
-            result_reason: Draw reason string (repetition/stalemate/fifty_move/insufficient/max_moves/checkmate/"")
-        """
-        board = chess.Board()
-        observations = []
-        policies = []
-        move_count = 0
-        total_sims = 0
-        total_evals = 0
-
-        while not board.is_game_over() and move_count < 10000:
-            fen = board.fen()
-
-            # Encode position (returns 8, 8, 123 in NHWC format)
-            obs = alphazero_cpp.encode_position(fen)
-
-            # Get legal moves and build mask + mapping
-            legal_moves = list(board.legal_moves)
-            mask = np.zeros(POLICY_SIZE, dtype=np.float32)
-            move_to_idx = {}
-            idx_to_move = {}
-
-            for move in legal_moves:
-                idx = alphazero_cpp.move_to_index(move.uci(), fen)
-                if 0 <= idx < POLICY_SIZE:
-                    mask[idx] = 1.0
-                    move_to_idx[move.uci()] = idx
-                    idx_to_move[idx] = move
-
-            # Get root evaluation
-            root_policy, root_value = self.evaluator.evaluate(obs, mask)
-            total_evals += 1
-
-            # Initialize MCTS search
-            self.mcts.init_search(fen, root_policy.astype(np.float32), float(root_value))
-
-            # Run MCTS with batched leaf evaluation
-            while not self.mcts.is_complete():
-                num_leaves, obs_batch, mask_batch = self.mcts.collect_leaves()
-                if num_leaves == 0:
-                    break
-
-                masks = mask_batch[:num_leaves]
-
-                # Batch evaluate (evaluator handles NHWC → permute internally)
-                leaf_policies, leaf_values = self.evaluator.evaluate_batch(obs_batch[:num_leaves], masks)
-                total_evals += num_leaves
-
-                # Update leaves
-                self.mcts.update_leaves(
-                    leaf_policies.astype(np.float32),
-                    leaf_values.astype(np.float32)
-                )
-
-            total_sims += self.mcts.get_simulations_completed()
-
-            # Get visit counts as policy
-            visit_counts = self.mcts.get_visit_counts()
-            policy = visit_counts.astype(np.float32)
-            policy = policy * mask
-            if policy.sum() > 0:
-                policy = policy / policy.sum()
-            else:
-                policy = mask / mask.sum()
-
-            # Store for training
-            observations.append(obs.copy())
-            policies.append(policy.copy())
-
-            # Select move with temperature
-            if move_count < self.temperature_moves:
-                action = np.random.choice(POLICY_SIZE, p=policy)
-            else:
-                action = np.argmax(policy)
-
-            # Get move from mapping
-            if action in idx_to_move:
-                move = idx_to_move[action]
-            else:
-                best_idx = max(idx_to_move.keys(), key=lambda i: policy[i])
-                move = idx_to_move[best_idx]
-
-            board.push(move)
-            move_count += 1
-            self.mcts.reset()
-
-        # Get game result
-        result = board.result()
-        if result == "1-0":
-            value = 1.0
-        elif result == "0-1":
-            value = -1.0
-        else:
-            value = 0.0  # Pure training label (risk_beta is search-time only)
-
-        # Determine result reason for draw breakdown tracking
-        if value == 0.0:
-            if move_count >= 10000:
-                result_reason = "max_moves"
-            elif board.is_repetition():
-                result_reason = "repetition"
-            elif board.is_stalemate():
-                result_reason = "stalemate"
-            elif board.is_fifty_moves():
-                result_reason = "fifty_move"
-            elif board.is_insufficient_material():
-                result_reason = "insufficient"
-            else:
-                result_reason = "max_moves"  # fallback
-        elif board.is_checkmate():
-            result_reason = "checkmate"
-        else:
-            result_reason = ""
-
-        # Extract UCI move history
-        moves_uci = [m.uci() for m in board.move_stack]
-
-        return observations, policies, value, move_count, total_sims, total_evals, moves_uci, result_reason
 
 
 # =============================================================================
@@ -2585,8 +2300,8 @@ Examples:
                         help="Gumbel sigma() scale factor (default: 1.0)")
 
     # Parallel self-play
-    parser.add_argument("--workers", type=int, default=1,
-                        help="Self-play workers. 1=sequential, >1=parallel with cross-game batching (default: 1)")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="Parallel self-play workers for cross-game GPU batching (default: 8, minimum: 2)")
     parser.add_argument("--gpu-batch-timeout-ms", type=int, default=20,
                         help="GPU batch collection timeout in ms (default: 20)")
     parser.add_argument("--stall-detection-us", type=int, default=500,
@@ -2676,6 +2391,10 @@ Examples:
 
     args = parser.parse_args()
 
+    # Validate --workers minimum
+    if args.workers < 2:
+        parser.error("--workers must be >= 2 (sequential self-play has been removed)")
+
     # Derive search_batch from search algorithm (no longer user-facing)
     if args.search_algorithm == "gumbel":
         args.search_batch = args.gumbel_top_k
@@ -2725,11 +2444,10 @@ Examples:
     else:
         print(f"  eval_batch={args.eval_batch} (workers × search_batch, rounded to 32)")
 
-    # Validate parameter relationships for parallel mode
-    if args.workers > 1:
-        if args.queue_capacity == 0:
-            auto_cap = max(8192, args.workers * args.search_batch * 8)
-            print(f"  Auto queue_capacity: {auto_cap} (from {args.workers} workers * {args.search_batch} search_batch * 8)")
+    # Auto queue capacity
+    if args.queue_capacity == 0:
+        auto_cap = max(8192, args.workers * args.search_batch * 8)
+        print(f"  Auto queue_capacity: {auto_cap} (from {args.workers} workers * {args.search_batch} search_batch * 8)")
 
     # Handle device
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -2820,11 +2538,8 @@ Examples:
         print(f"Root search:         Gumbel Top-k SH (top_k={args.gumbel_top_k}, c_visit={args.gumbel_c_visit}, c_scale={args.gumbel_c_scale})")
     else:
         print(f"Root search:         PUCT + Dirichlet (alpha={args.dirichlet_alpha}, eps={args.dirichlet_epsilon})")
-    if args.workers > 1:
-        print(f"Self-play:           Parallel ({args.workers} workers, "
-              f"eval_batch={args.eval_batch} GPU-effective, input={args.input_batch_size})")
-    else:
-        print(f"Self-play:           Sequential")
+    print(f"Self-play:           Parallel ({args.workers} workers, "
+          f"eval_batch={args.eval_batch} GPU-effective, input={args.input_batch_size})")
     print(f"Training:            {args.iterations} iters x {args.games_per_iter} games")
     print(f"                     train_batch={args.train_batch}, lr={args.lr}, epochs={args.epochs}")
     print(f"Value head:          WDL (soft cross-entropy), risk_beta={args.risk_beta}")
@@ -2958,19 +2673,6 @@ Examples:
         metrics_removed = truncate_training_log(run_dir, start_iter)
         if metrics_removed > 0:
             print(f"  Truncated training log: removed {metrics_removed} records >= iteration {start_iter}")
-
-    # Create evaluator and self-play (only needed for sequential mode)
-    evaluator = None
-    self_play = None
-    if args.workers <= 1:
-        evaluator = BatchedEvaluator(network, device, use_amp=(device == "cuda"))
-        self_play = CppSelfPlay(
-            evaluator=evaluator,
-            num_simulations=args.simulations,
-            mcts_batch_size=args.search_batch,
-            c_puct=args.c_explore,  # C++ binding kwarg stays c_puct
-            temperature_moves=args.temperature_moves,
-        )
 
     # Metrics tracker (for console output)
     print("Initializing metrics tracker...", end=" ", flush=True)
@@ -3397,298 +3099,148 @@ Examples:
         print(f"Iteration {iteration + 1}/{args.iterations}")
         print(f"  Self-play: generating {args.games_per_iter} games...")
 
-        if args.workers > 1:
-            # ================================================================
-            # PARALLEL SELF-PLAY (Cross-Game Batching)
-            # ================================================================
-            # Uses ParallelSelfPlayCoordinator for high GPU utilization
-            # All games run concurrently, NN evals batched across games
+        # Set up concurrent reanalysis if enabled and buffer has data
+        reanalyzer = None
+        reanalyze_this_iter = (
+            args.reanalyze_fraction > 0
+            and replay_buffer.size() > args.train_batch
+        )
+        if reanalyze_this_iter:
+            import random as _rng
+            reanalyze_sims = max(1, int(args.simulations * args.reanalyze_simulations_ratio))
+            num_positions = int(replay_buffer.size() * args.reanalyze_fraction)
 
-            # Set up concurrent reanalysis if enabled and buffer has data
-            reanalyzer = None
-            reanalyze_this_iter = (
-                args.reanalyze_fraction > 0
-                and replay_buffer.size() > args.train_batch
-            )
-            if reanalyze_this_iter:
-                import random as _rng
-                reanalyze_sims = max(1, int(args.simulations * args.reanalyze_simulations_ratio))
-                num_positions = int(replay_buffer.size() * args.reanalyze_fraction)
+            reanalysis_config = alphazero_cpp.ReanalysisConfig()
+            reanalysis_config.num_simulations = reanalyze_sims
+            reanalysis_config.gpu_batch_size = args.input_batch_size
+            reanalysis_config.c_puct = args.c_explore
+            reanalysis_config.fpu_base = args.fpu_base
+            reanalysis_config.risk_beta = args.risk_beta
+            reanalysis_config.use_gumbel = (args.search_algorithm == "gumbel")
+            reanalysis_config.gumbel_top_k = args.gumbel_top_k
+            reanalysis_config.gumbel_c_visit = args.gumbel_c_visit
+            reanalysis_config.gumbel_c_scale = args.gumbel_c_scale
 
-                reanalysis_config = alphazero_cpp.ReanalysisConfig()
-                reanalysis_config.num_simulations = reanalyze_sims
-                reanalysis_config.gpu_batch_size = args.input_batch_size
-                reanalysis_config.c_puct = args.c_explore
-                reanalysis_config.fpu_base = args.fpu_base
-                reanalysis_config.risk_beta = args.risk_beta
-                reanalysis_config.use_gumbel = (args.search_algorithm == "gumbel")
-                reanalysis_config.gumbel_top_k = args.gumbel_top_k
-                reanalysis_config.gumbel_c_visit = args.gumbel_c_visit
-                reanalysis_config.gumbel_c_scale = args.gumbel_c_scale
+            # Auto-derive mcts_batch_size to match search algorithm
+            if args.search_algorithm == "gumbel":
+                reanalysis_config.mcts_batch_size = args.gumbel_top_k  # e.g. 16
+            else:
+                reanalysis_config.mcts_batch_size = 1  # PUCT: single-leaf
 
-                # Auto-derive mcts_batch_size to match search algorithm
-                if args.search_algorithm == "gumbel":
-                    reanalysis_config.mcts_batch_size = args.gumbel_top_k  # e.g. 16
-                else:
-                    reanalysis_config.mcts_batch_size = 1  # PUCT: single-leaf
+            # Auto-derive worker count for GPU fill during dedicated reanalysis mode.
+            # Target: workers × mcts_batch_size ≈ gpu_batch_size
+            if args.reanalyze_workers > 0:
+                reanalyze_workers = args.reanalyze_workers  # explicit override
+            else:
+                target = args.input_batch_size  # gpu_batch_size
+                reanalyze_workers = max(4, target // reanalysis_config.mcts_batch_size)
+                reanalyze_workers = min(reanalyze_workers, 64)  # cap thread count
+            reanalysis_config.num_workers = reanalyze_workers
 
-                # Auto-derive worker count for GPU fill during dedicated reanalysis mode.
-                # Target: workers × mcts_batch_size ≈ gpu_batch_size
-                if args.reanalyze_workers > 0:
-                    reanalyze_workers = args.reanalyze_workers  # explicit override
-                else:
-                    target = args.input_batch_size  # gpu_batch_size
-                    reanalyze_workers = max(4, target // reanalysis_config.mcts_batch_size)
-                    reanalyze_workers = min(reanalyze_workers, 64)  # cap thread count
-                reanalysis_config.num_workers = reanalyze_workers
+            # Scale queue capacity for worker count × batch size
+            min_capacity = reanalyze_workers * reanalysis_config.mcts_batch_size * 8
+            if args.queue_capacity > 0:
+                reanalysis_config.queue_capacity = max(args.queue_capacity, min_capacity)
+            else:
+                reanalysis_config.queue_capacity = max(8192, min_capacity)
 
-                # Scale queue capacity for worker count × batch size
-                min_capacity = reanalyze_workers * reanalysis_config.mcts_batch_size * 8
-                if args.queue_capacity > 0:
-                    reanalysis_config.queue_capacity = max(args.queue_capacity, min_capacity)
-                else:
-                    reanalysis_config.queue_capacity = max(8192, min_capacity)
+            reanalyzer = alphazero_cpp.Reanalyzer(replay_buffer, reanalysis_config)
+            indices = _rng.sample(range(replay_buffer.size()), num_positions)
+            reanalyzer.set_indices(indices)
+            print(f"  Reanalysis: {num_positions} positions, {reanalyze_sims} sims, "
+                  f"{reanalyze_workers} workers, batch_size={reanalysis_config.mcts_batch_size} "
+                  f"(concurrent with self-play)")
 
-                reanalyzer = alphazero_cpp.Reanalyzer(replay_buffer, reanalysis_config)
-                indices = _rng.sample(range(replay_buffer.size()), num_positions)
-                reanalyzer.set_indices(indices)
-                print(f"  Reanalysis: {num_positions} positions, {reanalyze_sims} sims, "
-                      f"{reanalyze_workers} workers, batch_size={reanalysis_config.mcts_batch_size} "
-                      f"(concurrent with self-play)")
+        parallel_metrics, sample_game, hw_stats = run_parallel_selfplay(
+            network=network,
+            replay_buffer=replay_buffer,
+            device=device,
+            args=args,
+            iteration=iteration + 1,  # 1-indexed for display
+            live_dashboard=live_dashboard,
+            reanalyzer=reanalyzer,
+        )
+        metrics.reanalysis_positions = parallel_metrics.reanalysis_positions
+        metrics.reanalysis_time_s = parallel_metrics.reanalysis_time_s
+        metrics.reanalysis_mean_kl = parallel_metrics.reanalysis_mean_kl
+        metrics.num_games = parallel_metrics.num_games
+        metrics.total_moves = parallel_metrics.total_moves
+        metrics.total_simulations = parallel_metrics.total_simulations
+        metrics.total_nn_evals = parallel_metrics.total_nn_evals
+        metrics.white_wins = parallel_metrics.white_wins
+        metrics.black_wins = parallel_metrics.black_wins
+        metrics.draws = parallel_metrics.draws
+        metrics.draws_repetition = parallel_metrics.draws_repetition
+        metrics.draws_stalemate = parallel_metrics.draws_stalemate
+        metrics.draws_fifty_move = parallel_metrics.draws_fifty_move
+        metrics.draws_insufficient = parallel_metrics.draws_insufficient
+        metrics.draws_max_moves = parallel_metrics.draws_max_moves
+        metrics.draws_early_repetition = parallel_metrics.draws_early_repetition
+        metrics.standard_wins = parallel_metrics.standard_wins
+        metrics.opponent_wins = parallel_metrics.opponent_wins
+        metrics.asymmetric_draws = parallel_metrics.asymmetric_draws
+        metrics.selfplay_time = parallel_metrics.selfplay_time
+        metrics.risk_beta = parallel_metrics.risk_beta
 
-            parallel_metrics, sample_game, hw_stats = run_parallel_selfplay(
+        # Fill-up: play additional batches if buffer not ready (capped)
+        fillup_rounds = 0
+        while not check_training_ready() and not shutdown_handler.should_stop():
+            if fillup_rounds >= args.max_fillup_factor:
+                print(f"  WARNING: Buffer not ready after {fillup_rounds} extra rounds "
+                      f"({fillup_rounds * args.games_per_iter} games), training with available data")
+                break
+            print(f"  Buffer fill-up: {fillup_reason()}, playing {args.games_per_iter} more games...")
+            extra_metrics, _, _ = run_parallel_selfplay(
                 network=network,
                 replay_buffer=replay_buffer,
                 device=device,
                 args=args,
-                iteration=iteration + 1,  # 1-indexed for display
+                iteration=iteration + 1,
                 live_dashboard=live_dashboard,
-                reanalyzer=reanalyzer,
             )
-            metrics.reanalysis_positions = parallel_metrics.reanalysis_positions
-            metrics.reanalysis_time_s = parallel_metrics.reanalysis_time_s
-            metrics.reanalysis_mean_kl = parallel_metrics.reanalysis_mean_kl
-            metrics.num_games = parallel_metrics.num_games
-            metrics.total_moves = parallel_metrics.total_moves
-            metrics.total_simulations = parallel_metrics.total_simulations
-            metrics.total_nn_evals = parallel_metrics.total_nn_evals
-            metrics.white_wins = parallel_metrics.white_wins
-            metrics.black_wins = parallel_metrics.black_wins
-            metrics.draws = parallel_metrics.draws
-            metrics.draws_repetition = parallel_metrics.draws_repetition
-            metrics.draws_stalemate = parallel_metrics.draws_stalemate
-            metrics.draws_fifty_move = parallel_metrics.draws_fifty_move
-            metrics.draws_insufficient = parallel_metrics.draws_insufficient
-            metrics.draws_max_moves = parallel_metrics.draws_max_moves
-            metrics.draws_early_repetition = parallel_metrics.draws_early_repetition
-            metrics.standard_wins = parallel_metrics.standard_wins
-            metrics.opponent_wins = parallel_metrics.opponent_wins
-            metrics.asymmetric_draws = parallel_metrics.asymmetric_draws
-            metrics.selfplay_time = parallel_metrics.selfplay_time
-            metrics.risk_beta = parallel_metrics.risk_beta
+            metrics.num_games += extra_metrics.num_games
+            metrics.total_moves += extra_metrics.total_moves
+            metrics.total_simulations += extra_metrics.total_simulations
+            metrics.total_nn_evals += extra_metrics.total_nn_evals
+            metrics.white_wins += extra_metrics.white_wins
+            metrics.black_wins += extra_metrics.black_wins
+            metrics.draws += extra_metrics.draws
+            metrics.draws_repetition += extra_metrics.draws_repetition
+            metrics.draws_stalemate += extra_metrics.draws_stalemate
+            metrics.draws_fifty_move += extra_metrics.draws_fifty_move
+            metrics.draws_insufficient += extra_metrics.draws_insufficient
+            metrics.draws_max_moves += extra_metrics.draws_max_moves
+            metrics.draws_early_repetition += extra_metrics.draws_early_repetition
+            metrics.standard_wins += extra_metrics.standard_wins
+            metrics.opponent_wins += extra_metrics.opponent_wins
+            metrics.asymmetric_draws += extra_metrics.asymmetric_draws
+            metrics.selfplay_time += extra_metrics.selfplay_time
+            fillup_rounds += 1
 
-            # Fill-up: play additional batches if buffer not ready (capped)
-            fillup_rounds = 0
-            while not check_training_ready() and not shutdown_handler.should_stop():
-                if fillup_rounds >= args.max_fillup_factor:
-                    print(f"  WARNING: Buffer not ready after {fillup_rounds} extra rounds "
-                          f"({fillup_rounds * args.games_per_iter} games), training with available data")
-                    break
-                print(f"  Buffer fill-up: {fillup_reason()}, playing {args.games_per_iter} more games...")
-                extra_metrics, _, _ = run_parallel_selfplay(
-                    network=network,
-                    replay_buffer=replay_buffer,
-                    device=device,
-                    args=args,
-                    iteration=iteration + 1,
-                    live_dashboard=live_dashboard,
-                )
-                metrics.num_games += extra_metrics.num_games
-                metrics.total_moves += extra_metrics.total_moves
-                metrics.total_simulations += extra_metrics.total_simulations
-                metrics.total_nn_evals += extra_metrics.total_nn_evals
-                metrics.white_wins += extra_metrics.white_wins
-                metrics.black_wins += extra_metrics.black_wins
-                metrics.draws += extra_metrics.draws
-                metrics.draws_repetition += extra_metrics.draws_repetition
-                metrics.draws_stalemate += extra_metrics.draws_stalemate
-                metrics.draws_fifty_move += extra_metrics.draws_fifty_move
-                metrics.draws_insufficient += extra_metrics.draws_insufficient
-                metrics.draws_max_moves += extra_metrics.draws_max_moves
-                metrics.draws_early_repetition += extra_metrics.draws_early_repetition
-                metrics.standard_wins += extra_metrics.standard_wins
-                metrics.opponent_wins += extra_metrics.opponent_wins
-                metrics.asymmetric_draws += extra_metrics.asymmetric_draws
-                metrics.selfplay_time += extra_metrics.selfplay_time
-                fillup_rounds += 1
+        metrics.avg_game_length = metrics.total_moves / max(metrics.num_games, 1)
 
-            metrics.avg_game_length = metrics.total_moves / max(metrics.num_games, 1)
+        # Save sample game as PGN
+        if not args.no_sample_games and sample_game is not None:
+            save_sample_game_pgn(
+                run_dir, iteration + 1,
+                sample_game["moves"],
+                sample_game["result"],
+                sample_game["num_moves"]
+            )
 
-            # Save sample game as PGN
-            if not args.no_sample_games and sample_game is not None:
-                save_sample_game_pgn(
-                    run_dir, iteration + 1,
-                    sample_game["moves"],
-                    sample_game["result"],
-                    sample_game["num_moves"]
-                )
-
-            # Print sample game to console for LLM consumption
-            if sample_game is not None:
-                result = sample_game.get("result", "?")
-                n_moves = sample_game.get("num_moves", 0)
-                reason = sample_game.get("result_reason", "")
-                reason_str = f" ({reason})" if reason else ""
-                moves = sample_game.get("moves", [])
-                if len(moves) <= 30:
-                    move_str = " ".join(moves)
-                else:
-                    move_str = " ".join(moves[:20]) + f" ... ({len(moves)-25} moves) ... " + " ".join(moves[-5:])
-                print(f"  Sample Game: {result} in {n_moves} moves{reason_str}")
-                print(f"    Moves: {move_str}")
-        else:
-            # ================================================================
-            # SEQUENTIAL SELF-PLAY (Original)
-            # ================================================================
-            # Games played one-by-one, each game makes its own NN calls
-            network.eval()
-            selfplay_start = time.time()
-            games_completed = 0
-            seq_sample_game = None  # Track a sample game for PGN export
-
-            # Initialize progress reporter for this iteration
-            progress = ProgressReporter(interval=args.progress_interval)
-
-            # Track time for live dashboard updates (every 5 seconds)
-            last_live_update = time.time()
-            live_update_interval = 5.0  # seconds
-
-            game_idx = 0
-            filling_buffer = False
-            max_fillup_games = args.games_per_iter * args.max_fillup_factor
-            while True:
-                if game_idx >= args.games_per_iter:
-                    if check_training_ready():
-                        break
-                    if game_idx >= args.games_per_iter + max_fillup_games:
-                        print(f"  WARNING: Buffer not ready after {game_idx} games "
-                              f"(cap: {max_fillup_games} extra), training with available data")
-                        break
-                    if not filling_buffer:
-                        filling_buffer = True
-                        print(f"  Buffer fill-up: {fillup_reason()}, playing additional games...")
-                # Check for shutdown between games
-                if shutdown_handler.should_stop():
-                    print(f"  Stopping after {game_idx} games (shutdown requested)")
-                    break
-
-                obs_list, policy_list, result, num_moves, total_sims, total_evals, moves_uci, result_reason = self_play.play_game()
-                games_completed += 1
-
-                # Track sample game (prefer decisive games)
-                is_decisive = (result != 0)
-                if seq_sample_game is None or (not seq_sample_game["is_decisive"] and is_decisive):
-                    result_str = "1-0" if result > 0 else "0-1" if result < 0 else "1/2-1/2"
-                    seq_sample_game = {
-                        "moves": moves_uci,
-                        "result": result_str,
-                        "result_reason": result_reason,
-                        "num_moves": num_moves,
-                        "is_decisive": is_decisive
-                    }
-
-                # Add game data to C++ ReplayBuffer
-                # Flatten observations for storage: (123, 8, 8) -> (7872,)
-                # Value must be from side-to-move perspective (matches C++ game.hpp::set_outcomes)
-                for i, (obs, policy) in enumerate(zip(obs_list, policy_list)):
-                    obs_flat = obs.flatten().astype(np.float32)  # (7872,)
-                    white_to_move = (i % 2 == 0)
-                    if result == 1.0:  # White won
-                        value = 1.0 if white_to_move else -1.0
-                    elif result == -1.0:  # Black won
-                        value = -1.0 if white_to_move else 1.0
-                    else:  # Draw — pure training label (risk_beta is search-time only)
-                        value = 0.0
-                    replay_buffer.add_sample(obs_flat, policy.astype(np.float32), float(value))
-
-                metrics.total_moves += num_moves
-                metrics.total_simulations += total_sims
-                metrics.total_nn_evals += total_evals
-
-                if result == 1.0:
-                    metrics.white_wins += 1
-                elif result == -1.0:
-                    metrics.black_wins += 1
-                else:
-                    metrics.draws += 1
-                    # Draw breakdown (sequential path)
-                    if result_reason == "repetition":
-                        metrics.draws_repetition += 1
-                        if num_moves < 60:
-                            metrics.draws_early_repetition += 1
-                    elif result_reason == "stalemate":
-                        metrics.draws_stalemate += 1
-                    elif result_reason == "fifty_move":
-                        metrics.draws_fifty_move += 1
-                    elif result_reason == "insufficient":
-                        metrics.draws_insufficient += 1
-                    elif result_reason == "max_moves":
-                        metrics.draws_max_moves += 1
-
-                # Update progress tracker
-                progress.update(num_moves, total_sims, total_evals)
-
-                # Print periodic progress report (every 30 seconds)
-                if progress.should_report():
-                    progress.report(max(args.games_per_iter, game_idx + 1), get_total_buffer_size())
-
-                # Push live dashboard update every 5 seconds
-                now = time.time()
-                if live_dashboard is not None and (now - last_live_update) >= live_update_interval:
-                    elapsed_selfplay = now - selfplay_start
-                    live_dashboard.push_progress(
-                        iteration=iteration + 1,
-                        games_completed=games_completed,
-                        total_games=max(args.games_per_iter, game_idx + 1),
-                        moves=progress.total_moves,
-                        sims=progress.total_sims,
-                        evals=progress.total_evals,
-                        elapsed_time=elapsed_selfplay,
-                        buffer_size=get_total_buffer_size(),
-                        phase="selfplay"
-                    )
-                    last_live_update = now
-
-                game_idx += 1
-
-            metrics.num_games = games_completed
-            metrics.selfplay_time = time.time() - selfplay_start
-            metrics.avg_game_length = metrics.total_moves / max(metrics.num_games, 1)
-
-            # Save sample game as PGN (sequential path)
-            if not args.no_sample_games and seq_sample_game is not None:
-                save_sample_game_pgn(
-                    run_dir, iteration + 1,
-                    seq_sample_game["moves"],
-                    seq_sample_game["result"],
-                    seq_sample_game["num_moves"]
-                )
-
-            # Print sample game to console for LLM consumption
-            if seq_sample_game is not None:
-                result = seq_sample_game.get("result", "?")
-                n_moves = seq_sample_game.get("num_moves", 0)
-                moves = seq_sample_game.get("moves", [])
-                if len(moves) <= 30:
-                    move_str = " ".join(moves)
-                else:
-                    move_str = " ".join(moves[:20]) + f" ... ({len(moves)-25} moves) ... " + " ".join(moves[-5:])
-                print(f"  Sample Game: {result} in {n_moves} moves")
-                print(f"    Moves: {move_str}")
-
-            # Make sample_game available for claude logging
-            sample_game = seq_sample_game
-            hw_stats = {}  # No hardware metrics in sequential mode
+        # Print sample game to console for LLM consumption
+        if sample_game is not None:
+            result = sample_game.get("result", "?")
+            n_moves = sample_game.get("num_moves", 0)
+            reason = sample_game.get("result_reason", "")
+            reason_str = f" ({reason})" if reason else ""
+            moves = sample_game.get("moves", [])
+            if len(moves) <= 30:
+                move_str = " ".join(moves)
+            else:
+                move_str = " ".join(moves[:20]) + f" ... ({len(moves)-25} moves) ... " + " ".join(moves[-5:])
+            print(f"  Sample Game: {result} in {n_moves} moves{reason_str}")
+            print(f"    Moves: {move_str}")
 
         # Create selfplay_done safety lock (before training begins)
         selfplay_done_path = None
@@ -3980,7 +3532,7 @@ Examples:
 
     if live_dashboard is not None:
         live_dashboard.complete()
-        print(f"\n  Live dashboard still running at http://127.0.0.1:{args.dashboard_port}")
+        print(f"\n  Live dashboard still running at http://0.0.0.0:{args.dashboard_port}")
         print(f"  Press Ctrl+C to exit completely")
 
     # Final summary
