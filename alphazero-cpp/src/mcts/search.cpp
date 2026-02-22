@@ -9,6 +9,70 @@
 
 namespace mcts {
 
+// Collect moves from root to leaf by walking parent pointers.
+// Returns moves in root-to-leaf order (first move is root's child move).
+static std::vector<chess::Move> collect_path_moves(const Node* leaf, const Node* root) {
+    std::vector<chess::Move> moves;
+    const Node* node = leaf;
+    while (node != nullptr && node != root && node->parent != nullptr) {
+        moves.push_back(node->move);
+        node = node->parent;
+    }
+    std::reverse(moves.begin(), moves.end());
+    return moves;
+}
+
+// Build history boards for a leaf at depth D.
+// Combines position_history (pre-root) with in-tree boards (root to parent of leaf).
+// Returns at most 8 boards in chronological order (oldest first).
+//
+// clean_root: A copy of root_position with empty prev_states_ (created once
+//             per batch via getFen() to avoid copying the undo stack).
+static std::vector<chess::Board> build_leaf_history(
+    const std::vector<chess::Move>& path_moves,
+    const chess::Board& clean_root,
+    const std::vector<chess::Board>& position_history)
+{
+    int depth = static_cast<int>(path_moves.size());
+    int pre_root_count = static_cast<int>(position_history.size());
+
+    // How many history entries the encoder will use (max 8)
+    int total_available = pre_root_count + depth;  // pre-root + in-tree boards
+    int window = std::min(8, total_available);
+
+    // How many in-tree boards we need (depth boards exist: root, after_m1, ..., after_m(D-1))
+    int in_tree_needed = std::min(depth, window);
+    // How many pre-root boards to prepend
+    int pre_root_needed = window - in_tree_needed;
+
+    std::vector<chess::Board> history;
+    history.reserve(window);
+
+    // 1. Grab tail of position_history (oldest entries that fit)
+    if (pre_root_needed > 0) {
+        int start = pre_root_count - pre_root_needed;
+        for (int i = start; i < pre_root_count; ++i) {
+            history.push_back(position_history[i]);
+        }
+    }
+
+    // 2. Replay path moves on clean_root to generate in-tree boards.
+    //    We need the last `in_tree_needed` boards out of `depth` total.
+    //    Skip the first (depth - in_tree_needed) moves without saving.
+    if (in_tree_needed > 0) {
+        chess::Board board = clean_root;  // Cheap copy: empty prev_states_
+        int skip = depth - in_tree_needed;
+        for (int i = 0; i < depth; ++i) {
+            if (i >= skip) {
+                history.push_back(board);  // Save board BEFORE move
+            }
+            board.makeMove(path_moves[i]);
+        }
+    }
+
+    return history;  // Chronological, oldest first. Encoder reads from back.
+}
+
 Node* MCTSSearch::init_search(const chess::Board& root_position,
                                       const std::vector<float>& root_policy,
                                       float root_value,
@@ -63,15 +127,23 @@ int MCTSSearch::collect_leaves(float* obs_buffer, float* mask_buffer, int max_ba
     // Encode pending evaluations into buffers
     int batch_size = std::min(static_cast<int>(pending_evals_.size()), max_batch_size);
 
+    // Create clean root once per batch — FEN round-trip strips prev_states_ undo stack
+    // so board copies inside build_leaf_history are cheap (~200 bytes, not ~2KB).
+    chess::Board clean_root(root_position_.getFen());
+
     for (int i = 0; i < batch_size; ++i) {
         const auto& eval = pending_evals_[i];
 
+        // Reconstruct history via parent pointer walk + move replay
+        auto path_moves = collect_path_moves(eval.node, root_);
+        auto leaf_history = build_leaf_history(path_moves, clean_root, position_history_);
+
         // Encode position to observation buffer (NHWC format: 8 x 8 x 122)
-        // Pass position history for history plane encoding
+        // Pass per-leaf reconstructed history for accurate history plane encoding
         encoding::PositionEncoder::encode_to_buffer(
             eval.board,
             obs_buffer + i * encoding::PositionEncoder::TOTAL_SIZE,
-            position_history_
+            leaf_history
         );
 
         // Encode legal mask
@@ -475,13 +547,20 @@ int MCTSSearch::collect_leaves_async(float* obs_buffer, float* mask_buffer, int 
     // Encode collected leaves into buffers
     int batch_size = static_cast<int>(collection.size());
 
+    // Create clean root once per batch — FEN round-trip strips prev_states_ undo stack
+    chess::Board clean_root(root_position_.getFen());
+
     for (int i = 0; i < batch_size; ++i) {
         const auto& eval = collection[i];
+
+        // Reconstruct history via parent pointer walk + move replay
+        auto path_moves = collect_path_moves(eval.node, root_);
+        auto leaf_history = build_leaf_history(path_moves, clean_root, position_history_);
 
         encoding::PositionEncoder::encode_to_buffer(
             eval.board,
             obs_buffer + i * encoding::PositionEncoder::TOTAL_SIZE,
-            position_history_
+            leaf_history
         );
 
         float* mask_ptr = mask_buffer + i * encoding::MoveEncoder::POLICY_SIZE;

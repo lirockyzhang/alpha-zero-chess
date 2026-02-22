@@ -87,6 +87,11 @@ struct alignas(64) QueueMetrics {
     std::atomic<uint64_t> spin_poll_total_us{0};     // Cumulative spin-poll time (microseconds)
     std::atomic<uint64_t> spin_poll_count{0};        // Number of spin-poll phases
 
+    // Batch fire reason counters (sum should equal total_batches)
+    std::atomic<uint64_t> batches_fired_full{0};     // Batch reached fire_target (includes Phase 1b skip)
+    std::atomic<uint64_t> batches_fired_stall{0};    // Stall detection: no new submissions for stall_detection_us
+    std::atomic<uint64_t> batches_fired_timeout{0};  // Outer deadline (gpu_timeout_ms) expired
+
     double avg_batch_size() const {
         uint64_t batches = total_batches.load(std::memory_order_relaxed);
         uint64_t leaves = total_leaves.load(std::memory_order_relaxed);
@@ -111,6 +116,9 @@ struct alignas(64) QueueMetrics {
         submission_waits = 0;
         spin_poll_total_us = 0;
         spin_poll_count = 0;
+        batches_fired_full = 0;
+        batches_fired_stall = 0;
+        batches_fired_timeout = 0;
     }
 };
 

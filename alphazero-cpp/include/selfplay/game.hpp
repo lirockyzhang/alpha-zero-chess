@@ -23,6 +23,7 @@ struct GameState {
     std::string fen;                           // Board position as FEN string (for reanalysis)
     std::array<uint64_t, 8> history_hashes{};  // Zobrist hashes [T-1..T-8] for repetition detection
     uint8_t num_history{0};                    // How many hashes are valid
+    std::array<std::string, 8> history_fens{}; // FENs [T-1..T-8], most recent first
 
     GameState() : observation(encoding::PositionEncoder::TOTAL_SIZE, 0.0f),
                   policy(encoding::MoveEncoder::POLICY_SIZE, 0.0f),
@@ -51,7 +52,8 @@ struct GameTrajectory {
                    float sv = 0.0f,
                    const std::string& fen = "",
                    const std::array<uint64_t, 8>& hist_hashes = {},
-                   uint8_t num_hist = 0) {
+                   uint8_t num_hist = 0,
+                   const std::array<std::string, 8>& hist_fens = {}) {
         states.emplace_back();
         states.back().observation = obs;
         states.back().policy = pol;
@@ -60,6 +62,7 @@ struct GameTrajectory {
         states.back().fen = fen;
         states.back().history_hashes = hist_hashes;
         states.back().num_history = num_hist;
+        states.back().history_fens = hist_fens;
         num_moves++;
     }
 

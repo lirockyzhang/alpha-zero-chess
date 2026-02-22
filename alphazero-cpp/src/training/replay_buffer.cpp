@@ -1,8 +1,12 @@
 #include "training/replay_buffer.hpp"
 #include "training/sum_tree.hpp"
+#include "encoding/position_encoder.hpp"
+#include "chess.hpp"
 #include <iostream>
+#include <iomanip>
 #include <fstream>
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cmath>
 
@@ -66,8 +70,12 @@ void ReplayBuffer::add_sample(
     const SampleMeta* meta,
     const char* fen,
     const uint64_t* history_hashes,
-    uint8_t num_history
+    uint8_t num_history,
+    const char* const* history_fens
 ) {
+    // Thread safety: All pointer arguments (fen, history_hashes, history_fens)
+    // are deep-copied via synchronous memcpy before this function returns.
+    // Callers' buffers only need to remain valid for the duration of this call.
     // Validate sizes (no lock needed for validation)
     if (observation.size() != OBS_SIZE) {
         std::cerr << "Warning: observation size mismatch: " << observation.size()
@@ -116,13 +124,13 @@ void ReplayBuffer::add_sample(
     }
     update_composition_counters(pos, new_meta);
 
-    // FEN + history hash storage (only when enabled and data provided)
+    // FEN + history hash + history FEN storage (only when enabled and data provided)
     if (store_fens_ && fen != nullptr) {
-        char* slot = fens_.data() + pos * FEN_SLOT_SIZE;
+        // Root FEN — full zero-pad for deterministic binary output
+        char* fen_slot = fens_.data() + pos * FEN_SLOT_SIZE;
+        std::memset(fen_slot, 0, FEN_SLOT_SIZE);
         size_t len = std::strlen(fen);
-        if (len >= FEN_SLOT_SIZE) len = FEN_SLOT_SIZE - 1;
-        std::memcpy(slot, fen, len);
-        slot[len] = '\0';
+        std::memcpy(fen_slot, fen, std::min(len, FEN_SLOT_SIZE - 1));
 
         if (history_hashes != nullptr && num_history > 0) {
             uint8_t n = std::min(num_history, static_cast<uint8_t>(HISTORY_DEPTH));
@@ -137,11 +145,36 @@ void ReplayBuffer::add_sample(
             std::memset(history_hashes_.data() + pos * HISTORY_DEPTH, 0, HISTORY_DEPTH * sizeof(uint64_t));
             num_history_[pos] = 0;
         }
+
+        // Store history FENs (full zero-pad each 128-byte slot for deterministic binary files)
+        if (history_fens != nullptr) {
+            uint8_t n = std::min(num_history, static_cast<uint8_t>(HISTORY_DEPTH));
+            for (uint8_t h = 0; h < n; ++h) {
+                char* hslot = history_fens_.data() + (pos * HISTORY_DEPTH + h) * FEN_SLOT_SIZE;
+                std::memset(hslot, 0, FEN_SLOT_SIZE);
+                if (history_fens[h]) {
+                    size_t hlen = std::strlen(history_fens[h]);
+                    if (hlen >= FEN_SLOT_SIZE) hlen = FEN_SLOT_SIZE - 1;
+                    std::memcpy(hslot, history_fens[h], hlen);
+                }
+            }
+            // Zero remaining unused slots
+            for (uint8_t h = n; h < HISTORY_DEPTH; ++h) {
+                char* hslot = history_fens_.data() + (pos * HISTORY_DEPTH + h) * FEN_SLOT_SIZE;
+                std::memset(hslot, 0, FEN_SLOT_SIZE);
+            }
+        } else {
+            // No history FENs provided: clear all slots
+            std::memset(history_fens_.data() + pos * HISTORY_DEPTH * FEN_SLOT_SIZE,
+                        0, HISTORY_DEPTH * FEN_SLOT_SIZE);
+        }
     } else if (store_fens_) {
-        // FEN storage enabled but no FEN provided: clear the slot
-        fens_[pos * FEN_SLOT_SIZE] = '\0';
+        // FEN storage enabled but no FEN provided: clear all slots
+        std::memset(fens_.data() + pos * FEN_SLOT_SIZE, 0, FEN_SLOT_SIZE);
         std::memset(history_hashes_.data() + pos * HISTORY_DEPTH, 0, HISTORY_DEPTH * sizeof(uint64_t));
         num_history_[pos] = 0;
+        std::memset(history_fens_.data() + pos * HISTORY_DEPTH * FEN_SLOT_SIZE,
+                    0, HISTORY_DEPTH * FEN_SLOT_SIZE);
     }
 
     // PER: assign max priority to new sample (O(1) leaf-only write)
@@ -342,6 +375,7 @@ void ReplayBuffer::clear() {
         std::fill(fens_.begin(), fens_.end(), '\0');
         std::fill(history_hashes_.begin(), history_hashes_.end(), 0);
         std::fill(num_history_.begin(), num_history_.end(), 0);
+        std::fill(history_fens_.begin(), history_fens_.end(), '\0');
     }
 
     // Clear PER state
@@ -384,11 +418,13 @@ void ReplayBuffer::enable_fen_storage() {
     fens_.resize(capacity_ * FEN_SLOT_SIZE, '\0');
     history_hashes_.resize(capacity_ * HISTORY_DEPTH, 0);
     num_history_.resize(capacity_, 0);
+    history_fens_.resize(capacity_ * HISTORY_DEPTH * FEN_SLOT_SIZE, '\0');
     store_fens_ = true;
 
+    size_t total_bytes = capacity_ * (FEN_SLOT_SIZE + HISTORY_DEPTH * 8 + 1 + HISTORY_DEPTH * FEN_SLOT_SIZE);
     std::cerr << "[ReplayBuffer] FEN storage enabled: "
-              << (capacity_ * (FEN_SLOT_SIZE + HISTORY_DEPTH * 8 + 1)) / (1024 * 1024)
-              << " MB allocated" << std::endl;
+              << total_bytes / (1024 * 1024) << " MB allocated"
+              << " (includes history FENs)" << std::endl;
 }
 
 std::string ReplayBuffer::get_fen(size_t index) const {
@@ -405,6 +441,16 @@ const uint64_t* ReplayBuffer::get_history_hashes(size_t index) const {
 uint8_t ReplayBuffer::get_num_history(size_t index) const {
     if (!store_fens_ || index >= size()) return 0;
     return num_history_[index];
+}
+
+std::string ReplayBuffer::get_history_fen(size_t index, int hist_idx) const {
+    if (!store_fens_ || index >= size() ||
+        hist_idx < 0 || hist_idx >= static_cast<int>(HISTORY_DEPTH))
+        return "";
+    if (hist_idx >= num_history_[index]) return "";
+    const char* slot = history_fens_.data() + (index * HISTORY_DEPTH + hist_idx) * FEN_SLOT_SIZE;
+    if (slot[0] == '\0') return "";
+    return std::string(slot);
 }
 
 const float* ReplayBuffer::get_observation_ptr(size_t index) const {
@@ -571,9 +617,11 @@ void ReplayBuffer::update_priorities(
 // Binary Save/Load (.rpbf format)
 // ============================================================================
 //
+// RPBF v5 — Compressed format (no raw observations, sparse policies)
+//
 // Header (64 bytes):
 //   magic:        char[4] = "RPBF"
-//   version:      uint32_t = 3 or 4
+//   version:      uint32_t = 5
 //   capacity:     uint64_t   (original buffer capacity)
 //   num_samples:  uint64_t   (= size(), i.e. min(total_added, capacity))
 //   write_pos:    uint64_t
@@ -581,24 +629,30 @@ void ReplayBuffer::update_priorities(
 //   total_games:  uint64_t
 //   obs_size:     uint32_t
 //   policy_size:  uint32_t
-//   reserved:     uint8_t[8] (reserved[0] bit 0 = has_priorities in v3)
+//   reserved:     uint8_t[8]
+//     reserved[0] bit 1: has_fens (always set for v5)
+//     reserved[0] bit 2: has_history_fens
 //
-// Data (contiguous):
-//   observations: num_samples * OBS_SIZE * 4 bytes
-//   policies:     num_samples * POLICY_SIZE * 4 bytes
-//   values:       num_samples * 4 bytes
-//   wdl_targets:  num_samples * 3 * 4 bytes
-//   soft_values:  num_samples * 4 bytes
-//   metadata:     num_samples * 8 bytes
-//   priorities:   num_samples * 4 bytes (if reserved[0] bit 0 set)
-//   fens:         num_samples * 128 bytes (if reserved[0] bit 1 set, v4+)
-//   hist_hashes:  num_samples * 8 * 8 bytes (if reserved[0] bit 1 set, v4+)
-//   num_history:  num_samples * 1 byte (if reserved[0] bit 1 set, v4+)
+// Data sections (for first num_samples entries):
+//   1. Sparse policies   — variable-length stream
+//      Per sample: uint16_t count, then count × (uint16_t idx, float val)
+//   2. Values             — num_samples × 4 bytes
+//   3. WDL targets        — num_samples × 12 bytes
+//   4. Soft values        — num_samples × 4 bytes
+//   5. Metadata           — num_samples × 8 bytes
+//   6. Root FENs          — num_samples × FEN_SLOT_SIZE (128 bytes)
+//   7. History hashes     — num_samples × HISTORY_DEPTH × 8 bytes
+//   8. Num history        — num_samples × 1 byte
+//   9. History FENs       — num_samples × HISTORY_DEPTH × FEN_SLOT_SIZE
+//      (only if reserved[0] bit 2 set)
+//
+// Observations are NOT stored — reconstructed from FENs at load time.
+// Priorities section removed (PER tree rebuilt from uniform at load).
 
 #pragma pack(push, 1)
 struct RpbfHeader {
     char magic[4];          // "RPBF"
-    uint32_t version;       // 3 = PER priorities, 4 = FEN + Zobrist hashes
+    uint32_t version;       // 5 = compressed (sparse policies, no obs, history FENs)
     uint64_t capacity;
     uint64_t num_samples;
     uint64_t write_pos;
@@ -620,10 +674,13 @@ bool ReplayBuffer::save(const std::string& path) const {
 
     uint64_t num_samples = size();
 
+    // Check: v5 requires FEN storage (observations are reconstructed from FENs)
+    bool has_history_fens = store_fens_ && !history_fens_.empty();
+
     // Write header
     RpbfHeader header{};
     header.magic[0] = 'R'; header.magic[1] = 'P'; header.magic[2] = 'B'; header.magic[3] = 'F';
-    header.version = 4;
+    header.version = 5;
     header.capacity = static_cast<uint64_t>(capacity_);
     header.num_samples = num_samples;
     header.write_pos = write_pos_.value.load(std::memory_order_relaxed);
@@ -632,13 +689,13 @@ bool ReplayBuffer::save(const std::string& path) const {
     header.obs_size = static_cast<uint32_t>(OBS_SIZE);
     header.policy_size = static_cast<uint32_t>(POLICY_SIZE);
     std::memset(header.reserved, 0, sizeof(header.reserved));
-    // reserved[0] bit 0: has_priorities flag
-    if (sum_tree_ && num_samples > 0) {
-        header.reserved[0] |= 0x01;
-    }
-    // reserved[0] bit 1: has_fens flag
+    // reserved[0] bit 1: has_fens (always set for v5)
     if (store_fens_ && num_samples > 0) {
         header.reserved[0] |= 0x02;
+    }
+    // reserved[0] bit 2: has_history_fens
+    if (has_history_fens && num_samples > 0) {
+        header.reserved[0] |= 0x04;
     }
 
     out.write(reinterpret_cast<const char*>(&header), sizeof(header));
@@ -648,37 +705,62 @@ bool ReplayBuffer::save(const std::string& path) const {
         return out.good();
     }
 
-    // Write data arrays (first num_samples slots)
-    out.write(reinterpret_cast<const char*>(observations_.data()),
-              num_samples * OBS_SIZE * sizeof(float));
-    out.write(reinterpret_cast<const char*>(policies_.data()),
-              num_samples * POLICY_SIZE * sizeof(float));
+    // Section 1: Sparse policies (variable-length)
+    uint64_t sparse_entries_total = 0;
+    for (uint64_t i = 0; i < num_samples; ++i) {
+        const float* pol = policies_.data() + i * POLICY_SIZE;
+        uint16_t count = 0;
+        for (size_t j = 0; j < POLICY_SIZE; ++j) {
+            if (pol[j] != 0.0f) count++;
+        }
+        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        for (size_t j = 0; j < POLICY_SIZE; ++j) {
+            if (pol[j] != 0.0f) {
+                uint16_t idx = static_cast<uint16_t>(j);
+                out.write(reinterpret_cast<const char*>(&idx), sizeof(idx));
+                out.write(reinterpret_cast<const char*>(&pol[j]), sizeof(float));
+            }
+        }
+        sparse_entries_total += count;
+    }
+
+    // Section 2: Values
     out.write(reinterpret_cast<const char*>(values_.data()),
               num_samples * sizeof(float));
+
+    // Section 3: WDL targets
     out.write(reinterpret_cast<const char*>(wdl_targets_.data()),
               num_samples * 3 * sizeof(float));
+
+    // Section 4: Soft values
     out.write(reinterpret_cast<const char*>(soft_values_.data()),
               num_samples * sizeof(float));
+
+    // Section 5: Metadata
     out.write(reinterpret_cast<const char*>(metadata_.data()),
               num_samples * sizeof(SampleMeta));
 
-    // Write priorities if PER is enabled
-    if (sum_tree_ && num_samples > 0) {
-        std::vector<float> priorities(num_samples);
-        for (uint64_t i = 0; i < num_samples; ++i) {
-            priorities[i] = sum_tree_->get(i);
-        }
-        out.write(reinterpret_cast<const char*>(priorities.data()),
-                  num_samples * sizeof(float));
+    // Section 6: Root FENs
+    if (store_fens_) {
+        out.write(fens_.data(), num_samples * FEN_SLOT_SIZE);
     }
 
-    // Write FEN + history hashes if enabled (v4)
-    if (store_fens_ && num_samples > 0) {
-        out.write(fens_.data(), num_samples * FEN_SLOT_SIZE);
+    // Section 7: History hashes
+    if (store_fens_) {
         out.write(reinterpret_cast<const char*>(history_hashes_.data()),
                   num_samples * HISTORY_DEPTH * sizeof(uint64_t));
+    }
+
+    // Section 8: Num history
+    if (store_fens_) {
         out.write(reinterpret_cast<const char*>(num_history_.data()),
                   num_samples * sizeof(uint8_t));
+    }
+
+    // Section 9: History FENs (if available)
+    if (has_history_fens) {
+        out.write(history_fens_.data(),
+                  num_samples * HISTORY_DEPTH * FEN_SLOT_SIZE);
     }
 
     out.close();
@@ -688,9 +770,13 @@ bool ReplayBuffer::save(const std::string& path) const {
         return false;
     }
 
-    std::cerr << "[ReplayBuffer] Saved " << num_samples << " samples to " << path
-              << (sum_tree_ ? " (with priorities)" : "")
-              << (store_fens_ ? " (with FENs)" : "") << std::endl;
+    double avg_entries = num_samples > 0
+        ? static_cast<double>(sparse_entries_total) / num_samples : 0.0;
+    std::cerr << "[ReplayBuffer] Saved v5: " << num_samples << " samples to " << path
+              << " (sparse policy avg " << std::fixed << std::setprecision(1)
+              << avg_entries << " entries/sample"
+              << (has_history_fens ? ", with history FENs" : "")
+              << ")" << std::endl;
     return true;
 }
 
@@ -716,15 +802,15 @@ bool ReplayBuffer::load(const std::string& path) {
         return false;
     }
 
-    // Validate version (v3 or v4)
-    if (header.version != 3 && header.version != 4) {
+    // Validate version (v5 only)
+    if (header.version != 5) {
         std::cerr << "[ReplayBuffer] Unsupported version " << header.version
-                  << " (expected 3 or 4) in: " << path << std::endl;
+                  << " (expected 5) in: " << path << std::endl;
         return false;
     }
 
-    bool has_priorities = (header.reserved[0] & 0x01) != 0;
     bool has_fens = (header.reserved[0] & 0x02) != 0;
+    bool has_history_fens = (header.reserved[0] & 0x04) != 0;
 
     // Validate sizes
     if (header.obs_size != OBS_SIZE || header.policy_size != POLICY_SIZE) {
@@ -749,95 +835,98 @@ bool ReplayBuffer::load(const std::string& path) {
         return true;
     }
 
-    // When truncating (num_samples < header.num_samples), we need to seek past
-    // unread entries in each section since they're stored contiguously in the file.
     uint64_t file_samples = header.num_samples;
 
-    // Read data arrays into slots 0..num_samples-1
-    in.read(reinterpret_cast<char*>(observations_.data()),
-            num_samples * OBS_SIZE * sizeof(float));
-    if (num_samples < file_samples) {
-        in.seekg((file_samples - num_samples) * OBS_SIZE * sizeof(float), std::ios::cur);
+    // Section 1: Read sparse policies, expand to dense
+    for (uint64_t i = 0; i < num_samples; ++i) {
+        float* pol = policies_.data() + i * POLICY_SIZE;
+        std::fill(pol, pol + POLICY_SIZE, 0.0f);
+        uint16_t count;
+        in.read(reinterpret_cast<char*>(&count), sizeof(count));
+        for (uint16_t j = 0; j < count; ++j) {
+            uint16_t idx;
+            float val;
+            in.read(reinterpret_cast<char*>(&idx), sizeof(idx));
+            in.read(reinterpret_cast<char*>(&val), sizeof(val));
+            if (idx < POLICY_SIZE) pol[idx] = val;
+        }
+    }
+    // Skip extra samples if truncating (variable-length, must read sequentially)
+    for (uint64_t i = num_samples; i < file_samples; ++i) {
+        uint16_t count;
+        in.read(reinterpret_cast<char*>(&count), sizeof(count));
+        in.seekg(count * (sizeof(uint16_t) + sizeof(float)), std::ios::cur);
     }
 
-    in.read(reinterpret_cast<char*>(policies_.data()),
-            num_samples * POLICY_SIZE * sizeof(float));
-    if (num_samples < file_samples) {
-        in.seekg((file_samples - num_samples) * POLICY_SIZE * sizeof(float), std::ios::cur);
-    }
-
+    // Section 2: Values
     in.read(reinterpret_cast<char*>(values_.data()),
             num_samples * sizeof(float));
     if (num_samples < file_samples) {
         in.seekg((file_samples - num_samples) * sizeof(float), std::ios::cur);
     }
 
+    // Section 3: WDL targets
     in.read(reinterpret_cast<char*>(wdl_targets_.data()),
             num_samples * 3 * sizeof(float));
     if (num_samples < file_samples) {
         in.seekg((file_samples - num_samples) * 3 * sizeof(float), std::ios::cur);
     }
 
+    // Section 4: Soft values
     in.read(reinterpret_cast<char*>(soft_values_.data()),
             num_samples * sizeof(float));
     if (num_samples < file_samples) {
         in.seekg((file_samples - num_samples) * sizeof(float), std::ios::cur);
     }
 
+    // Section 5: Metadata
     in.read(reinterpret_cast<char*>(metadata_.data()),
             num_samples * sizeof(SampleMeta));
     if (num_samples < file_samples) {
         in.seekg((file_samples - num_samples) * sizeof(SampleMeta), std::ios::cur);
     }
 
-    // Load priorities if present and PER is enabled
-    if (has_priorities && sum_tree_) {
-        std::vector<float> priorities(num_samples);
-        in.read(reinterpret_cast<char*>(priorities.data()),
-                num_samples * sizeof(float));
-        for (uint64_t i = 0; i < num_samples; ++i) {
-            sum_tree_->set_leaf(i, priorities[i]);
-        }
-        sum_tree_->rebuild();
-        tree_needs_rebuild_ = false;
-        std::cerr << "[ReplayBuffer] Loaded priorities for " << num_samples << " samples" << std::endl;
-    } else if (has_priorities && !sum_tree_) {
-        // Skip priorities section
-        in.seekg(file_samples * sizeof(float), std::ios::cur);
-    } else if (sum_tree_) {
-        // No priorities in file but PER enabled: initialize uniform
-        for (uint64_t i = 0; i < num_samples; ++i) {
-            sum_tree_->set_leaf(i, 1.0f);
-        }
-        sum_tree_->rebuild();
-        tree_needs_rebuild_ = false;
-    }
-
-    // Load FEN + history hashes if present (v4)
+    // Section 6: Root FENs
     if (has_fens && store_fens_) {
         in.read(fens_.data(), num_samples * FEN_SLOT_SIZE);
         if (num_samples < file_samples) {
             in.seekg((file_samples - num_samples) * FEN_SLOT_SIZE, std::ios::cur);
         }
+    } else if (has_fens) {
+        in.seekg(file_samples * FEN_SLOT_SIZE, std::ios::cur);
+    }
+
+    // Section 7: History hashes
+    if (has_fens && store_fens_) {
         in.read(reinterpret_cast<char*>(history_hashes_.data()),
                 num_samples * HISTORY_DEPTH * sizeof(uint64_t));
         if (num_samples < file_samples) {
             in.seekg((file_samples - num_samples) * HISTORY_DEPTH * sizeof(uint64_t), std::ios::cur);
         }
+    } else if (has_fens) {
+        in.seekg(file_samples * HISTORY_DEPTH * sizeof(uint64_t), std::ios::cur);
+    }
+
+    // Section 8: Num history
+    if (has_fens && store_fens_) {
         in.read(reinterpret_cast<char*>(num_history_.data()),
                 num_samples * sizeof(uint8_t));
         if (num_samples < file_samples) {
             in.seekg((file_samples - num_samples) * sizeof(uint8_t), std::ios::cur);
         }
-        std::cerr << "[ReplayBuffer] Loaded FENs for " << num_samples << " samples" << std::endl;
-    } else if (has_fens && !store_fens_) {
-        // Skip FEN sections
-        in.seekg(file_samples * FEN_SLOT_SIZE, std::ios::cur);
-        in.seekg(file_samples * HISTORY_DEPTH * sizeof(uint64_t), std::ios::cur);
+    } else if (has_fens) {
         in.seekg(file_samples * sizeof(uint8_t), std::ios::cur);
-    } else if (store_fens_) {
-        // No FENs in file but storage enabled: zero-fill (already done by enable_fen_storage)
-        std::cerr << "[ReplayBuffer] No FEN data in file (v3 compat), FEN slots empty" << std::endl;
+    }
+
+    // Section 9: History FENs (if present)
+    if (has_history_fens && store_fens_) {
+        in.read(history_fens_.data(),
+                num_samples * HISTORY_DEPTH * FEN_SLOT_SIZE);
+        if (num_samples < file_samples) {
+            in.seekg((file_samples - num_samples) * HISTORY_DEPTH * FEN_SLOT_SIZE, std::ios::cur);
+        }
+    } else if (has_history_fens) {
+        in.seekg(file_samples * HISTORY_DEPTH * FEN_SLOT_SIZE, std::ios::cur);
     }
 
     if (!in.good()) {
@@ -853,6 +942,15 @@ bool ReplayBuffer::load(const std::string& path) {
     sentinel.game_result = 0xFF;
     for (size_t i = num_samples; i < capacity_; ++i) {
         metadata_[i] = sentinel;
+    }
+
+    // Initialize PER if enabled (uniform priorities)
+    if (sum_tree_) {
+        for (uint64_t i = 0; i < num_samples; ++i) {
+            sum_tree_->set_leaf(i, 1.0f);
+        }
+        sum_tree_->rebuild();
+        tree_needs_rebuild_ = false;
     }
 
     // Restore atomics
@@ -872,8 +970,48 @@ bool ReplayBuffer::load(const std::string& path) {
     draws_count_.value.store(draws, std::memory_order_relaxed);
     losses_count_.value.store(losses, std::memory_order_relaxed);
 
-    std::cerr << "[ReplayBuffer] Loaded " << num_samples << " samples from " << path
+    std::cerr << "[ReplayBuffer] Loaded v5: " << num_samples << " samples from " << path
               << " (W=" << wins << " D=" << draws << " L=" << losses << ")" << std::endl;
+
+    // Reconstruct observations from FENs (v5 doesn't store raw observations)
+    if (has_fens && store_fens_) {
+        std::cerr << "[ReplayBuffer] Reconstructing observations from FENs ("
+                  << num_samples << " samples)..." << std::endl;
+        auto t_start = std::chrono::steady_clock::now();
+
+        #pragma omp parallel for schedule(dynamic, 256)
+        for (int64_t i = 0; i < static_cast<int64_t>(num_samples); ++i) {
+            std::string fen = get_fen(static_cast<size_t>(i));
+            if (fen.empty()) continue;
+
+            // Build history in chronological order (oldest first)
+            std::vector<chess::Board> history;
+            uint8_t nh = num_history_[i];
+            for (int h = static_cast<int>(nh) - 1; h >= 0; --h) {
+                std::string hfen = get_history_fen(static_cast<size_t>(i), h);
+                if (!hfen.empty()) {
+                    history.emplace_back(hfen);
+                }
+            }
+
+            chess::Board board(fen);
+            encoding::PositionEncoder::encode_to_buffer(
+                board,
+                observations_.data() + i * OBS_SIZE,
+                history
+            );
+        }
+
+        auto t_end = std::chrono::steady_clock::now();
+        double secs = std::chrono::duration<double>(t_end - t_start).count();
+        std::cerr << "[ReplayBuffer] Reconstructed " << num_samples
+                  << " observations in " << std::fixed << std::setprecision(1)
+                  << secs << "s" << std::endl;
+    } else {
+        std::cerr << "[ReplayBuffer] WARNING: v5 file has no FENs, observations will be zero!"
+                  << std::endl;
+    }
+
     return true;
 }
 

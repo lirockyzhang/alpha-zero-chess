@@ -558,6 +558,11 @@ public:
         result["spin_poll_avg_us"] = spin_polls > 0
             ? static_cast<double>(spin_total_us) / static_cast<double>(spin_polls) : 0.0;
 
+        // Batch fire reason breakdown (sum should equal total_batches)
+        result["batches_fired_full"] = qm.batches_fired_full.load(std::memory_order_relaxed);
+        result["batches_fired_stall"] = qm.batches_fired_stall.load(std::memory_order_relaxed);
+        result["batches_fired_timeout"] = qm.batches_fired_timeout.load(std::memory_order_relaxed);
+
         // Tree depth metrics
         result["max_search_depth"] = m.max_search_depth;
         result["min_search_depth"] = m.min_search_depth;
@@ -993,10 +998,10 @@ public:
         result["total_batches"] = queue_metrics.total_batches.load();
         result["total_leaves"] = queue_metrics.total_leaves.load();
 
-        // Batch fire reason breakdown
-        result["batches_fired_full"] = queue_metrics.batches_fired_full.load();
-        result["batches_fired_stall"] = queue_metrics.batches_fired_stall.load();
-        result["batches_fired_timeout"] = queue_metrics.batches_fired_timeout.load();
+        // Batch fire reason breakdown (sum should equal total_batches)
+        result["batches_fired_full"] = queue_metrics.batches_fired_full.load(std::memory_order_relaxed);
+        result["batches_fired_stall"] = queue_metrics.batches_fired_stall.load(std::memory_order_relaxed);
+        result["batches_fired_timeout"] = queue_metrics.batches_fired_timeout.load(std::memory_order_relaxed);
 
         result["max_search_depth"] = stats.max_search_depth.load();
         result["min_search_depth"] = stats.min_search_depth.load() == INT64_MAX

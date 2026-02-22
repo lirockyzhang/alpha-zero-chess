@@ -74,15 +74,13 @@ void Reanalyzer::worker_func(int worker_id) {
     try {
         mcts::NodePool node_pool;
 
-        // Pre-allocate buffers — sized for single-leaf evaluation only.
-        // Reanalysis always processes one leaf at a time (hardcoded at collect_leaves
-        // call below). config_.mcts_batch_size controls the search batch for Sequential
-        // Halving rounds but leaf collection is single-leaf for simplicity.
-        std::vector<float> obs_buffer(encoding::PositionEncoder::TOTAL_SIZE);
-        std::vector<float> mask_buffer(encoding::MoveEncoder::POLICY_SIZE);
-        std::vector<float> policy_buffer(encoding::MoveEncoder::POLICY_SIZE);
-        std::vector<float> value_buffer(1);
-        std::vector<float> wdl_buffer(3);
+        // Pre-allocate buffers — sized for mcts_batch_size leaves per collect_leaves call.
+        int bs = std::max(1, config_.mcts_batch_size);
+        std::vector<float> obs_buffer(bs * encoding::PositionEncoder::TOTAL_SIZE);
+        std::vector<float> mask_buffer(bs * encoding::MoveEncoder::POLICY_SIZE);
+        std::vector<float> policy_buffer(bs * encoding::MoveEncoder::POLICY_SIZE);
+        std::vector<float> value_buffer(bs);
+        std::vector<float> wdl_buffer(bs * 3);
 
         while (!shutdown_.load(std::memory_order_acquire)) {
             // Atomically claim next work item
@@ -109,6 +107,19 @@ void Reanalyzer::worker_func(int worker_id) {
             if (hashes && num_hist > 0) {
                 for (int h = static_cast<int>(num_hist) - 1; h >= 0; --h) {
                     board.pushHistoryHash(hashes[h]);
+                }
+            }
+
+            // Build position_history from stored history FENs.
+            // Stored [T-1, T-2, ..., T-8] -> reverse to chronological (oldest first).
+            std::vector<chess::Board> position_history;
+            if (num_hist > 0) {
+                position_history.reserve(num_hist);
+                for (int h = static_cast<int>(num_hist) - 1; h >= 0; --h) {
+                    std::string hfen = buffer_.get_history_fen(index, h);
+                    if (!hfen.empty()) {
+                        position_history.emplace_back(hfen);
+                    }
                 }
             }
 
@@ -188,20 +199,19 @@ void Reanalyzer::worker_func(int worker_id) {
 
             mcts::MCTSSearch search(node_pool, search_config);
 
-            // Initialize search with root evaluation
-            // Note: empty history vec — child leaf encoding is approximate
-            // (acceptable for shallow reanalysis, root uses stored obs)
+            // Initialize search with root evaluation and position history
+            // History FENs enable full 8-board history encoding for leaf nodes
             std::vector<float> root_policy(
                 policy_buffer.data(),
                 policy_buffer.data() + encoding::MoveEncoder::POLICY_SIZE);
-            search.init_search(board, root_policy, value_buffer[0]);
+            search.init_search(board, root_policy, value_buffer[0], position_history);
 
-            // MCTS simulation loop (synchronous, single-leaf)
+            // MCTS simulation loop
             while (!search.is_search_complete() &&
                    !shutdown_.load(std::memory_order_acquire))
             {
                 int num_leaves = search.collect_leaves(
-                    obs_buffer.data(), mask_buffer.data(), 1);
+                    obs_buffer.data(), mask_buffer.data(), config_.mcts_batch_size);
 
                 if (num_leaves == 0) break;
 

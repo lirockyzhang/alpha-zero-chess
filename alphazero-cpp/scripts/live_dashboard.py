@@ -531,6 +531,7 @@ DASHBOARD_HTML = """
                 <div class="metric-row"><span>Avg Batch Size:</span><span id="avg-batch-size">0</span></div>
                 <div class="metric-row"><span>NN Evals/sec:</span><span id="sys-evals-sec">0</span></div>
                 <div class="metric-row"><span>Batch Fill:</span><span id="batch-fill-ratio">0%</span></div>
+                <div class="metric-row"><span>Batch Fire:</span><span id="batch-fire-reason">--</span></div>
                 <div class="metric-row"><span>GPU Wait:</span><span id="gpu-wait-ms">0ms</span></div>
                 <div class="metric-row"><span>Avg Infer:</span><span id="avg-infer-time">0ms</span></div>
                 <div class="metric-row"><span>GPU Memory:</span><span id="gpu-memory">0 MB</span></div>
@@ -578,6 +579,7 @@ DASHBOARD_HTML = """
                 <div class="metric-row"><span>Moves:</span><span id="live-moves">0</span></div>
                 <div class="metric-row"><span>Games/min:</span><span id="live-gph">0</span></div>
                 <div class="metric-row"><span>Game Moves:</span><span id="live-current-moves">--</span></div>
+                <div class="metric-row"><span>Risk β:</span><span id="live-risk-beta">--</span></div>
             </div>
 
             <!-- Refutation Status Card (hidden until asymmetric risk data arrives) -->
@@ -1235,6 +1237,19 @@ DASHBOARD_HTML = """
                 updateMetricWithHighlight('avg-batch-size', (data.avg_batch_size || 0).toFixed(1));
                 updateMetricWithHighlight('sys-evals-sec', Math.round(data.evals_per_sec).toLocaleString());
                 updateMetricWithHighlight('batch-fill-ratio', ((data.batch_fill_ratio || 0) * 100).toFixed(1) + '%');
+
+                // Batch fire reason breakdown (full/stall/timeout)
+                const bFull = data.batches_fired_full || 0;
+                const bStall = data.batches_fired_stall || 0;
+                const bTimeout = data.batches_fired_timeout || 0;
+                const bTotal = bFull + bStall + bTimeout;
+                if (bTotal > 0) {
+                    const pFull = ((bFull / bTotal) * 100).toFixed(0);
+                    const pStall = ((bStall / bTotal) * 100).toFixed(0);
+                    const pTimeout = ((bTimeout / bTotal) * 100).toFixed(0);
+                    updateMetricWithHighlight('batch-fire-reason', `F${pFull} S${pStall} T${pTimeout}%`);
+                }
+
                 updateMetricWithHighlight('gpu-wait-ms', (data.gpu_wait_ms || 0).toFixed(1) + 'ms');
                 updateMetricWithHighlight('avg-infer-time', (data.avg_infer_time_ms || 0).toFixed(2) + 'ms');
                 updateMetricWithHighlight('gpu-memory', (data.gpu_memory_used_mb || 0).toFixed(0) + ' MB');
@@ -1282,6 +1297,11 @@ DASHBOARD_HTML = """
                 } else {
                     updateMetricWithHighlight('live-current-moves', '--');
                 }
+
+                // Risk beta (show sampled value, highlight non-zero)
+                const rb = data.risk_beta || 0;
+                const rbText = rb === 0 ? '0' : (rb > 0 ? '+' : '') + rb.toFixed(3);
+                updateMetricWithHighlight('live-risk-beta', rbText);
 
                 // Refutation Status (only show when asymmetric risk is active)
                 const stdWins = data.standard_wins || 0;
@@ -1888,6 +1908,7 @@ class LiveDashboardServer:
     def push_progress(self, iteration: int, games_completed: int, total_games: int,
                        moves: int, sims: int, evals: int, elapsed_time: float,
                        buffer_size: int, phase: str = "selfplay",
+                       risk_beta: float = 0.0,
                        # Game results (live W/D/L)
                        white_wins: int = 0,
                        black_wins: int = 0,
@@ -1906,6 +1927,10 @@ class LiveDashboardServer:
                        pool_load: float = 0.0,
                        avg_batch_size: float = 0.0,
                        batch_fill_ratio: float = 0.0,
+                       # Batch fire reason breakdown
+                       batches_fired_full: int = 0,
+                       batches_fired_stall: int = 0,
+                       batches_fired_timeout: int = 0,
                        # GPU metrics
                        cuda_graph_fires: int = 0,  # Deprecated: sum of all graph fires
                        large_graph_fires: int = 0,
@@ -2020,6 +2045,7 @@ class LiveDashboardServer:
             'evals': evals,
             'evals_per_sec': evals_per_sec,
             'games_per_hour': games_per_hour,
+            'risk_beta': risk_beta,
             'white_wins': white_wins,
             'black_wins': black_wins,
             'draws': draws,
@@ -2041,6 +2067,10 @@ class LiveDashboardServer:
             'pool_load': pool_load,
             'avg_batch_size': avg_batch_size,
             'batch_fill_ratio': batch_fill_ratio,
+            # Batch fire reason breakdown
+            'batches_fired_full': batches_fired_full,
+            'batches_fired_stall': batches_fired_stall,
+            'batches_fired_timeout': batches_fired_timeout,
             # GPU metrics
             'cuda_graph_fires': cuda_graph_fires,
             'large_graph_fires': large_graph_fires,

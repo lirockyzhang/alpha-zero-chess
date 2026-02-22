@@ -191,6 +191,12 @@ void ParallelSelfPlayCoordinator::worker_thread_func(int worker_id) {
                         game_res, term,
                         static_cast<uint16_t>(i), game_len
                     };
+                    // Build C-string pointer array for history FENs
+                    const char* hfen_ptrs[8] = {};
+                    for (uint8_t h = 0; h < state.num_history; ++h) {
+                        if (!state.history_fens[h].empty())
+                            hfen_ptrs[h] = state.history_fens[h].c_str();
+                    }
                     replay_buffer_->add_sample(
                         state.observation,
                         state.policy,
@@ -200,7 +206,8 @@ void ParallelSelfPlayCoordinator::worker_thread_func(int worker_id) {
                         &meta,
                         state.fen.empty() ? nullptr : state.fen.c_str(),
                         state.history_hashes.data(),
-                        state.num_history
+                        state.num_history,
+                        state.num_history > 0 ? hfen_ptrs : nullptr
                     );
                 }
             } else {
@@ -682,17 +689,19 @@ GameTrajectory ParallelSelfPlayCoordinator::play_single_game(
         std::vector<chess::Board> history_vec(position_history.begin(), position_history.end());
         encoding::PositionEncoder::encode_to_buffer(board, state_obs.data(), history_vec);
 
-        // Capture FEN and Zobrist history hashes for reanalysis
+        // Capture FEN, Zobrist history hashes, and history FENs for reanalysis
         std::string position_fen;
         std::array<uint64_t, 8> hist_hashes{};
+        std::array<std::string, 8> hist_fens{};
         uint8_t num_hist = 0;
         if (replay_buffer_ && replay_buffer_->fen_storage_enabled()) {
             position_fen = board.getFen();
             num_hist = static_cast<uint8_t>(
                 std::min(size_t(8), position_history.size()));
             for (uint8_t h = 0; h < num_hist; ++h) {
-                hist_hashes[h] = position_history[
-                    position_history.size() - 1 - h].hash();
+                size_t idx = position_history.size() - 1 - h;
+                hist_hashes[h] = position_history[idx].hash();
+                hist_fens[h] = position_history[idx].getFen();
             }
         }
 
@@ -702,9 +711,9 @@ GameTrajectory ParallelSelfPlayCoordinator::play_single_game(
         float soft_val = (move_risk_beta != 0.0f)
             ? search.get_root_risk_value(move_risk_beta) : 0.0f;
 
-        // Add to trajectory (with MCTS root WDL, soft value, FEN, and history hashes)
+        // Add to trajectory (with MCTS root WDL, soft value, FEN, history hashes, and history FENs)
         trajectory.add_state(state_obs, policy, search.get_root_wdl(), soft_val,
-                             position_fen, hist_hashes, num_hist);
+                             position_fen, hist_hashes, num_hist, hist_fens);
 
         // Safety check: if no move was selected (shouldn't happen), break
         if (legal_moves.empty()) {

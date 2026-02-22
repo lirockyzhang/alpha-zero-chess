@@ -71,6 +71,7 @@ public:
      * @param fen Optional FEN string (stored if fen_storage_enabled)
      * @param history_hashes Optional 8 Zobrist hashes [T-1..T-8] for repetition detection
      * @param num_history Number of valid history hashes (0-8)
+     * @param history_fens Optional array of num_history FEN C-strings [T-1..T-8] for obs reconstruction
      */
     void add_sample(
         const std::vector<float>& observation,
@@ -81,7 +82,8 @@ public:
         const SampleMeta* meta = nullptr,
         const char* fen = nullptr,
         const uint64_t* history_hashes = nullptr,
-        uint8_t num_history = 0
+        uint8_t num_history = 0,
+        const char* const* history_fens = nullptr
     );
 
     /**
@@ -315,6 +317,14 @@ public:
     uint8_t get_num_history(size_t index) const;
 
     /**
+     * Get history FEN string at buffer index.
+     * @param index Buffer sample index
+     * @param hist_idx History slot (0=T-1 most recent, 7=T-8 oldest)
+     * Returns empty string if FEN storage disabled, index invalid, or slot empty.
+     */
+    std::string get_history_fen(size_t index, int hist_idx) const;
+
+    /**
      * Get direct pointer to observation data at buffer index.
      * Used by reanalyzer to read stored observation without copy.
      */
@@ -406,6 +416,7 @@ private:
     std::vector<char> fens_;               // capacity * FEN_SLOT_SIZE (null-terminated C strings)
     std::vector<uint64_t> history_hashes_; // capacity * HISTORY_DEPTH (Zobrist hashes [T-1..T-8])
     std::vector<uint8_t> num_history_;     // capacity (valid hash count per sample)
+    std::vector<char> history_fens_;       // capacity * HISTORY_DEPTH * FEN_SLOT_SIZE
     bool store_fens_{false};
 
     // Prioritized Experience Replay (PER) state

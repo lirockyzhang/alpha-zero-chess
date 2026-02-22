@@ -2142,6 +2142,7 @@ def run_parallel_selfplay(
                 elapsed_time=max(elapsed, 0.1),
                 buffer_size=total_buffer_size(),
                 phase="selfplay",
+                risk_beta=risk_beta,
                 white_wins=live_stats.get('white_wins', 0),
                 black_wins=live_stats.get('black_wins', 0),
                 draws=live_stats.get('draws', 0),
@@ -2157,6 +2158,10 @@ def run_parallel_selfplay(
                 pool_load=live_stats.get('pool_load', 0.0),
                 avg_batch_size=live_stats.get('avg_batch_size', 0.0),
                 batch_fill_ratio=live_stats.get('batch_fill_ratio', 0.0),
+                # Batch fire reason breakdown
+                batches_fired_full=live_stats.get('batches_fired_full', 0),
+                batches_fired_stall=live_stats.get('batches_fired_stall', 0),
+                batches_fired_timeout=live_stats.get('batches_fired_timeout', 0),
                 # GPU metrics (separate counts for pie chart)
                 cuda_graph_fires=graph_fires,
                 large_graph_fires=cuda_graph_stats['large_graph_fires'],
@@ -2598,6 +2603,10 @@ Examples:
                         help="Per-game opponent risk range MIN:MAX (e.g. '0.5:2.0'). "
                              "MIN can equal MAX for a fixed opponent risk. "
                              "Each game: one side uses --risk-beta, the other samples from U(min,max).")
+    parser.add_argument("--risk-beta-random", action="store_true", default=False,
+                        help="Sample risk_beta each iteration from Laplace(0, std) distribution")
+    parser.add_argument("--risk-beta-std", type=float, default=0.5,
+                        help="Std deviation of Laplace distribution for --risk-beta-random (default: 0.5)")
 
     # Network parameters
     parser.add_argument("--filters", type=int, default=192,
@@ -2996,6 +3005,8 @@ Examples:
         'simulations': (int, 50, 10000),
         'c_explore': (float, 0.1, 10.0),
         'risk_beta': (float, -3.0, 3.0),
+        'risk_beta_random': (bool, False, True),
+        'risk_beta_std': (float, 0.01, 3.0),
         'temperature_moves': (int, 0, 200),
         'dirichlet_alpha': (float, 0.01, 2.0),
         'dirichlet_epsilon': (float, 0.0, 1.0),
@@ -3019,7 +3030,8 @@ Examples:
               f"fpu_base={args.fpu_base:g}")
         print(f"  Explore:   dirichlet_alpha={args.dirichlet_alpha:g}, "
               f"dirichlet_epsilon={args.dirichlet_epsilon:g}, temperature_moves={args.temperature_moves}")
-        print(f"  Risk:      risk_beta={args.risk_beta:g}")
+        risk_mode = " [random Laplace]" if args.risk_beta_random else ""
+        print(f"  Risk:      risk_beta={args.risk_beta:g}{risk_mode}")
         print(f"  Training:  lr={args.lr:.2e}, train_batch={args.train_batch}, epochs={args.epochs}")
         if args.priority_exponent > 0:
             print(f"  PER:       alpha={args.priority_exponent:g}, beta={args.per_beta:g}")
@@ -3358,6 +3370,12 @@ Examples:
         apply_dashboard_updates('self-play')
         check_export_request()
 
+        # Per-iteration risk_beta sampling from Laplace distribution
+        if args.risk_beta_random:
+            laplace_b = args.risk_beta_std / np.sqrt(2)
+            args.risk_beta = float(np.random.laplace(0, laplace_b))
+            print(f"  [Risk] Sampled risk_beta={args.risk_beta:.3f} (Laplace std={args.risk_beta_std:g})")
+
         # Re-derive search_batch and downstream sizes (gumbel_top_k may have changed)
         old_search_batch = args.search_batch
         if args.search_algorithm == "gumbel":
@@ -3396,11 +3414,9 @@ Examples:
                 import random as _rng
                 reanalyze_sims = max(1, int(args.simulations * args.reanalyze_simulations_ratio))
                 num_positions = int(replay_buffer.size() * args.reanalyze_fraction)
-                reanalyze_workers = args.reanalyze_workers or max(1, args.workers // 2)
 
                 reanalysis_config = alphazero_cpp.ReanalysisConfig()
                 reanalysis_config.num_simulations = reanalyze_sims
-                reanalysis_config.num_workers = reanalyze_workers
                 reanalysis_config.gpu_batch_size = args.input_batch_size
                 reanalysis_config.c_puct = args.c_explore
                 reanalysis_config.fpu_base = args.fpu_base
@@ -3409,17 +3425,36 @@ Examples:
                 reanalysis_config.gumbel_top_k = args.gumbel_top_k
                 reanalysis_config.gumbel_c_visit = args.gumbel_c_visit
                 reanalysis_config.gumbel_c_scale = args.gumbel_c_scale
-                # Match primary queue capacity so collect_batch has consistent limits
-                if args.queue_capacity > 0:
-                    reanalysis_config.queue_capacity = args.queue_capacity
+
+                # Auto-derive mcts_batch_size to match search algorithm
+                if args.search_algorithm == "gumbel":
+                    reanalysis_config.mcts_batch_size = args.gumbel_top_k  # e.g. 16
                 else:
-                    reanalysis_config.queue_capacity = max(8192, args.workers * args.search_batch * 16)
+                    reanalysis_config.mcts_batch_size = 1  # PUCT: single-leaf
+
+                # Auto-derive worker count for GPU fill during dedicated reanalysis mode.
+                # Target: workers × mcts_batch_size ≈ gpu_batch_size
+                if args.reanalyze_workers > 0:
+                    reanalyze_workers = args.reanalyze_workers  # explicit override
+                else:
+                    target = args.input_batch_size  # gpu_batch_size
+                    reanalyze_workers = max(4, target // reanalysis_config.mcts_batch_size)
+                    reanalyze_workers = min(reanalyze_workers, 64)  # cap thread count
+                reanalysis_config.num_workers = reanalyze_workers
+
+                # Scale queue capacity for worker count × batch size
+                min_capacity = reanalyze_workers * reanalysis_config.mcts_batch_size * 8
+                if args.queue_capacity > 0:
+                    reanalysis_config.queue_capacity = max(args.queue_capacity, min_capacity)
+                else:
+                    reanalysis_config.queue_capacity = max(8192, min_capacity)
 
                 reanalyzer = alphazero_cpp.Reanalyzer(replay_buffer, reanalysis_config)
                 indices = _rng.sample(range(replay_buffer.size()), num_positions)
                 reanalyzer.set_indices(indices)
                 print(f"  Reanalysis: {num_positions} positions, {reanalyze_sims} sims, "
-                      f"{reanalyze_workers} workers (concurrent with self-play)")
+                      f"{reanalyze_workers} workers, batch_size={reanalysis_config.mcts_batch_size} "
+                      f"(concurrent with self-play)")
 
             parallel_metrics, sample_game, hw_stats = run_parallel_selfplay(
                 network=network,

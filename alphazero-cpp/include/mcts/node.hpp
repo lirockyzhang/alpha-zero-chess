@@ -122,10 +122,7 @@ struct alignas(64) Node {
         // Guard against tiny negative residuals from fixed-point rounding
         float var = std::max(0.0f, mean_sq - mean * mean);
 
-        float q_risk = mean + (beta / 2.0f) * var;
-
-        // Clamp to valid range (extreme beta may saturate)
-        return std::clamp(q_risk, -1.0f, 1.0f);
+        return mean + (beta / 2.0f) * var;
     }
 
     // Prior probability from neural network

@@ -512,6 +512,7 @@ int GlobalEvaluationQueue::collect_batch(
         }
 
         // Phase 1b: Check if batch already meets fire target — skip spin-poll
+        int fire_reason = 0;  // 0=full, 1=stall, 2=timeout
         size_t initial_size = staged_requests_.size();
         bool need_spin = (initial_size < fire_target) &&
                          !shutdown_.load(std::memory_order_acquire);
@@ -538,6 +539,7 @@ int GlobalEvaluationQueue::collect_batch(
             // saw_growth defers the now() call to the less-frequent clock check,
             // avoiding steady_clock overhead (~20-30ns/call) in the hot inner loop.
             bool saw_growth = false;
+            fire_reason = 2;  // default: timeout (loop condition fails)
 
             while (std::chrono::steady_clock::now() < outer_deadline) {
                 _mm_pause();
@@ -549,7 +551,7 @@ int GlobalEvaluationQueue::collect_batch(
                 // provides the acquire barrier before we touch staged_requests_.
                 if ((spin_count & 15) == 0) {
                     uint64_t cur = total_submissions_.load(std::memory_order_relaxed);
-                    if (cur - snapshot >= need) break;  // full batch
+                    if (cur - snapshot >= need) { fire_reason = 0; break; }  // full batch
                     if (cur > last_seen) {
                         last_seen = cur;
                         saw_growth = true;
@@ -566,7 +568,7 @@ int GlobalEvaluationQueue::collect_batch(
                         stall_start = now;   // reset stall timer on observed growth
                         saw_growth = false;
                     } else if (now - stall_start > std::chrono::microseconds(stall_detection_us)) {
-                        break;  // stall window — no new submissions
+                        fire_reason = 1; break;  // stall window — no new submissions
                     }
                 }
             }
@@ -580,6 +582,13 @@ int GlobalEvaluationQueue::collect_batch(
 
             // Phase 1d: Re-acquire lock to extract metadata
             lock.lock();
+        }
+
+        // Increment batch fire reason counter
+        switch (fire_reason) {
+            case 0: metrics_.batches_fired_full.fetch_add(1, std::memory_order_relaxed); break;
+            case 1: metrics_.batches_fired_stall.fetch_add(1, std::memory_order_relaxed); break;
+            case 2: metrics_.batches_fired_timeout.fetch_add(1, std::memory_order_relaxed); break;
         }
         // Falls through to metadata extraction below
 

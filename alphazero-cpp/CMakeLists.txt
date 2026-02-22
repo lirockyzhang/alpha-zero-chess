@@ -129,6 +129,7 @@ target_include_directories(training PUBLIC
 
 target_link_libraries(training PUBLIC
     Threads::Threads
+    encoding
 )
 
 # NOTE: Old MCTS test executables disabled - they use deprecated API
@@ -138,6 +139,22 @@ target_link_libraries(training PUBLIC
 add_executable(virtual_visits_test tests/virtual_visits_test.cpp)
 target_link_libraries(virtual_visits_test PRIVATE mcts_core encoding)
 target_include_directories(virtual_visits_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/chess-library/include
+)
+
+# History encoding test (position history reconstruction for MCTS leaves)
+add_executable(history_encoding_test tests/history_encoding_test.cpp)
+target_link_libraries(history_encoding_test PRIVATE mcts_core encoding)
+target_include_directories(history_encoding_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/chess-library/include
+)
+
+# Replay buffer v5 test (FEN storage, sparse policy, obs reconstruction)
+add_executable(replay_buffer_v5_test tests/replay_buffer_v5_test.cpp)
+target_link_libraries(replay_buffer_v5_test PRIVATE training encoding OpenMP::OpenMP_CXX)
+target_include_directories(replay_buffer_v5_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/chess-library/include
 )
