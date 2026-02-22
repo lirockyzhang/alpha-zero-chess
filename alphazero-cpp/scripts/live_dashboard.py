@@ -157,6 +157,12 @@ DASHBOARD_HTML = """
             width: 100%;
             height: 250px;
         }
+        .card-wide {
+            grid-column: span 2;
+        }
+        .card-wide .chart {
+            height: 300px;
+        }
         .footer {
             text-align: center;
             padding: 20px;
@@ -263,6 +269,9 @@ DASHBOARD_HTML = """
         @media (max-width: 600px) {
             .grid {
                 grid-template-columns: 1fr;
+            }
+            .card-wide {
+                grid-column: span 1;
             }
             .header .stats {
                 flex-direction: column;
@@ -544,6 +553,22 @@ DASHBOARD_HTML = """
                 </div>
             </div>
 
+            <!-- Training Progress Card (hidden until training phase) -->
+            <div class="monitoring-card" id="training-progress-card" style="display:none;">
+                <h4>🧠 Training Progress</h4>
+                <div class="metric-row"><span>Epoch:</span><span id="train-epoch">--</span></div>
+                <div class="metric-row"><span>Loss:</span><span id="train-loss">--</span></div>
+                <div class="metric-row"><span>Policy Loss:</span><span id="train-policy-loss">--</span></div>
+                <div class="metric-row"><span>Value Loss:</span><span id="train-value-loss">--</span></div>
+                <div class="metric-row"><span>Grad Norm:</span><span id="train-grad-norm">--</span></div>
+                <div style="margin-top: 6px;">
+                    <div style="background: rgba(255,255,255,0.1); border-radius: 4px; height: 8px; overflow: hidden;">
+                        <div id="train-progress-bar" style="background: linear-gradient(90deg, #9b59b6, #3498db); height: 100%; width: 0%; transition: width 0.5s;"></div>
+                    </div>
+                    <div style="font-size: 0.7em; color: #95a5a6; margin-top: 2px; text-align: center;" id="train-progress-text">0%</div>
+                </div>
+            </div>
+
             <!-- Iteration Progress Card -->
             <div class="monitoring-card">
                 <h4>📊 Iteration Progress</h4>
@@ -775,7 +800,7 @@ DASHBOARD_HTML = """
         </div>
 
         <!-- Reanalysis -->
-        <div class="card" id="reanalysis-card" style="display:none;">
+        <div class="card card-wide" id="reanalysis-card" style="display:none;">
             <h3>🔄 Reanalysis</h3>
             <div id="reanalysis-chart" class="chart"></div>
         </div>
@@ -1164,9 +1189,18 @@ DASHBOARD_HTML = """
                 if (data.phase === 'selfplay') {
                     phaseIcon.textContent = '🎮';
                     phaseText.textContent = `Iteration ${data.iteration} - Self-Play (${data.games_completed}/${data.total_games} games)`;
+                } else if (data.phase === 'reanalysis') {
+                    phaseIcon.textContent = '🔄';
+                    const c = data.reanalysis_completed || 0;
+                    const t = data.reanalysis_total || 0;
+                    phaseText.textContent = `Iteration ${data.iteration} - Reanalysis Tail (${c.toLocaleString()}/${t.toLocaleString()})`;
                 } else if (data.phase === 'training') {
                     phaseIcon.textContent = '🧠';
-                    phaseText.textContent = `Iteration ${data.iteration} - Training`;
+                    const ep = data.train_epoch || 0;
+                    const total = data.train_total_epochs || 0;
+                    phaseText.textContent = ep > 0
+                        ? `Iteration ${data.iteration} - Training (epoch ${ep}/${total})`
+                        : `Iteration ${data.iteration} - Training`;
                 }
 
                 // Update ETA
@@ -1298,6 +1332,25 @@ DASHBOARD_HTML = """
                         pct.toFixed(0) + '% (' + processed.toLocaleString() + ' / ' + reanalTarget.toLocaleString() + ')';
                 } else {
                     reanalCard.style.display = 'none';
+                }
+
+                // Training Progress card (show during training phase with epoch data)
+                const trainCard = document.getElementById('training-progress-card');
+                const trainEpoch = data.train_epoch || 0;
+                const trainTotalEpochs = data.train_total_epochs || 0;
+                if (data.phase === 'training' && trainEpoch > 0) {
+                    trainCard.style.display = '';
+                    updateMetricWithHighlight('train-epoch', `${trainEpoch} / ${trainTotalEpochs}`);
+                    updateMetricWithHighlight('train-loss', (data.train_loss || 0).toFixed(4));
+                    updateMetricWithHighlight('train-policy-loss', (data.train_policy_loss || 0).toFixed(4));
+                    updateMetricWithHighlight('train-value-loss', (data.train_value_loss || 0).toFixed(4));
+                    updateMetricWithHighlight('train-grad-norm', (data.train_grad_norm || 0).toFixed(2));
+                    const trainPct = trainTotalEpochs > 0 ? (trainEpoch / trainTotalEpochs * 100) : 0;
+                    document.getElementById('train-progress-bar').style.width = trainPct.toFixed(1) + '%';
+                    document.getElementById('train-progress-text').textContent =
+                        `${trainPct.toFixed(0)}% (epoch ${trainEpoch}/${trainTotalEpochs})`;
+                } else {
+                    trainCard.style.display = 'none';
                 }
 
                 // Update buffer size in header
@@ -1907,8 +1960,15 @@ class LiveDashboardServer:
                        reanalysis_total: int = 0,
                        reanalysis_nn_evals: int = 0,
                        reanalysis_mean_kl: float = 0.0,
-                       reanalysis_elapsed_s: float = 0.0):
-        """Push real-time progress updates during self-play (every few seconds).
+                       reanalysis_elapsed_s: float = 0.0,
+                       # Training progress (per-epoch)
+                       train_epoch: int = 0,
+                       train_total_epochs: int = 0,
+                       train_loss: float = 0.0,
+                       train_policy_loss: float = 0.0,
+                       train_value_loss: float = 0.0,
+                       train_grad_norm: float = 0.0):
+        """Push real-time progress updates during self-play, reanalysis, or training.
 
         Args:
             iteration: Current iteration number
@@ -1919,7 +1979,7 @@ class LiveDashboardServer:
             evals: Total NN evaluations so far
             elapsed_time: Seconds elapsed in this phase
             buffer_size: Current replay buffer size
-            phase: Current phase ("selfplay" or "training")
+            phase: Current phase ("selfplay", "reanalysis", or "training")
             timeout_evals: Number of MCTS evaluation timeouts (mcts_failures)
             pool_exhaustion: Times observation pool ran out of slots
             submission_drops: Total leaves dropped due to pool exhaustion
@@ -2036,6 +2096,13 @@ class LiveDashboardServer:
             'reanalysis_nn_evals': reanalysis_nn_evals,
             'reanalysis_mean_kl': reanalysis_mean_kl,
             'reanalysis_elapsed_s': reanalysis_elapsed_s,
+            # Training progress
+            'train_epoch': train_epoch,
+            'train_total_epochs': train_total_epochs,
+            'train_loss': train_loss,
+            'train_policy_loss': train_policy_loss,
+            'train_value_loss': train_value_loss,
+            'train_grad_norm': train_grad_norm,
         }
 
         self.socketio.emit('progress', progress_data)

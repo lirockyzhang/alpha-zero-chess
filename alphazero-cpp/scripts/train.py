@@ -1117,8 +1117,38 @@ def run_selfplay_with_reanalysis(
         raise selfplay_exception[0]
 
     # Self-play done. Wait for reanalysis tail (GPU thread still serving secondary queue)
+    # Use same threading.Event + waiter pattern as self-play for live dashboard updates
     reanalysis_tail_start = time.time()
-    reanalyzer.wait()
+    reanalysis_done = threading.Event()
+    reanalysis_exception = [None]
+
+    def reanalysis_waiter():
+        try:
+            reanalyzer.wait()
+        except Exception as e:
+            reanalysis_exception[0] = e
+        reanalysis_done.set()
+
+    reanalysis_thread = threading.Thread(target=reanalysis_waiter, daemon=True)
+    reanalysis_thread.start()
+
+    while not reanalysis_done.is_set():
+        reanalysis_done.wait(timeout=0.5)
+        now = time.time()
+        if progress_callback and (now - last_progress_time) >= progress_interval:
+            try:
+                progress_callback(None)  # None signals "reanalysis tail"
+            except Exception:
+                pass
+            last_progress_time = now
+        if shutdown_handler.should_stop():
+            reanalyzer.stop()
+            reanalysis_done.wait(timeout=5.0)
+            break
+
+    if reanalysis_exception[0]:
+        raise reanalysis_exception[0]
+
     reanalysis_tail_time = time.time() - reanalysis_tail_start
 
     # Get stats before shutdown
@@ -1948,9 +1978,43 @@ def run_parallel_selfplay(
     console_interval = getattr(args, 'progress_interval', 30.0)
 
     def progress_cb(live_stats):
-        """Print live C++ stats to console and optionally push to dashboard."""
+        """Print live C++ stats to console and optionally push to dashboard.
+
+        When live_stats is None, we're in the reanalysis tail phase (self-play
+        done, reanalysis workers still running). Push reanalysis stats only.
+        """
         now = time.time()
         elapsed = now - selfplay_start
+
+        # Reanalysis tail phase: live_stats=None means self-play is done
+        if live_stats is None:
+            if live_dashboard is not None:
+                reanl_kwargs = {}
+                if reanalyzer is not None:
+                    try:
+                        rs = reanalyzer.get_stats()
+                        reanl_target = int(replay_buffer.size() * args.reanalyze_fraction) if args.reanalyze_fraction > 0 else 0
+                        reanl_kwargs = {
+                            'reanalysis_completed': rs.get('positions_completed', 0),
+                            'reanalysis_skipped': rs.get('positions_skipped', 0),
+                            'reanalysis_total': reanl_target,
+                            'reanalysis_nn_evals': rs.get('total_nn_evals', 0),
+                            'reanalysis_mean_kl': rs.get('mean_kl', 0.0),
+                            'reanalysis_elapsed_s': elapsed,
+                        }
+                    except Exception:
+                        pass
+                live_dashboard.push_progress(
+                    iteration=metrics.iteration,
+                    games_completed=actual_total_games,
+                    total_games=actual_total_games,
+                    moves=0, sims=0, evals=0,
+                    elapsed_time=max(elapsed, 0.1),
+                    buffer_size=total_buffer_size(),
+                    phase="reanalysis",
+                    **reanl_kwargs,
+                )
+            return
 
         # Console progress printing (always active)
         if (now - last_console_report[0]) >= console_interval:
@@ -2298,6 +2362,7 @@ def train_iteration(
     device: str,
     scaler: GradScaler,
     per_beta: float = 0.0,
+    progress_callback=None,
 ) -> dict:
     """Train for one iteration using C++ ReplayBuffer.
 
@@ -2417,6 +2482,21 @@ def train_iteration(
         total_policy_loss += policy_loss.item()
         total_value_loss += value_loss.item()
         num_batches += 1
+
+        # Per-epoch progress callback for live dashboard
+        if progress_callback is not None:
+            try:
+                progress_callback({
+                    'epoch': epoch + 1,
+                    'total_epochs': epochs,
+                    'loss': total_loss / num_batches,
+                    'policy_loss': total_policy_loss / num_batches,
+                    'value_loss': total_value_loss / num_batches,
+                    'grad_norm': grad_norm_val,
+                    'nan_skip_count': nan_skip_count,
+                })
+            except Exception:
+                pass
 
     if num_batches == 0:
         return {
@@ -3622,6 +3702,29 @@ Examples:
 
                 train_start = time.time()
 
+                # Training progress callback for live dashboard
+                train_progress_cb = None
+                if live_dashboard is not None:
+                    def _train_progress_cb(train_stats):
+                        live_dashboard.push_progress(
+                            iteration=iteration + 1,
+                            games_completed=metrics.num_games,
+                            total_games=metrics.num_games,
+                            moves=metrics.total_moves,
+                            sims=metrics.total_simulations,
+                            evals=metrics.total_nn_evals,
+                            elapsed_time=time.time() - train_start,
+                            buffer_size=get_total_buffer_size(),
+                            phase="training",
+                            train_epoch=train_stats['epoch'],
+                            train_total_epochs=train_stats['total_epochs'],
+                            train_loss=train_stats['loss'],
+                            train_policy_loss=train_stats['policy_loss'],
+                            train_value_loss=train_stats['value_loss'],
+                            train_grad_norm=train_stats['grad_norm'],
+                        )
+                    train_progress_cb = _train_progress_cb
+
                 # PER beta (fixed, not annealed)
                 current_per_beta = args.per_beta if args.priority_exponent > 0 else 0.0
 
@@ -3629,6 +3732,7 @@ Examples:
                     network, optimizer, replay_buffer,
                     args.train_batch, args.epochs, device, scaler,
                     per_beta=current_per_beta,
+                    progress_callback=train_progress_cb,
                 )
 
                 metrics.train_time = time.time() - train_start
@@ -3714,46 +3818,6 @@ Examples:
                 sample_game=sample_game,
             )
 
-        # Synchronous Claude review handshake (--claude with non-zero timeout)
-        # Dual-signal: selfplay_done (created earlier) + awaiting_review (created now)
-        # Training blocks until BOTH are deleted by the reviewing agent.
-        if claude_iface is not None and args.claude_timeout > 0:
-            awaiting_path = os.path.join(run_dir, "awaiting_review")
-            with open(awaiting_path, 'w') as f:
-                f.write(str(iteration + 1))
-                f.flush()
-                os.fsync(f.fileno())
-
-            print(f"  Awaiting Claude review... (delete both selfplay_done AND awaiting_review to continue)")
-            wait_start = time.time()
-            timeout = args.claude_timeout
-            while True:
-                time.sleep(1.0)
-                selfplay_exists = selfplay_done_path is not None and os.path.exists(selfplay_done_path)
-                review_exists = os.path.exists(awaiting_path)
-                if not selfplay_exists and not review_exists:
-                    break
-                if shutdown_handler.should_stop():
-                    for p in [selfplay_done_path, awaiting_path]:
-                        if p:
-                            try:
-                                os.remove(p)
-                            except OSError:
-                                pass
-                    break
-                if time.time() - wait_start > timeout:
-                    print(f"  Claude review timeout ({timeout}s) — auto-continuing")
-                    for p in [selfplay_done_path, awaiting_path]:
-                        if p:
-                            try:
-                                os.remove(p)
-                            except OSError:
-                                pass
-                    break
-
-            # Apply any parameter changes Claude wrote during review
-            poll_control_file('claude-review')
-
         # Save checkpoint and training metrics BEFORE evaluation (at save_interval)
         save_checkpoint_now = (iteration + 1) % args.save_interval == 0 or iteration == args.iterations - 1
         if save_checkpoint_now:
@@ -3822,10 +3886,51 @@ Examples:
 
             print()
 
+        # Synchronous Claude review handshake (--claude with non-zero timeout)
+        # Dual-signal: selfplay_done (created earlier) + awaiting_review (created now)
+        # Training blocks until BOTH are deleted by the reviewing agent.
+        if claude_iface is not None and args.claude_timeout > 0:
+            awaiting_path = os.path.join(run_dir, "awaiting_review")
+            with open(awaiting_path, 'w') as f:
+                f.write(str(iteration + 1))
+                f.flush()
+                os.fsync(f.fileno())
+
+            print(f"  Awaiting Claude review... (delete both selfplay_done AND awaiting_review to continue)")
+            wait_start = time.time()
+            timeout = args.claude_timeout
+            while True:
+                time.sleep(1.0)
+                selfplay_exists = selfplay_done_path is not None and os.path.exists(selfplay_done_path)
+                review_exists = os.path.exists(awaiting_path)
+                if not selfplay_exists and not review_exists:
+                    break
+                if shutdown_handler.should_stop():
+                    for p in [selfplay_done_path, awaiting_path]:
+                        if p:
+                            try:
+                                os.remove(p)
+                            except OSError:
+                                pass
+                    break
+                if time.time() - wait_start > timeout:
+                    print(f"  Claude review timeout ({timeout}s) — auto-continuing")
+                    for p in [selfplay_done_path, awaiting_path]:
+                        if p:
+                            try:
+                                os.remove(p)
+                            except OSError:
+                                pass
+                    break
+
+            # Apply any parameter changes Claude wrote during review
+            poll_control_file('claude-review')
+
         # Check for shutdown after iteration complete
         if shutdown_handler.should_stop():
             emergency_save(iteration + 1, "Shutdown after training")
             break
+    
     except Exception as e:
         import traceback
         print(f"\n{'=' * 70}")
