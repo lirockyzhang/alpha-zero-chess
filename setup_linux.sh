@@ -124,11 +124,14 @@ echo
 # ─── Step 4: Python environment ───────────────────────────────────────────────
 info "Step 4/6: Setting up Python environment..."
 
-# Create venv with system-site-packages so it can see pre-installed torch.
+# Create venv using the system Python (which has torch pre-installed).
 # uv venv doesn't have --system-site-packages, so we patch pyvenv.cfg after.
 if [ ! -d ".venv" ]; then
-    info "Creating virtual environment (Python 3.13)..."
-    uv venv --python 3.13 --seed
+    # Use system Python (>= 3.12) rather than a specific version,
+    # so the venv matches the Python where torch is installed.
+    SYS_PY=$(python3 --version 2>/dev/null | grep -oP '\d+\.\d+' || echo "3.12")
+    info "Creating virtual environment (Python $SYS_PY)..."
+    uv venv --python "$SYS_PY" --seed
 else
     ok "Virtual environment already exists"
 fi
@@ -144,9 +147,9 @@ if [ -f "$PYVENV_CFG" ]; then
     info "Enabled system-site-packages (inherit pre-installed PyTorch)"
 fi
 
-# Install all dependencies EXCEPT torch/torchvision (those are pre-installed)
-info "Installing Python dependencies (preserving pre-installed PyTorch)..."
-uv sync --no-install-package torch --no-install-package torchvision
+# Install all dependencies (torch/torchvision are optional — use pre-installed)
+info "Installing Python dependencies..."
+uv sync
 
 ok "Python dependencies installed"
 echo
