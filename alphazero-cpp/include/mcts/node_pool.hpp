@@ -41,7 +41,13 @@ public:
     Node* allocate() {
         // Check if current block is full
         if (current_offset_ >= NODES_PER_BLOCK) {
-            allocate_block();
+            // Reuse existing block if available (after reset)
+            if (current_block_ + 1 < blocks_.size()) {
+                current_block_++;
+                current_offset_ = 0;
+            } else {
+                allocate_block();
+            }
         }
 
         // Get node from current block
