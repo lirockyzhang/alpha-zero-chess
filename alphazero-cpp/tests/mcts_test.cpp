@@ -95,7 +95,7 @@ void test_node_pool() {
 
     std::cout << "✓ Allocated 1000 nodes" << std::endl;
     std::cout << "✓ Pool size: " << pool.size() << " nodes" << std::endl;
-    std::cout << "✓ Memory usage: " << pool.memory_usage() / 1024 << " KB" << std::endl;
+    std::cout << "✓ Memory reserved: " << pool.memory_reserved() / 1024 << " KB" << std::endl;
 
     // Verify nodes are 64-byte aligned
     for (int i = 0; i < 10; ++i) {

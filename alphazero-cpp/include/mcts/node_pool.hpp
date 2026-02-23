@@ -65,14 +65,33 @@ public:
         current_offset_ = 0;
     }
 
-    // Get total number of allocated nodes
+    // Reset pool and free excess blocks beyond keep_blocks.
+    // Use between games to reclaim memory from outlier searches.
+    void shrink(size_t keep_blocks = 2) {
+        reset();
+        while (blocks_.size() > keep_blocks && keep_blocks >= 1) {
+#ifdef _WIN32
+            _aligned_free(blocks_.back());
+#else
+            std::free(blocks_.back());
+#endif
+            blocks_.pop_back();
+        }
+    }
+
+    // Get total number of allocated nodes (since last reset)
     size_t size() const {
         return current_block_ * NODES_PER_BLOCK + current_offset_;
     }
 
-    // Get memory usage in bytes
-    size_t memory_usage() const {
+    // Get total memory reserved by the pool (high-water mark)
+    size_t memory_reserved() const {
         return blocks_.size() * NODES_PER_BLOCK * sizeof(Node);
+    }
+
+    // Get memory actively used since last reset
+    size_t memory_used() const {
+        return size() * sizeof(Node);
     }
 
 private:

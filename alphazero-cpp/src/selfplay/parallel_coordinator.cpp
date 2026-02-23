@@ -214,8 +214,8 @@ void ParallelSelfPlayCoordinator::worker_thread_func(int worker_id) {
                 completed_games_.push(std::move(trajectory));
             }
 
-            // Reset pool for next game
-            node_pool.reset();
+            // Shrink pool between games to reclaim outlier memory
+            node_pool.shrink();
         }
     } catch (const std::exception& e) {
         fprintf(stderr, "[FATAL] Worker %d exception: %s\n", worker_id, e.what());

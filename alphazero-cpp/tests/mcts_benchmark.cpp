@@ -65,7 +65,7 @@ BenchmarkResult benchmark_position(const std::string& name,
 
     // Calculate metrics
     double nps = (simulations * 1000.0) / time_ms;
-    size_t memory_kb = pool.memory_usage() / 1024;
+    size_t memory_kb = pool.memory_reserved() / 1024;
 
     return BenchmarkResult{
         name,
@@ -225,7 +225,7 @@ void benchmark_memory_allocation() {
 
         double time_ms = timer.elapsed_ms();
         double allocs_per_sec = (count * 1000.0) / time_ms;
-        size_t memory_kb = pool.memory_usage() / 1024;
+        size_t memory_kb = pool.memory_reserved() / 1024;
 
         std::cout << std::left << std::setw(20) << count
                   << std::right << std::setw(15) << std::fixed << std::setprecision(2) << time_ms
