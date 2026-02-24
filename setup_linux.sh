@@ -125,8 +125,9 @@ echo
 info "Step 4/6: Setting up Python environment..."
 
 # Detect a pre-existing venv with PyTorch (e.g., cloud GPU instances).
-# Common locations: /venv/main/ (Lambda, Vast.ai), or already-activated $VIRTUAL_ENV.
+# Common locations: /venv/main/ (Vast.ai), or already-activated $VIRTUAL_ENV.
 PREEXISTING_VENV=""
+RUN="uv run"  # prefix for python commands; empty when using pre-existing venv
 if [ -d "/venv/main" ] && /venv/main/bin/python -c "import torch" 2>/dev/null; then
     PREEXISTING_VENV="/venv/main"
 elif [ -n "${VIRTUAL_ENV:-}" ] && "$VIRTUAL_ENV/bin/python" -c "import torch" 2>/dev/null; then
@@ -135,8 +136,13 @@ fi
 
 if [ -n "$PREEXISTING_VENV" ]; then
     info "Found pre-existing venv with PyTorch at $PREEXISTING_VENV"
-    # Tell uv to sync into the existing venv instead of creating .venv
-    export UV_PROJECT_ENVIRONMENT="$PREEXISTING_VENV"
+    # Activate if not already active (so 'python' resolves to this venv)
+    if [ "${VIRTUAL_ENV:-}" != "$PREEXISTING_VENV" ]; then
+        # shellcheck disable=SC1091
+        source "$PREEXISTING_VENV/bin/activate"
+    fi
+    # Use 'python' directly; 'uv run' would try to manage .venv and enforce Python version
+    RUN=""
     ok "Using pre-existing venv (skipping venv creation)"
 else
     # Create venv using the system Python (which has torch pre-installed).
@@ -166,8 +172,9 @@ fi
 # Install all dependencies
 info "Installing Python dependencies..."
 if [ -n "$PREEXISTING_VENV" ]; then
-    # --inexact: keep pre-installed packages (torch, etc.) that aren't in pyproject.toml
-    uv sync --inexact
+    # uv pip: installs into active env without managing the venv or enforcing Python version.
+    # Reads [project.dependencies] from pyproject.toml (torch is optional, already installed).
+    uv pip install -r pyproject.toml
 else
     # --extra cuda: install torch/torchvision from the CUDA index in pyproject.toml
     uv sync --extra cuda
@@ -180,7 +187,7 @@ echo
 info "Step 5/6: Building C++ MCTS engine..."
 
 # Get pybind11 cmake directory from the venv
-PYBIND11_DIR=$(uv run python -c "import pybind11; print(pybind11.get_cmake_dir())")
+PYBIND11_DIR=$($RUN python -c "import pybind11; print(pybind11.get_cmake_dir())")
 info "pybind11 cmake dir: $PYBIND11_DIR"
 
 BUILD_DIR="alphazero-cpp/build"
@@ -220,7 +227,7 @@ info "Step 6/6: Verifying installation..."
 ERRORS=0
 
 # Check C++ module loads
-if uv run python -c "import alphazero_cpp; print('  alphazero_cpp:', dir(alphazero_cpp)[:5], '...')" 2>/dev/null; then
+if $RUN python -c "import alphazero_cpp; print('  alphazero_cpp:', dir(alphazero_cpp)[:5], '...')" 2>/dev/null; then
     ok "alphazero_cpp module loads"
 else
     warn "alphazero_cpp module failed to load (sys.path may need build/Release/)"
@@ -228,7 +235,7 @@ else
 fi
 
 # Check PyTorch
-if uv run python -c "
+if $RUN python -c "
 import torch
 print(f'  PyTorch {torch.__version__}  CUDA: {torch.cuda.is_available()}', end='')
 if torch.cuda.is_available():
@@ -244,7 +251,7 @@ else
 fi
 
 # Check python-chess
-if uv run python -c "import chess; print(f'  python-chess {chess.__version__}')" 2>/dev/null; then
+if $RUN python -c "import chess; print(f'  python-chess {chess.__version__}')" 2>/dev/null; then
     ok "python-chess accessible"
 else
     warn "python-chess not found"
@@ -260,12 +267,13 @@ else
 fi
 echo -e "${BOLD}══════════════════════════════════════════════════════${NC}"
 echo
+PYCMD="${RUN:+$RUN }python"
 echo "  Start training:"
 echo "    cd $REPO_DIR"
-echo "    uv run python alphazero-cpp/scripts/train.py \\"
+echo "    $PYCMD alphazero-cpp/scripts/train.py \\"
 echo "      --filters 256 --blocks 20 --iterations 100 \\"
 echo "      --games-per-iter 50 --simulations 200 --workers 64"
 echo
 echo "  Or resume a previous run:"
-echo "    uv run python alphazero-cpp/scripts/train.py --resume checkpoints/<run_dir>"
+echo "    $PYCMD alphazero-cpp/scripts/train.py --resume checkpoints/<run_dir>"
 echo
