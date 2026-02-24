@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # setup_linux.sh — One-command setup for AlphaZero Chess on Linux
 #
-# Prerequisites: PyTorch already installed (with your desired CUDA version)
+# Prerequisites: NVIDIA GPU with CUDA drivers (PyTorch installed automatically)
 # Usage:
 #   curl -LsSf https://raw.githubusercontent.com/lirockyzhang/alpha-zero-chess/main/setup_linux.sh | bash
 #   # or:
@@ -124,32 +124,54 @@ echo
 # ─── Step 4: Python environment ───────────────────────────────────────────────
 info "Step 4/6: Setting up Python environment..."
 
-# Create venv using the system Python (which has torch pre-installed).
-# uv venv doesn't have --system-site-packages, so we patch pyvenv.cfg after.
-if [ ! -d ".venv" ]; then
-    # Use system Python (>= 3.12) rather than a specific version,
-    # so the venv matches the Python where torch is installed.
-    SYS_PY=$(python3 --version 2>/dev/null | grep -oP '\d+\.\d+' || echo "3.12")
-    info "Creating virtual environment (Python $SYS_PY)..."
-    uv venv --python "$SYS_PY" --seed
+# Detect a pre-existing venv with PyTorch (e.g., cloud GPU instances).
+# Common locations: /venv/main/ (Lambda, Vast.ai), or already-activated $VIRTUAL_ENV.
+PREEXISTING_VENV=""
+if [ -d "/venv/main" ] && /venv/main/bin/python -c "import torch" 2>/dev/null; then
+    PREEXISTING_VENV="/venv/main"
+elif [ -n "${VIRTUAL_ENV:-}" ] && "$VIRTUAL_ENV/bin/python" -c "import torch" 2>/dev/null; then
+    PREEXISTING_VENV="$VIRTUAL_ENV"
+fi
+
+if [ -n "$PREEXISTING_VENV" ]; then
+    info "Found pre-existing venv with PyTorch at $PREEXISTING_VENV"
+    # Tell uv to sync into the existing venv instead of creating .venv
+    export UV_PROJECT_ENVIRONMENT="$PREEXISTING_VENV"
+    ok "Using pre-existing venv (skipping venv creation)"
 else
-    ok "Virtual environment already exists"
-fi
-
-# Enable system-site-packages so the venv inherits pre-installed torch
-PYVENV_CFG=".venv/pyvenv.cfg"
-if [ -f "$PYVENV_CFG" ]; then
-    if grep -q "include-system-site-packages" "$PYVENV_CFG"; then
-        sed -i 's/include-system-site-packages.*/include-system-site-packages = true/' "$PYVENV_CFG"
+    # Create venv using the system Python (which has torch pre-installed).
+    # uv venv doesn't have --system-site-packages, so we patch pyvenv.cfg after.
+    if [ ! -d ".venv" ]; then
+        # Use system Python (>= 3.12) rather than a specific version,
+        # so the venv matches the Python where torch is installed.
+        SYS_PY=$(python3 --version 2>/dev/null | grep -oP '\d+\.\d+' || echo "3.12")
+        info "Creating virtual environment (Python $SYS_PY)..."
+        uv venv --python "$SYS_PY" --seed
     else
-        echo "include-system-site-packages = true" >> "$PYVENV_CFG"
+        ok "Virtual environment already exists"
     fi
-    info "Enabled system-site-packages (inherit pre-installed PyTorch)"
+
+    # Enable system-site-packages so the venv inherits pre-installed torch
+    PYVENV_CFG=".venv/pyvenv.cfg"
+    if [ -f "$PYVENV_CFG" ]; then
+        if grep -q "include-system-site-packages" "$PYVENV_CFG"; then
+            sed -i 's/include-system-site-packages.*/include-system-site-packages = true/' "$PYVENV_CFG"
+        else
+            echo "include-system-site-packages = true" >> "$PYVENV_CFG"
+        fi
+        info "Enabled system-site-packages (inherit pre-installed PyTorch)"
+    fi
 fi
 
-# Install all dependencies (torch/torchvision are optional — use pre-installed)
+# Install all dependencies
 info "Installing Python dependencies..."
-uv sync
+if [ -n "$PREEXISTING_VENV" ]; then
+    # --inexact: keep pre-installed packages (torch, etc.) that aren't in pyproject.toml
+    uv sync --inexact
+else
+    # --extra cuda: install torch/torchvision from the CUDA index in pyproject.toml
+    uv sync --extra cuda
+fi
 
 ok "Python dependencies installed"
 echo
