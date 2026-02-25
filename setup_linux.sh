@@ -227,17 +227,19 @@ info "Step 6/6: Verifying installation..."
 ERRORS=0
 
 # Check C++ module loads (add build dirs to sys.path, same as train.py)
-if $RUN python -c "
+CPP_ERR=$($RUN python -c "
 import sys, os
-sys.path.insert(0, os.path.join('alphazero-cpp', 'build', 'Release'))
-sys.path.insert(0, os.path.join('alphazero-cpp', 'build'))
+sys.path.insert(0, os.path.join('$REPO_DIR', 'alphazero-cpp', 'build', 'Release'))
+sys.path.insert(0, os.path.join('$REPO_DIR', 'alphazero-cpp', 'build'))
 import alphazero_cpp
 print('  alphazero_cpp:', dir(alphazero_cpp)[:5], '...')
-" 2>/dev/null; then
+" 2>&1) && CPP_OK=true || CPP_OK=false
+if [ "$CPP_OK" = true ]; then
+    echo "$CPP_ERR"  # print the dir() output
     ok "alphazero_cpp module loads"
 else
-    warn "alphazero_cpp module failed to load"
-    warn "  Check that alphazero-cpp/build/ contains alphazero_cpp*.so"
+    warn "alphazero_cpp module failed to load:"
+    echo "$CPP_ERR" | sed 's/^/    /'
     ERRORS=$((ERRORS + 1))
 fi
 
