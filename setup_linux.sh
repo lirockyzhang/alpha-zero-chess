@@ -23,7 +23,7 @@ warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 fail()  { echo -e "${RED}[FAIL]${NC}  $*"; exit 1; }
 
 echo -e "${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║       AlphaZero Chess — Linux Setup                 ║${NC}"
+echo -e "${BOLD}║             AlphaZero Chess — Linux Setup            ║${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
 echo
 
