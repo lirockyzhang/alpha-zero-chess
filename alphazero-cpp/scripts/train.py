@@ -955,321 +955,7 @@ def run_selfplay_with_reanalysis(
     return selfplay_result, reanalysis_stats, reanalysis_tail_time
 
 
-def calibrate_cuda_graphs(
-    network: nn.Module,
-    device: str,
-    eval_batch: int,
-    warmup_iters: int = 5,
-    measure_iters: int = 20
-) -> dict:
-    """
-    Measure eager vs CUDA graph performance to determine optimal thresholds.
-
-    The crossover point where CUDA graph beats eager execution depends on:
-        Graph wins when: graph_replay_time < eager_overhead + per_sample × batch_size
-        Crossover batch: B = (graph_time - eager_overhead) / per_sample
-
-    For a graph of size G with actual batch B (B ≤ G), we pay for G samples but
-    only needed B — this is "padding waste". The calibration finds where graph
-    replay + padding is still cheaper than eager overhead.
-
-    Returns dict with:
-    - mini_graph_size: Size for mini graph (graph always wins at any fill)
-    - small_graph_size: Size for small graph (graph needs some fill to win)
-    - large_graph_threshold: Minimum batch to use large graph
-    - eager_overhead_ms: Fixed eager overhead
-    - eager_per_sample_ms: Per-sample eager cost
-    - measurements: Raw timing data for debugging
-    """
-    import statistics
-
-    if device != "cuda":
-        mini_graph_size = 64
-        small_graph_size = mini_graph_size * 2
-        medium_graph_size = max(small_graph_size + 1, eval_batch // 2)
-        return {
-            'mini_graph_size': mini_graph_size,
-            'small_graph_size': small_graph_size,
-            'medium_graph_size': medium_graph_size,
-            'large_graph_threshold': eval_batch * 7 // 8,
-            'mini_threshold': 0,
-            'small_threshold': mini_graph_size,
-            'medium_threshold': small_graph_size,
-            'eager_overhead_ms': 0.0,
-            'eager_per_sample_ms': 0.0,
-            'measurements': {},
-            'skipped': True
-        }
-
-    network.eval()
-    torch.cuda.synchronize()
-
-    # Test sizes: powers of 2, capped at eval_batch // 2.
-    # Eager is only used for batches below the large graph threshold,
-    # so testing at full eval_batch wastes calibration time.
-    half_batch = eval_batch // 2
-    test_sizes = [s for s in [8, 16, 32, 64, 128, 256, 512, 1024] if s <= half_batch]
-    if half_batch > 0 and half_batch not in test_sizes:
-        test_sizes.append(half_batch)
-    test_sizes = sorted(test_sizes)
-
-    print("  GPU warmup...", end=" ", flush=True)
-    # Extended warmup to reach thermal steady-state (~2 seconds of sustained load)
-    # This is critical: calibration on a "cold" GPU gives optimistic timings
-    warmup_obs = torch.zeros(eval_batch, INPUT_CHANNELS, 8, 8, device='cuda'
-                             ).to(memory_format=torch.channels_last)
-    warmup_mask = torch.zeros(eval_batch, POLICY_SIZE, device='cuda')
-    warmup_start = time.time()
-    warmup_count = 0
-    while time.time() - warmup_start < 2.0:  # 2 seconds of sustained inference
-        with torch.no_grad(), autocast('cuda'):
-            network(warmup_obs, warmup_mask)
-        warmup_count += 1
-    torch.cuda.synchronize()
-    print(f"done ({warmup_count} iters)")
-
-    # --- Measure eager execution times ---
-    # IMPORTANT: Start from numpy to match the real runtime path in neural_evaluator
-    # (lines ~1341-1342: torch.from_numpy(arr).float().to(device))
-    # This captures the CPU→GPU transfer cost that dominates for large batches.
-    print(f"  Measuring eager: ", end="", flush=True)
-    eager_times = {}  # size -> list of times in ms
-
-    for size in test_sizes:
-        obs_np = np.zeros((size, 8, 8, INPUT_CHANNELS), dtype=np.float32)  # NHWC
-        mask_np = np.zeros((size, POLICY_SIZE), dtype=np.float32)
-
-        # Warmup for this size (full pipeline: NHWC numpy → permute → channels_last GPU)
-        for _ in range(warmup_iters):
-            obs_t = torch.from_numpy(obs_np).permute(0, 3, 1, 2).float().to('cuda')
-            mask_t = torch.from_numpy(mask_np).float().to('cuda')
-            with torch.no_grad(), autocast('cuda'):
-                network(obs_t, mask_t)
-            torch.cuda.synchronize()
-
-        # Measure full pipeline (matches runtime eager path)
-        times = []
-        for _ in range(measure_iters):
-            torch.cuda.synchronize()
-            start = time.perf_counter()
-            obs_t = torch.from_numpy(obs_np).permute(0, 3, 1, 2).float().to('cuda')
-            mask_t = torch.from_numpy(mask_np).float().to('cuda')
-            with torch.no_grad(), autocast('cuda'):
-                network(obs_t, mask_t)
-            torch.cuda.synchronize()
-            times.append((time.perf_counter() - start) * 1000)
-
-        eager_times[size] = times
-        print(f"{size}", end="→" if size != test_sizes[-1] else "\n", flush=True)
-
-    # --- Fit linear model: eager_time = overhead + per_sample * batch_size ---
-    # Using least squares fit on median times for robustness
-    sizes = np.array(list(eager_times.keys()), dtype=np.float64)
-    medians = np.array([statistics.median(eager_times[s]) for s in eager_times.keys()], dtype=np.float64)
-
-    # Linear regression: y = a + b*x
-    # b = Cov(x,y) / Var(x), a = mean(y) - b * mean(x)
-    x_mean, y_mean = sizes.mean(), medians.mean()
-    cov_xy = ((sizes - x_mean) * (medians - y_mean)).sum()
-    var_x = ((sizes - x_mean) ** 2).sum()
-
-    if var_x > 0:
-        per_sample_ms = cov_xy / var_x
-        overhead_ms = y_mean - per_sample_ms * x_mean
-    else:
-        per_sample_ms = 0.0
-        overhead_ms = y_mean
-
-    # Calculate R² for fit quality
-    y_pred = overhead_ms + per_sample_ms * sizes
-    ss_res = ((medians - y_pred) ** 2).sum()
-    ss_tot = ((medians - y_mean) ** 2).sum()
-    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-
-    # Ensure non-negative values (sanity check)
-    overhead_ms = max(0.0, overhead_ms)
-    per_sample_ms = max(0.0, per_sample_ms)
-
-    # --- Measure CUDA graph times ---
-    # Benchmark from 16 upward to find the largest "always wins" size for mini graph.
-    # Also include eval_batch//2 (medium candidate) and eval_batch (large).
-    medium_graph_size_candidate = eval_batch // 2
-    graph_sizes = [s for s in [16, 32, 64, 128, medium_graph_size_candidate, eval_batch]
-                   if s <= eval_batch]
-    graph_sizes = sorted(set(graph_sizes))
-
-    print(f"  Measuring graphs: ", end="", flush=True)
-    graph_times = {}  # size -> median time in ms (including copy-in)
-
-    for size in graph_sizes:
-        try:
-            obs = torch.zeros(size, INPUT_CHANNELS, 8, 8, device='cuda'
-                             ).to(memory_format=torch.channels_last)
-            mask = torch.zeros(size, POLICY_SIZE, device='cuda')
-
-            # Warmup pass
-            with torch.no_grad(), autocast('cuda'):
-                network(obs, mask)
-
-            # Capture graph
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                with torch.no_grad(), autocast('cuda'):
-                    network(obs, mask)
-
-            # Prepare NHWC numpy source for copy-in measurement
-            # (matches runtime: permute NHWC→channels_last then copy_)
-            obs_np = np.zeros((size, 8, 8, INPUT_CHANNELS), dtype=np.float32)  # NHWC
-            mask_np = np.zeros((size, POLICY_SIZE), dtype=np.float32)
-
-            # Warmup replays with copy-in (permute is zero-cost metadata swap)
-            for _ in range(warmup_iters):
-                obs.copy_(torch.from_numpy(obs_np).permute(0, 3, 1, 2))
-                mask.copy_(torch.from_numpy(mask_np))
-                graph.replay()
-            torch.cuda.synchronize()
-
-            # Measure copy-in + replay (matches runtime graph paths)
-            times = []
-            for _ in range(measure_iters):
-                torch.cuda.synchronize()
-                start = time.perf_counter()
-                obs.copy_(torch.from_numpy(obs_np).permute(0, 3, 1, 2))
-                mask.copy_(torch.from_numpy(mask_np))
-                graph.replay()
-                torch.cuda.synchronize()
-                times.append((time.perf_counter() - start) * 1000)
-
-            graph_times[size] = statistics.median(times)
-            print(f"{size}", end="→" if size != graph_sizes[-1] else "\n", flush=True)
-
-            # Clean up graph to free memory
-            del graph, obs, mask
-            torch.cuda.empty_cache()
-
-        except Exception as e:
-            print(f"\n  Warning: Graph capture failed for size {size}: {e}")
-            continue
-
-    if not graph_times:
-        print("  Warning: No CUDA graphs captured, using defaults")
-        mini_graph_size = 64
-        small_graph_size = mini_graph_size * 2
-        medium_graph_size = max(small_graph_size + 1, eval_batch // 2)
-        return {
-            'mini_graph_size': mini_graph_size,
-            'small_graph_size': small_graph_size,
-            'medium_graph_size': medium_graph_size,
-            'large_graph_threshold': eval_batch * 7 // 8,
-            'mini_threshold': 0,
-            'small_threshold': mini_graph_size,
-            'medium_threshold': small_graph_size,
-            'eager_overhead_ms': overhead_ms,
-            'eager_per_sample_ms': per_sample_ms,
-            'measurements': {'eager': eager_times, 'graph': {}},
-            'failed': True
-        }
-
-    # --- Calculate crossovers and select optimal parameters ---
-    # Report measurement variance as coefficient of variation (CV = std/mean)
-    avg_cv = sum(statistics.stdev(t) / statistics.mean(t) for t in eager_times.values() if len(t) > 1) / len(eager_times)
-    reliability = "high" if avg_cv < 0.05 else "moderate" if avg_cv < 0.15 else "low"
-
-    print(f"\n  Eager: {overhead_ms:.1f}ms overhead + {per_sample_ms:.3f}ms/sample (R2={r_squared:.3f})")
-    print(f"  Measurement variance: {avg_cv*100:.1f}% CV ({reliability} reliability)")
-    print("  Graph crossovers:")
-
-    crossovers = {}  # size -> crossover batch
-    for size, graph_time in sorted(graph_times.items()):
-        if per_sample_ms > 0:
-            crossover = (graph_time - overhead_ms) / per_sample_ms
-        else:
-            crossover = 0 if graph_time < overhead_ms else float('inf')
-
-        crossovers[size] = crossover
-        fill_pct = (crossover / size * 100) if size > 0 else 0
-
-        # Explain what crossover means in practical terms
-        if crossover <= 0:
-            verdict = "graph always wins"
-        elif crossover >= size:
-            verdict = "graph never wins"
-        else:
-            verdict = f"graph wins at {fill_pct:.0f}%+ fill"
-
-        print(f"    Size {size:4d}: graph={graph_time:.1f}ms, crossover={crossover:.0f}, {verdict}")
-
-    # Select mini graph: largest measured size where graph always wins (crossover ≤ 0)
-    always_wins = [s for s, c in crossovers.items() if c <= 0]
-    if always_wins:
-        mini_graph_size = max(always_wins)
-        mini_quality = "graph always wins"
-    else:
-        # No size where graph always wins — use smallest measured size
-        mini_graph_size = min(graph_times.keys())
-        mini_quality = "no always-wins size, using smallest"
-
-    # Small = 2× mini (geometric doubling), capped at eval_batch
-    small_graph_size = min(mini_graph_size * 2, eval_batch)
-
-    # Medium = eval_batch // 2 (skip if it would overlap with small)
-    medium_graph_size = eval_batch // 2
-
-    # Compute crossover threshold for each tier
-    # crossover = minimum batch where graph(S) beats eager(B)
-    def get_threshold(size):
-        if size in crossovers:
-            return max(0, int(crossovers[size]))  # clamp to 0 (0 = graph always wins)
-        # If size wasn't benchmarked, interpolate from linear model
-        graph_est = overhead_ms + per_sample_ms * size  # rough estimate
-        return 0  # conservative: assume graph wins
-
-    mini_threshold = get_threshold(mini_graph_size)
-
-    # Small lower bound: max(mini_graph_size, crossover)
-    # Prevents batches <= mini_graph_size that fail mini_threshold from leaking into small
-    small_threshold = max(mini_graph_size, get_threshold(small_graph_size))
-
-    # Medium: min(7/8 * medium_graph_size, crossover) caps padding waste at 12.5%
-    # max(small_graph_size, ...) prevents batches <= small_graph_size from leaking in
-    if medium_graph_size > small_graph_size:
-        medium_crossover = get_threshold(medium_graph_size)
-        medium_threshold = max(small_graph_size, min(medium_graph_size * 7 // 8, medium_crossover))
-    else:
-        medium_threshold = 0
-
-    # Large: min(7/8 * eval_batch, crossover) — matches medium's pattern
-    # When medium is skipped, large must cover everything above small (no gap)
-    large_crossover = get_threshold(eval_batch)
-    if medium_graph_size > small_graph_size:
-        large_graph_threshold = max(medium_graph_size, min(eval_batch * 7 // 8, large_crossover))
-    else:
-        large_graph_threshold = max(small_graph_size, min(eval_batch * 7 // 8, large_crossover))
-
-    print(f"\n  Selected: mini={mini_graph_size} ({mini_quality})")
-    print(f"           small={small_graph_size} (2x mini, threshold={small_threshold})")
-    if medium_graph_size > small_graph_size:
-        print(f"           medium={medium_graph_size} (eval_batch//2, threshold={medium_threshold})")
-    print(f"           large_threshold={large_graph_threshold} (7/8 fill)")
-
-    return {
-        'mini_graph_size': mini_graph_size,
-        'small_graph_size': small_graph_size,
-        'medium_graph_size': medium_graph_size,
-        'large_graph_threshold': large_graph_threshold,
-        'mini_threshold': mini_threshold,
-        'small_threshold': small_threshold,
-        'medium_threshold': medium_threshold,
-        'eager_overhead_ms': overhead_ms,
-        'eager_per_sample_ms': per_sample_ms,
-        'r_squared': r_squared,
-        'avg_cv': avg_cv,
-        'measurements': {
-            'eager_medians': {s: statistics.median(t) for s, t in eager_times.items()},
-            'graph_medians': graph_times,
-            'crossovers': crossovers
-        }
-    }
+    # calibrate_cuda_graphs removed — fixed tier sizes eliminate startup latency
 
 
 def collect_hardware_stats(coordinator, batch_size_histogram, cuda_graph_stats, device):
@@ -1456,67 +1142,31 @@ def run_parallel_selfplay(
     # minimal CPU overhead. For fixed-batch-size inference, this eliminates
     # kernel launch overhead (~5-10ms savings per batch).
     #
-    # Strategy: Four CUDA graphs at geometric sizes + eager fallback:
-    # - Large graph at input_batch_size for high-throughput when batches are full
-    # - Medium graph at input_batch_size//2 for batches in the upper-mid range
-    # - Small graph at 128 for mid-range batches
-    # - Mini graph at 64 for small batches (graph always wins)
-    # - Eager fallback when batch is below crossover threshold for its tier
-    #
-    # All sizes are in input terms (before mirror doubling in forward()).
-    # Calibration measures eager vs graph performance to find optimal crossovers.
+    # Strategy: Four fixed CUDA graph tiers + eager fallback (no calibration):
+    # - Large graph at gpu_batch_size (100%), fires when batch > 7/8
+    # - Medium graph at 7/8 * gpu_batch_size, fires when batch > 6/8
+    # - Small graph at 256 (fixed), fires when batch <= 256
+    # - Mini graph at 128 (fixed), fires when batch <= 128
+    # - Eager fallback for batches between 256 and 6/8 * gpu_batch_size
 
     gpu_batch_size = args.input_batch_size
 
-    # Run calibration to determine optimal graph sizes and thresholds
-    def _use_default_calibration(gpu_batch_size):
-        """Return default CUDA graph tier sizes when calibration is skipped/failed."""
-        if gpu_batch_size <= 64:
-            mini = max(8, gpu_batch_size // 4)
-            small = max(mini + 1, gpu_batch_size // 2)
-            return mini, small, 0, small, 0, mini + 1, 0
-        else:
-            mini = 64
-            small = mini * 2
-            medium = max(small + 1, gpu_batch_size // 2)
-            return mini, small, medium, gpu_batch_size * 7 // 8, 0, mini, small
-
-    if device == "cuda" and args.workers > 1:
-        print("\nCalibrating CUDA graphs...")
-        calibration_start = time.time()
-        calibration = calibrate_cuda_graphs(network, device, args.input_batch_size)
-        calibration_time = time.time() - calibration_start
-
-        r_sq = calibration.get('r_squared', 0)
-        avg_cv = calibration.get('avg_cv', 1.0)
-
-        if r_sq < 0.5 or avg_cv > 0.15:
-            print(f"  WARNING: Low reliability (R²={r_sq:.3f}, CV={avg_cv*100:.1f}%), retrying in 15s...")
-            time.sleep(15)
-            calibration = calibrate_cuda_graphs(network, device, args.input_batch_size)
-            r_sq = calibration.get('r_squared', 0)
-            avg_cv = calibration.get('avg_cv', 1.0)
-
-        if r_sq < 0.5:
-            print(f"  Calibration unreliable after retry (R²={r_sq:.3f}), using defaults")
-            (mini_graph_size, small_graph_size, medium_graph_size,
-             *_unused) = _use_default_calibration(gpu_batch_size)
-        else:
-            mini_graph_size = calibration['mini_graph_size']
-            small_graph_size = calibration['small_graph_size']
-            medium_graph_size = calibration['medium_graph_size']
-            print(f"  Calibration completed in {calibration_time:.1f}s\n")
-    else:
-        (mini_graph_size, small_graph_size, medium_graph_size,
-         *_unused) = _use_default_calibration(gpu_batch_size)
-
-    # Large graph fires only when batch fills ≥75% of expected worker output.
-    # During end-of-iteration wind-down, batch sizes shrink below this
-    # threshold and fall through to the eager path (less padding waste).
-    large_graph_threshold = (args.workers * args.search_batch * 3) // 4
+    # Fixed tier sizes (no calibration needed)
+    mini_graph_size = 128
+    small_graph_size = 256
+    medium_graph_size = gpu_batch_size * 7 // 8
+    large_graph_threshold = gpu_batch_size * 7 // 8  # batches strictly above this use large
+    medium_threshold = gpu_batch_size * 6 // 8       # batches must exceed this to use medium
+    small_threshold = 0   # no lower bound for small/mini (dashboard compat)
     mini_threshold = 0
-    small_threshold = 0
-    medium_threshold = 0
+
+    # Guard: if gpu_batch_size is small, clamp tiers to avoid overlap
+    if medium_graph_size <= small_graph_size:
+        medium_graph_size = 0  # disable medium tier
+    if small_graph_size >= gpu_batch_size:
+        small_graph_size = gpu_batch_size // 2
+    if mini_graph_size >= small_graph_size:
+        mini_graph_size = small_graph_size // 2
 
     use_cuda_graph = (device == "cuda")
 
@@ -1528,7 +1178,7 @@ def run_parallel_selfplay(
     static_value_large = None
     static_wdl_large = None
 
-    # Medium graph (eval_batch // 2)
+    # Medium graph (7/8 * gpu_batch_size)
     cuda_graph_medium = None
     static_obs_medium = None
     static_mask_medium = None
@@ -1536,7 +1186,7 @@ def run_parallel_selfplay(
     static_value_medium = None
     static_wdl_medium = None
 
-    # Small graph (128)
+    # Small graph (256 fixed)
     cuda_graph_small = None
     static_obs_small = None
     static_mask_small = None
@@ -1544,7 +1194,7 @@ def run_parallel_selfplay(
     static_value_small = None
     static_wdl_small = None
 
-    # Mini graph (64 - smallest tier)
+    # Mini graph (128 fixed)
     cuda_graph_mini = None
     static_obs_mini = None
     static_mask_mini = None
@@ -1573,8 +1223,8 @@ def run_parallel_selfplay(
                 with autocast('cuda'):
                     static_policy_large, static_value_large, _spl, static_wdl_large = network(static_obs_large, static_mask_large)
 
-            # ===== Capture MEDIUM graph (eval_batch // 2) =====
-            # Skip if medium would overlap with small (e.g. eval_batch <= 256)
+            # ===== Capture MEDIUM graph (7/8 * gpu_batch_size) =====
+            # Skip if gpu_batch_size is too small for a separate medium tier
             if medium_graph_size > small_graph_size:
                 static_obs_medium = torch.zeros(medium_graph_size, INPUT_CHANNELS, 8, 8, device='cuda'
                                                 ).to(memory_format=torch.channels_last)
@@ -1627,8 +1277,13 @@ def run_parallel_selfplay(
 
             medium_str = f", medium={medium_graph_size}" if cuda_graph_medium is not None else ""
             print(f"  CUDA Graphs captured: large={gpu_batch_size}{medium_str}, small={small_graph_size}, mini={mini_graph_size}")
-            medium_route = f", <={medium_graph_size}->medium" if cuda_graph_medium is not None else ""
-            print(f"  Routing: <={mini_graph_size}->mini, <={small_graph_size}->small{medium_route}, >={large_graph_threshold}->large, else->eager")
+            if cuda_graph_medium is not None:
+                print(f"  Routing: <={mini_graph_size}->mini, <={small_graph_size}->small, "
+                      f">{medium_threshold}&<={medium_graph_size}->medium, "
+                      f">{large_graph_threshold}->large, else->eager")
+            else:
+                print(f"  Routing: <={mini_graph_size}->mini, <={small_graph_size}->small, "
+                      f">={large_graph_threshold}->large, else->eager")
             print(f"  Total buffer memory: {total_mem_mb:.1f} MB")
         except Exception as e:
             print(f"  CUDA Graph capture failed ({e}), falling back to eager mode")
@@ -1682,13 +1337,15 @@ def run_parallel_selfplay(
         if len(batch_size_histogram['samples']) < batch_size_histogram['sample_limit']:
             batch_size_histogram['samples'].append((time.time(), batch_size))
 
-        # Route batch to smallest CUDA graph that fits (no eager gap on CUDA).
-        # CUDA graph replay (~0.5ms) beats eager (~3-5ms) even with padding waste.
+        # Route batch to appropriate CUDA graph tier.
+        # Top 1/4 of batch sizes: large (100%) and medium (7/8).
+        # Small batches: small (256) and mini (128).
+        # Gap between 256 and 6/8 * gpu_batch_size: eager fallback.
         path_taken = 'eager'
         graph_size_used = 0
 
         if use_cuda_graph and batch_size <= mini_graph_size and cuda_graph_mini is not None:
-            # MINI GRAPH PATH: tightest fit for tiny batches
+            # MINI GRAPH PATH: batch <= 128
             path_taken = 'mini'
             graph_size_used = mini_graph_size
             cuda_graph_stats['mini_graph_fires'] += 1
@@ -1708,7 +1365,7 @@ def run_parallel_selfplay(
             wdl_logits = static_wdl_mini[:batch_size]
 
         elif use_cuda_graph and batch_size <= small_graph_size and cuda_graph_small is not None:
-            # SMALL GRAPH PATH: batch fits in small graph
+            # SMALL GRAPH PATH: batch <= 256
             path_taken = 'small'
             graph_size_used = small_graph_size
             cuda_graph_stats['small_graph_fires'] += 1
@@ -1726,28 +1383,8 @@ def run_parallel_selfplay(
             policies = static_policy_small[:batch_size]
             wdl_logits = static_wdl_small[:batch_size]
 
-        elif use_cuda_graph and batch_size <= medium_graph_size and cuda_graph_medium is not None:
-            # MEDIUM GRAPH PATH: mid-range batches
-            path_taken = 'medium'
-            graph_size_used = medium_graph_size
-            cuda_graph_stats['medium_graph_fires'] += 1
-
-            static_obs_medium[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]).permute(0, 3, 1, 2))
-            static_mask_medium[:batch_size].copy_(torch.from_numpy(mask_array[:batch_size]))
-            try:
-                cuda_graph_medium.replay()
-            except RuntimeError as e:
-                print(f"[ERROR] Medium CUDA graph replay failed: {e}", file=sys.stderr, flush=True)
-                print(f"[WARN] Disabling CUDA graphs — eager fallback for remainder of self-play", file=sys.stderr, flush=True)
-                use_cuda_graph = False
-                torch.cuda.empty_cache()
-                raise
-            policies = static_policy_medium[:batch_size]
-            wdl_logits = static_wdl_medium[:batch_size]
-
-        elif use_cuda_graph and cuda_graph_large is not None and batch_size >= large_graph_threshold:
-            # LARGE GRAPH PATH: only when batch fills ≥75% of expected worker output.
-            # C++ guarantees batch_size <= eval_batch (= gpu_batch_size)
+        elif use_cuda_graph and cuda_graph_large is not None and batch_size > large_graph_threshold:
+            # LARGE GRAPH PATH: batch > 7/8 of gpu_batch_size (top 1/8)
             path_taken = 'large'
             graph_size_used = gpu_batch_size
             cuda_graph_stats['large_graph_fires'] += 1
@@ -1765,8 +1402,27 @@ def run_parallel_selfplay(
             policies = static_policy_large[:batch_size]
             wdl_logits = static_wdl_large[:batch_size]
 
+        elif use_cuda_graph and cuda_graph_medium is not None and batch_size > medium_threshold:
+            # MEDIUM GRAPH PATH: 6/8 < batch <= 7/8 of gpu_batch_size
+            path_taken = 'medium'
+            graph_size_used = medium_graph_size
+            cuda_graph_stats['medium_graph_fires'] += 1
+
+            static_obs_medium[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]).permute(0, 3, 1, 2))
+            static_mask_medium[:batch_size].copy_(torch.from_numpy(mask_array[:batch_size]))
+            try:
+                cuda_graph_medium.replay()
+            except RuntimeError as e:
+                print(f"[ERROR] Medium CUDA graph replay failed: {e}", file=sys.stderr, flush=True)
+                print(f"[WARN] Disabling CUDA graphs — eager fallback for remainder of self-play", file=sys.stderr, flush=True)
+                use_cuda_graph = False
+                torch.cuda.empty_cache()
+                raise
+            policies = static_policy_medium[:batch_size]
+            wdl_logits = static_wdl_medium[:batch_size]
+
         else:
-            # EAGER PATH: batch > medium but < large threshold (wind-down only),
+            # EAGER PATH: batch between 256 and 6/8 * gpu_batch_size,
             # or CPU, or graph capture failed
             cuda_graph_stats['eager_fires'] += 1
             obs_tensor = torch.from_numpy(obs_array[:batch_size]).permute(0, 3, 1, 2).float().to(device)
