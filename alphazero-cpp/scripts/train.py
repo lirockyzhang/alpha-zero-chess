@@ -2301,7 +2301,7 @@ def train_iteration(
 
                 # Conditional target: 1 if win, 0 if loss (only for decisive samples)
                 decisive_mask = y_dec > 0.5  # (batch,) bool
-                cond_loss_full = torch.zeros_like(z_dec)
+                cond_loss_full = torch.zeros(z_dec.shape, device=z_dec.device, dtype=torch.float32)
                 if decisive_mask.any():
                     y_cond = outcome_wdl[:, 0][decisive_mask]  # 1 for win, 0 for loss
                     L_cond = F.binary_cross_entropy_with_logits(
@@ -2325,7 +2325,7 @@ def train_iteration(
                     p_dec = torch.sigmoid(z_dec.detach())
                     p_dec_correct = torch.where(y_dec > 0.5, p_dec, 1.0 - p_dec)
                     focal_w_dec = (1.0 - p_dec_correct) ** focal_gamma
-                    focal_w_cond = torch.ones_like(z_dec)
+                    focal_w_cond = torch.ones(z_dec.shape, device=z_dec.device, dtype=torch.float32)
                     if decisive_mask.any():
                         p_cond = torch.sigmoid(z_cond[decisive_mask].detach())
                         p_cond_correct = torch.where(y_cond > 0.5, p_cond, 1.0 - p_cond)
