@@ -226,11 +226,18 @@ info "Step 6/6: Verifying installation..."
 
 ERRORS=0
 
-# Check C++ module loads
-if $RUN python -c "import alphazero_cpp; print('  alphazero_cpp:', dir(alphazero_cpp)[:5], '...')" 2>/dev/null; then
+# Check C++ module loads (add build dirs to sys.path, same as train.py)
+if $RUN python -c "
+import sys, os
+sys.path.insert(0, os.path.join('alphazero-cpp', 'build', 'Release'))
+sys.path.insert(0, os.path.join('alphazero-cpp', 'build'))
+import alphazero_cpp
+print('  alphazero_cpp:', dir(alphazero_cpp)[:5], '...')
+" 2>/dev/null; then
     ok "alphazero_cpp module loads"
 else
-    warn "alphazero_cpp module failed to load (sys.path may need build/Release/)"
+    warn "alphazero_cpp module failed to load"
+    warn "  Check that alphazero-cpp/build/ contains alphazero_cpp*.so"
     ERRORS=$((ERRORS + 1))
 fi
 
