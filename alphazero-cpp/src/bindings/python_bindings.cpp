@@ -1190,6 +1190,47 @@ PYBIND11_MODULE(alphazero_cpp, m) {
         py::arg("batch_size"),
         "Sample a random batch of training data.\n"
         "Returns: (observations, policies, values, wdl_targets, soft_values)")
+        .def("sample_stratified", [](training::ReplayBuffer& self,
+                                      size_t batch_size, float alpha) {
+            std::vector<float> observations, policies, values, wdl_targets, soft_values;
+            std::vector<float> is_weights;
+
+            bool success = self.sample_stratified(
+                batch_size, alpha, observations, policies, values,
+                &wdl_targets, &soft_values, is_weights);
+            if (!success) {
+                throw std::runtime_error("Stratified sampling failed (not enough samples or empty buffer)");
+            }
+
+            constexpr size_t OBS_FLAT = encoding::PositionEncoder::TOTAL_SIZE;  // 7872
+            py::array_t<float> obs_array(std::vector<size_t>{batch_size, OBS_FLAT});
+            py::array_t<float> pol_array(std::vector<size_t>{batch_size, 4672UL});
+            py::array_t<float> val_array(std::vector<size_t>{batch_size});
+            py::array_t<float> wdl_array(std::vector<size_t>{batch_size, 3UL});
+            py::array_t<float> sv_array(std::vector<size_t>{batch_size});
+            py::array_t<float> wt_array(std::vector<size_t>{batch_size});
+
+            std::memcpy(obs_array.mutable_data(), observations.data(),
+                       batch_size * OBS_FLAT * sizeof(float));
+            std::memcpy(pol_array.mutable_data(), policies.data(),
+                       batch_size * 4672 * sizeof(float));
+            std::memcpy(val_array.mutable_data(), values.data(),
+                       batch_size * sizeof(float));
+            std::memcpy(wdl_array.mutable_data(), wdl_targets.data(),
+                       batch_size * 3 * sizeof(float));
+            std::memcpy(sv_array.mutable_data(), soft_values.data(),
+                       batch_size * sizeof(float));
+            std::memcpy(wt_array.mutable_data(), is_weights.data(),
+                       batch_size * sizeof(float));
+
+            return py::make_tuple(obs_array, pol_array, val_array, wdl_array,
+                                  sv_array, wt_array);
+        },
+        py::arg("batch_size"), py::arg("alpha") = 1.0f,
+        "Sample with outcome-stratified sampling and IS weights.\n"
+        "Samples equally from W/D/L outcome classes.\n"
+        "alpha: 0=uniform, 1=full stratification (default: 1.0)\n"
+        "Returns: (observations, policies, values, wdl_targets, soft_values, is_weights)")
         .def("size", &training::ReplayBuffer::size,
              "Get current number of samples in buffer")
         .def("capacity", &training::ReplayBuffer::capacity,

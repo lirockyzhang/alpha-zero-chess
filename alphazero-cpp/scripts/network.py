@@ -129,6 +129,33 @@ class ValueHead(nn.Module):
             return self.tanh(self.fc2(x))
 
 
+class FactoredValueHead(nn.Module):
+    """Factored value head (Proposition 9): decisiveness + conditional outcome.
+
+    Structural firewall against draw saturation:
+    - Decisiveness head: P(decisive) = sigmoid(z_dec)
+    - Conditional head: P(win|decisive) = sigmoid(z_cond)
+    - WDL reconstruction: w_D = 1-p_dec, w_W = p_dec*p_cond, w_L = p_dec*(1-p_cond)
+    """
+    def __init__(self, in_channels: int, num_filters: int = 1, hidden_size: int = 256):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, num_filters, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(num_filters)
+        self.relu = nn.ReLU(inplace=True)
+        self.fc_shared = nn.Linear(num_filters * 8 * 8, hidden_size)
+        # Two separate output heads from shared hidden
+        self.fc_dec = nn.Linear(hidden_size, 1)   # decisiveness logit
+        self.fc_cond = nn.Linear(hidden_size, 1)  # conditional W|dec logit
+
+    def forward(self, x):
+        x = self.relu(self.bn(self.conv(x)))
+        x = x.reshape(x.size(0), -1)
+        h = self.relu(self.fc_shared(x))
+        z_dec = self.fc_dec(h)     # (batch, 1)
+        z_cond = self.fc_cond(h)   # (batch, 1)
+        return z_dec, z_cond
+
+
 # =============================================================================
 # Horizontal Mirror Equivariance
 # =============================================================================
@@ -223,7 +250,8 @@ class AlphaZeroNet(nn.Module):
         value_filters: int = 1,
         value_hidden: int = 256,
         wdl: bool = True,
-        se_reduction: int = 16
+        se_reduction: int = 16,
+        factored_value: bool = False
     ):
         super().__init__()
         self.input_channels = input_channels
@@ -232,6 +260,9 @@ class AlphaZeroNet(nn.Module):
         self.num_actions = num_actions
         self.wdl = wdl
         self.se_reduction = se_reduction
+        self.factored_value = factored_value
+        self._last_z_dec = None   # Set by forward() when factored_value=True
+        self._last_z_cond = None  # Set by forward() when factored_value=True
 
         # Input convolution
         self.input_conv = ConvBlock(input_channels, num_filters)
@@ -243,7 +274,10 @@ class AlphaZeroNet(nn.Module):
 
         # Output heads
         self.policy_head = PolicyHead(num_filters, policy_filters, num_actions)
-        self.value_head = ValueHead(num_filters, value_filters, value_hidden, wdl=wdl)
+        if factored_value:
+            self.value_head = FactoredValueHead(num_filters, value_filters, value_hidden)
+        else:
+            self.value_head = ValueHead(num_filters, value_filters, value_hidden, wdl=wdl)
 
         # Policy mirror permutation for horizontal equivariance
         self.register_buffer('policy_mirror', _build_policy_mirror())
@@ -288,30 +322,43 @@ class AlphaZeroNet(nn.Module):
 
         # Both heads on doubled batch
         policy_logits_both = self.policy_head(trunk)  # (2B, 4672)
-        value_raw_both = self.value_head(trunk)        # (2B, 3)
+        value_raw_both = self.value_head(trunk)        # (2B, 3) or tuple of (2B, 1) for factored
 
-        # Split original / flipped
+        # Split original / flipped policy
         policy_orig, policy_flip = policy_logits_both[:B], policy_logits_both[B:]
-        value_orig, value_flip = value_raw_both[:B], value_raw_both[B:]
-
-        # Un-mirror flipped policy using precomputed permutation
         policy_flip_unmirrored = policy_flip[:, self.policy_mirror]
-
-        # Average for equivariant output
         policy_logits = (policy_orig + policy_flip_unmirrored) * 0.5
-        value_raw = (value_orig + value_flip) * 0.5
 
-        # Standard masking and output
         if mask is not None:
             policy_logits = policy_logits.masked_fill(mask == 0, -1e4)
-
         policy = F.softmax(policy_logits, dim=1)
 
-        if self.wdl:
+        if self.factored_value:
+            z_dec_both, z_cond_both = value_raw_both
+            z_dec_orig, z_dec_flip = z_dec_both[:B], z_dec_both[B:]
+            z_cond_orig, z_cond_flip = z_cond_both[:B], z_cond_both[B:]
+            z_dec = (z_dec_orig + z_dec_flip) * 0.5
+            z_cond = (z_cond_orig + z_cond_flip) * 0.5
+            p_dec = torch.sigmoid(z_dec)
+            p_cond = torch.sigmoid(z_cond)
+            w_W = p_dec * p_cond
+            w_D = 1.0 - p_dec
+            w_L = p_dec * (1.0 - p_cond)
+            eps = 1e-7
+            wdl_logits = torch.log(torch.cat([w_W, w_D, w_L], dim=1) + eps)
+            value = w_W - w_L
+            # Store for loss computation in train.py
+            self._last_z_dec = z_dec
+            self._last_z_cond = z_cond
+        elif self.wdl:
+            value_orig, value_flip = value_raw_both[:B], value_raw_both[B:]
+            value_raw = (value_orig + value_flip) * 0.5
             wdl_logits = value_raw
             wdl_probs = F.softmax(wdl_logits, dim=1)
             value = wdl_probs[:, 0:1] - wdl_probs[:, 2:3]
         else:
+            value_orig, value_flip = value_raw_both[:B], value_raw_both[B:]
+            value_raw = (value_orig + value_flip) * 0.5
             wdl_logits = None
             value = value_raw
 

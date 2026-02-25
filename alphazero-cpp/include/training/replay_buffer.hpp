@@ -284,6 +284,36 @@ public:
     );
 
     // ========================================================================
+    // Outcome-Stratified Sampling
+    // ========================================================================
+
+    /**
+     * Sample with outcome-stratified sampling and IS weights.
+     * Samples equally from W/D/L outcome classes regardless of buffer composition.
+     * Falls back to uniform sampling if any outcome class is empty.
+     *
+     * @param batch_size Number of samples to return
+     * @param alpha Stratification strength (0=uniform, 1=full stratification)
+     * @param observations Output: sampled observations
+     * @param policies Output: sampled policies
+     * @param values Output: sampled values
+     * @param wdl_targets Output: sampled WDL targets (nullable)
+     * @param soft_values Output: sampled soft values (nullable)
+     * @param out_is_weights Output: importance sampling weights
+     * @return true if successful
+     */
+    bool sample_stratified(
+        size_t batch_size,
+        float alpha,
+        std::vector<float>& observations,
+        std::vector<float>& policies,
+        std::vector<float>& values,
+        std::vector<float>* wdl_targets,
+        std::vector<float>* soft_values,
+        std::vector<float>& out_is_weights
+    );
+
+    // ========================================================================
     // FEN + History Hash Storage (for MCTS Reanalysis)
     // ========================================================================
 
@@ -424,6 +454,14 @@ private:
     float priority_exponent_{0.0f};             // alpha
     bool tree_needs_rebuild_{false};            // set by add_sample, cleared by sample_prioritized
     mutable std::mutex per_mutex_;              // protects sum_tree_ during sample + update
+
+    // Outcome-stratified sampling state
+    std::vector<size_t> win_indices_;
+    std::vector<size_t> draw_indices_;
+    std::vector<size_t> loss_indices_;
+    bool stratified_dirty_{true};
+    mutable std::mutex stratified_mutex_;
+    void rebuild_stratified_indices();
 };
 
 } // namespace training

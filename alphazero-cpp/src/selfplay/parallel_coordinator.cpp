@@ -147,6 +147,14 @@ void ParallelSelfPlayCoordinator::worker_thread_func(int worker_id) {
             // Play one game
             GameTrajectory trajectory = play_single_game(worker_id, node_pool);
 
+            // If shutdown was requested during the game, discard this
+            // potentially incomplete trajectory — it has wrong value labels
+            // (labeled DRAW when the game may have been winning/losing) and
+            // possibly truncated MCTS search results.
+            if (shutdown_.load(std::memory_order_acquire)) {
+                break;
+            }
+
             // Store sample game (prefer decisive games over draws)
             {
                 std::lock_guard<std::mutex> lock(sample_game_mutex_);
@@ -721,6 +729,24 @@ GameTrajectory ParallelSelfPlayCoordinator::play_single_game(
             break;  // No legal moves = game over (shouldn't reach here due to isGameOver check)
         }
 
+        // Validate selected move is actually legal (defensive check)
+        {
+            bool move_is_legal = false;
+            for (const auto& lm : legal_moves) {
+                if (lm == selected_move) {
+                    move_is_legal = true;
+                    break;
+                }
+            }
+            if (!move_is_legal) {
+                fprintf(stderr, "[BUG] Worker %d move %d: selected_move %s is NOT in legal_moves! FEN: %s\n",
+                        worker_id, move_count,
+                        chess::uci::moveToUci(selected_move).c_str(),
+                        board.getFen().c_str());
+                break;  // Abort game rather than record an illegal move
+            }
+        }
+
         // Update position history
         position_history.push_back(board);
         if (position_history.size() > 8) {
@@ -736,10 +762,21 @@ GameTrajectory ParallelSelfPlayCoordinator::play_single_game(
         stats_.worker_current_moves[worker_id].store(move_count, std::memory_order_relaxed);
     }
 
-    // Determine game result and reason
-    chess::GameResult result;
+    // Check if the game was interrupted by shutdown (not a natural game-over
+    // or max-moves exit).  Return early with an unlabeled trajectory so the
+    // caller can discard it — avoids polluting replay buffer and stats with
+    // positions mislabeled as draws.
     auto game_result = board.isGameOver();
     chess::GameResultReason reason = game_result.first;
+    bool game_completed = (reason != chess::GameResultReason::NONE) ||
+                          (move_count >= config_.max_moves_per_game);
+    if (!game_completed) {
+        // Game was interrupted by shutdown
+        return trajectory;
+    }
+
+    // Determine game result and reason
+    chess::GameResult result;
 
     if (reason == chess::GameResultReason::CHECKMATE) {
         // Side to move is checkmated, so they lost

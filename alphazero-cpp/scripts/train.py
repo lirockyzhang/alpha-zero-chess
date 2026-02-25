@@ -431,6 +431,79 @@ class MetricsTracker:
         print("\n" + "=" * 70)
 
 
+class CollapseMonitor:
+    """Monitor for value head collapse warning signs.
+
+    Tracks metrics over a sliding window and emits prominent log warnings.
+    Purely observational — no behavioral side effects.
+    """
+
+    def __init__(self, window: int = 3):
+        self.window = window
+        self.draw_rates: List[float] = []
+        self.rep_draw_rates: List[float] = []
+        self.value_losses: List[float] = []
+        self.avg_game_lengths: List[float] = []
+
+    def update(self, metrics: IterationMetrics, value_loss: float) -> List[str]:
+        """Update monitor with latest iteration metrics. Returns list of alert strings."""
+        total_games = metrics.white_wins + metrics.black_wins + metrics.draws
+        draw_rate = metrics.draws / total_games if total_games > 0 else 0.0
+        rep_draw_rate = metrics.draws_repetition / total_games if total_games > 0 else 0.0
+
+        self.draw_rates.append(draw_rate)
+        self.rep_draw_rates.append(rep_draw_rate)
+        self.value_losses.append(value_loss)
+        self.avg_game_lengths.append(metrics.avg_game_length)
+
+        alerts = []
+
+        # WARNING: draw rate > 60% for 3 consecutive iterations
+        if len(self.draw_rates) >= self.window:
+            recent_draws = self.draw_rates[-self.window:]
+            if all(d > 0.6 for d in recent_draws):
+                alerts.append(f"WARNING: Draw rate >{60}% for {self.window} consecutive iterations "
+                              f"(latest: {recent_draws[-1]:.1%})")
+
+        # CRITICAL: repetition draw rate > 30% for 3 iterations
+        if len(self.rep_draw_rates) >= self.window:
+            recent_rep = self.rep_draw_rates[-self.window:]
+            if all(r > 0.3 for r in recent_rep):
+                alerts.append(f"CRITICAL: Repetition draw rate >{30}% for {self.window} iterations "
+                              f"(latest: {recent_rep[-1]:.1%})")
+
+        # PLATEAU: value loss change < 2% over 5 iterations
+        plateau_window = 5
+        if len(self.value_losses) >= plateau_window:
+            recent_vl = self.value_losses[-plateau_window:]
+            max_vl, min_vl = max(recent_vl), min(recent_vl)
+            if max_vl > 0 and (max_vl - min_vl) / max_vl < 0.02:
+                alerts.append(f"PLATEAU: Value loss change <2% over {plateau_window} iterations "
+                              f"(range: {min_vl:.4f}-{max_vl:.4f})")
+
+        # COLLAPSE: avg game length < 40 for 3 iterations
+        if len(self.avg_game_lengths) >= self.window:
+            recent_gl = self.avg_game_lengths[-self.window:]
+            if all(gl < 40 for gl in recent_gl):
+                alerts.append(f"COLLAPSE: Avg game length <40 for {self.window} iterations "
+                              f"(latest: {recent_gl[-1]:.1f})")
+
+        # DANGER: compound signal — value_loss < 0.5 AND draw_rate > 60%
+        if value_loss < 0.5 and draw_rate > 0.6:
+            alerts.append(f"DANGER: value_loss={value_loss:.4f} (<0.5) AND "
+                          f"draw_rate={draw_rate:.1%} (>60%) — collapse imminent")
+
+        # Print alerts prominently
+        if alerts:
+            print(f"\n  {'!' * 66}")
+            print(f"  COLLAPSE MONITOR ALERTS (iteration {metrics.iteration}):")
+            for alert in alerts:
+                print(f"    [{alert}]")
+            print(f"  {'!' * 66}")
+
+        return alerts
+
+
 # =============================================================================
 # Run Directory and Resume Helpers
 # =============================================================================
@@ -674,13 +747,18 @@ def save_sample_game_pgn(run_dir: str, iteration: int, moves_uci: list,
         # Replay moves on a board to build the PGN game tree
         node = game
         board = chess.Board()
-        for uci_str in moves_uci:
+        for move_idx, uci_str in enumerate(moves_uci):
             move = chess.Move.from_uci(uci_str)
             if move in board.legal_moves:
                 node = node.add_variation(move)
                 board.push(move)
             else:
-                # Shouldn't happen, but be defensive
+                ply = move_idx + 1
+                move_num = (ply + 1) // 2
+                color = "White" if ply % 2 == 1 else "Black"
+                print(f"  [BUG] Illegal move in sample game at move {move_num} ({color}): "
+                      f"UCI={uci_str}, FEN={board.fen()}")
+                print(f"  [BUG] Full UCI sequence: {moves_uci}")
                 break
 
         # Save to file
@@ -1307,11 +1385,25 @@ def run_parallel_selfplay(
 
     risk_beta = args.risk_beta
 
+    # Adaptive simulation budget (Step 5): scale sims by buffer WDL entropy
+    effective_sims = args.simulations
+    if args.adaptive_sims and replay_buffer.size() > args.train_batch:
+        comp = replay_buffer.get_composition()
+        total_comp = comp['wins'] + comp['draws'] + comp['losses']
+        if total_comp > 0:
+            probs = [comp[k] / total_comp for k in ['wins', 'draws', 'losses']]
+            h = -sum(p * math.log(p) for p in probs if p > 0)
+            scale = max(0.25, h / args.entropy_target)
+            effective_sims = max(args.gumbel_top_k, int(args.simulations * scale))
+            if effective_sims != args.simulations:
+                print(f"  [Adaptive Sims] H={h:.3f}, target={args.entropy_target}, "
+                      f"scale={scale:.2f}, sims: {args.simulations} -> {effective_sims}")
+
     # Create parallel coordinator
     coordinator = alphazero_cpp.ParallelSelfPlayCoordinator(
         num_workers=args.workers,
         games_per_worker=games_per_worker,
-        num_simulations=args.simulations,
+        num_simulations=effective_sims,
         mcts_batch_size=args.search_batch,
         gpu_batch_size=args.input_batch_size,
         c_puct=args.c_explore,  # C++ binding kwarg stays c_puct
@@ -1582,6 +1674,7 @@ def run_parallel_selfplay(
     def neural_evaluator(obs_array: np.ndarray, mask_array: np.ndarray, batch_size: int,
                          out_policies: np.ndarray = None, out_values: np.ndarray = None):
         """Neural network evaluator callback for C++ coordinator."""
+        nonlocal use_cuda_graph  # Allow disabling CUDA graphs on runtime error
         infer_start = time.perf_counter()
 
         # Track batch size distribution for analysis
@@ -1603,7 +1696,14 @@ def run_parallel_selfplay(
             # permute is zero-copy metadata swap: NHWC → channels_last NCHW
             static_obs_mini[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]).permute(0, 3, 1, 2))
             static_mask_mini[:batch_size].copy_(torch.from_numpy(mask_array[:batch_size]))
-            cuda_graph_mini.replay()
+            try:
+                cuda_graph_mini.replay()
+            except RuntimeError as e:
+                print(f"[ERROR] Mini CUDA graph replay failed: {e}", file=sys.stderr, flush=True)
+                print(f"[WARN] Disabling CUDA graphs — eager fallback for remainder of self-play", file=sys.stderr, flush=True)
+                use_cuda_graph = False
+                torch.cuda.empty_cache()
+                raise  # C++ retry loop will re-enter; next call uses eager path
             policies = static_policy_mini[:batch_size]
             wdl_logits = static_wdl_mini[:batch_size]
 
@@ -1615,7 +1715,14 @@ def run_parallel_selfplay(
 
             static_obs_small[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]).permute(0, 3, 1, 2))
             static_mask_small[:batch_size].copy_(torch.from_numpy(mask_array[:batch_size]))
-            cuda_graph_small.replay()
+            try:
+                cuda_graph_small.replay()
+            except RuntimeError as e:
+                print(f"[ERROR] Small CUDA graph replay failed: {e}", file=sys.stderr, flush=True)
+                print(f"[WARN] Disabling CUDA graphs — eager fallback for remainder of self-play", file=sys.stderr, flush=True)
+                use_cuda_graph = False
+                torch.cuda.empty_cache()
+                raise
             policies = static_policy_small[:batch_size]
             wdl_logits = static_wdl_small[:batch_size]
 
@@ -1627,7 +1734,14 @@ def run_parallel_selfplay(
 
             static_obs_medium[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]).permute(0, 3, 1, 2))
             static_mask_medium[:batch_size].copy_(torch.from_numpy(mask_array[:batch_size]))
-            cuda_graph_medium.replay()
+            try:
+                cuda_graph_medium.replay()
+            except RuntimeError as e:
+                print(f"[ERROR] Medium CUDA graph replay failed: {e}", file=sys.stderr, flush=True)
+                print(f"[WARN] Disabling CUDA graphs — eager fallback for remainder of self-play", file=sys.stderr, flush=True)
+                use_cuda_graph = False
+                torch.cuda.empty_cache()
+                raise
             policies = static_policy_medium[:batch_size]
             wdl_logits = static_wdl_medium[:batch_size]
 
@@ -1640,7 +1754,14 @@ def run_parallel_selfplay(
 
             static_obs_large[:batch_size].copy_(torch.from_numpy(obs_array[:batch_size]).permute(0, 3, 1, 2))
             static_mask_large[:batch_size].copy_(torch.from_numpy(mask_array[:batch_size]))
-            cuda_graph_large.replay()
+            try:
+                cuda_graph_large.replay()
+            except RuntimeError as e:
+                print(f"[ERROR] Large CUDA graph replay failed: {e}", file=sys.stderr, flush=True)
+                print(f"[WARN] Disabling CUDA graphs — eager fallback for remainder of self-play", file=sys.stderr, flush=True)
+                use_cuda_graph = False
+                torch.cuda.empty_cache()
+                raise
             policies = static_policy_large[:batch_size]
             wdl_logits = static_wdl_large[:batch_size]
 
@@ -2083,12 +2204,24 @@ def train_iteration(
     scaler: GradScaler,
     per_beta: float = 0.0,
     progress_callback=None,
+    entropy_reg: float = 0.0,
+    focal_gamma: float = 0.0,
+    factored_value_head: bool = False,
+    stratified_sampling: bool = False,
+    stratified_alpha: float = 1.0,
 ) -> dict:
     """Train for one iteration using C++ ReplayBuffer.
 
     When PER is enabled (replay_buffer.per_enabled() and per_beta > 0),
     uses prioritized sampling with IS weight correction and updates
     priorities after each gradient step.
+
+    Collapse prevention mechanisms (all disabled by default):
+    - entropy_reg: WDL entropy regularization coefficient (Step 1)
+    - focal_gamma: Focal loss exponent for hard-sample focus (Step 6)
+    - factored_value_head: Use factored binary CE loss (Step 7)
+    - stratified_sampling: Sample equally from W/D/L classes (Step 4)
+    - stratified_alpha: Stratification strength 0-1 (Step 4)
     """
     network.train()
 
@@ -2110,13 +2243,20 @@ def train_iteration(
     total_grad_norm = 0.0
     max_grad_norm = 0.0
     nan_skip_count = 0
+    total_wdl_entropy = 0.0
+    total_focal_weight = 0.0
 
     for epoch in range(epochs):
         # Sample batch from C++ ReplayBuffer
         indices = None
+        is_weights_tensor = None
         if use_per:
             obs, policies, values, wdl_targets, soft_values, indices, is_weights = \
                 replay_buffer.sample_prioritized(batch_size, per_beta)
+            is_weights_tensor = torch.from_numpy(is_weights).to(device)
+        elif stratified_sampling:
+            obs, policies, values, wdl_targets, soft_values, is_weights = \
+                replay_buffer.sample_stratified(batch_size, stratified_alpha)
             is_weights_tensor = torch.from_numpy(is_weights).to(device)
         else:
             obs, policies, values, wdl_targets, soft_values = replay_buffer.sample(batch_size)
@@ -2142,29 +2282,94 @@ def train_iteration(
                 dim=1
             )
 
-            # Value loss: soft WDL cross-entropy with pure game outcome targets
-            # Build outcome WDL from scalar game result: win→[1,0,0], draw→[0,1,0], loss→[0,0,1]
+            # Value loss: build outcome WDL from scalar game result
+            # win→[1,0,0], draw→[0,1,0], loss→[0,0,1]
             outcome_wdl = torch.zeros_like(mcts_wdl_target)  # (batch, 3)
             outcome_wdl[:, 0] = (value_target > 0.5).float()    # win
             outcome_wdl[:, 1] = ((value_target >= -0.5) & (value_target <= 0.5)).float()  # draw
             outcome_wdl[:, 2] = (value_target < -0.5).float()   # loss
 
-            # Per-sample value loss: NaN-safe — shape (batch,)
-            per_sample_value = -torch.sum(
-                torch.nan_to_num(outcome_wdl * F.log_softmax(wdl_logits, dim=1), nan=0.0),
-                dim=1
-            )
+            # ── Phase 1: Base value loss ────────────────────────────────
+            if factored_value_head:
+                # Factored head: two separate binary CE losses (Proposition 9)
+                z_dec = network._last_z_dec.squeeze(1)     # (batch,)
+                z_cond = network._last_z_cond.squeeze(1)   # (batch,)
 
-            # Per-sample total loss — shape (batch,)
+                # Decisiveness target: 1 if win or loss, 0 if draw
+                y_dec = outcome_wdl[:, 0] + outcome_wdl[:, 2]  # (batch,)
+                L_dec = F.binary_cross_entropy_with_logits(z_dec, y_dec, reduction='none')
+
+                # Conditional target: 1 if win, 0 if loss (only for decisive samples)
+                decisive_mask = y_dec > 0.5  # (batch,) bool
+                cond_loss_full = torch.zeros_like(z_dec)
+                if decisive_mask.any():
+                    y_cond = outcome_wdl[:, 0][decisive_mask]  # 1 for win, 0 for loss
+                    L_cond = F.binary_cross_entropy_with_logits(
+                        z_cond[decisive_mask], y_cond, reduction='none')
+                    cond_loss_full[decisive_mask] = L_cond
+
+                per_sample_value = L_dec + cond_loss_full
+            else:
+                # Standard: WDL soft cross-entropy — shape (batch,)
+                per_sample_value = -torch.sum(
+                    torch.nan_to_num(outcome_wdl * F.log_softmax(wdl_logits, dim=1), nan=0.0),
+                    dim=1
+                )
+
+            # ── Phase 2: Focal modulation (Step 6) ──────────────────────
+            # Applied BEFORE entropy reg so focal doesn't modulate the entropy term
+            batch_focal_weight = 1.0
+            if focal_gamma > 0.0:
+                if factored_value_head:
+                    # Per-head focal weights for factored head
+                    p_dec = torch.sigmoid(z_dec.detach())
+                    p_dec_correct = torch.where(y_dec > 0.5, p_dec, 1.0 - p_dec)
+                    focal_w_dec = (1.0 - p_dec_correct) ** focal_gamma
+                    focal_w_cond = torch.ones_like(z_dec)
+                    if decisive_mask.any():
+                        p_cond = torch.sigmoid(z_cond[decisive_mask].detach())
+                        p_cond_correct = torch.where(y_cond > 0.5, p_cond, 1.0 - p_cond)
+                        focal_w_cond[decisive_mask] = (1.0 - p_cond_correct) ** focal_gamma
+                    per_sample_value = focal_w_dec * L_dec + focal_w_cond * cond_loss_full
+                    batch_focal_weight = focal_w_dec.mean().item()
+                else:
+                    wdl_probs_focal = F.softmax(wdl_logits.float(), dim=1)
+                    p_correct = torch.sum(outcome_wdl * wdl_probs_focal, dim=1)
+                    focal_weight = (1.0 - p_correct.detach()) ** focal_gamma
+                    per_sample_value = focal_weight * per_sample_value
+                    batch_focal_weight = focal_weight.mean().item()
+
+            # ── Phase 3: Entropy regularization (Step 1) ────────────────
+            # Applied AFTER focal so the entropy bonus is not modulated
+            batch_entropy = 0.0
+            if entropy_reg > 0.0:
+                if factored_value_head:
+                    # Entropy from reconstructed WDL probs
+                    p_dec_ent = torch.sigmoid(z_dec)
+                    p_cond_ent = torch.sigmoid(z_cond)
+                    w_W = p_dec_ent * p_cond_ent
+                    w_D = 1.0 - p_dec_ent
+                    w_L = p_dec_ent * (1.0 - p_cond_ent)
+                    wdl_recon = torch.stack([w_W, w_D, w_L], dim=1)
+                    per_sample_entropy = -torch.sum(
+                        wdl_recon * torch.log(wdl_recon + 1e-7), dim=1)
+                else:
+                    # Entropy from softmax of WDL logits (float for AMP precision)
+                    wdl_probs = F.softmax(wdl_logits.float(), dim=1)
+                    wdl_log_probs = F.log_softmax(wdl_logits.float(), dim=1)
+                    per_sample_entropy = -torch.sum(wdl_probs * wdl_log_probs, dim=1)
+                per_sample_value = per_sample_value - entropy_reg * per_sample_entropy
+                batch_entropy = per_sample_entropy.mean().item()
+
+            # ── Phase 4: Combine and apply IS weights (Step 4) ──────────
             per_sample_total = per_sample_policy + per_sample_value
 
-            # Compute weighted or unweighted loss for backprop
-            if use_per:
+            if is_weights_tensor is not None:
                 loss = torch.mean(is_weights_tensor * per_sample_total)
             else:
                 loss = torch.mean(per_sample_total)
 
-            # Unweighted means for logging (comparable regardless of PER)
+            # Unweighted means for logging (comparable regardless of PER/stratified)
             policy_loss = per_sample_policy.mean()
             value_loss = per_sample_value.mean()
 
@@ -2201,6 +2406,8 @@ def train_iteration(
         total_loss += loss.item()
         total_policy_loss += policy_loss.item()
         total_value_loss += value_loss.item()
+        total_wdl_entropy += batch_entropy
+        total_focal_weight += batch_focal_weight
         num_batches += 1
 
         # Per-epoch progress callback for live dashboard
@@ -2234,6 +2441,8 @@ def train_iteration(
         'grad_norm_avg': total_grad_norm / num_batches,
         'grad_norm_max': max_grad_norm,
         'nan_skip_count': nan_skip_count,
+        'wdl_entropy': total_wdl_entropy / num_batches if num_batches > 0 else 0.0,
+        'focal_mean_weight': total_focal_weight / num_batches if num_batches > 0 else 1.0,
     }
     return result
 
@@ -2354,6 +2563,30 @@ Examples:
                         help="PER IS correction beta (default: 0.4). "
                              "0=no correction, 1=full correction. See operation manual Section 10q.")
 
+    # Value Head Collapse Prevention
+    parser.add_argument("--entropy-reg", type=float, default=0.0,
+                        help="WDL entropy regularization coefficient (default: 0.0 = disabled). "
+                             "Penalizes low-entropy WDL predictions to prevent draw collapse. "
+                             "Recommended: 0.05-0.2.")
+    parser.add_argument("--focal-gamma", type=float, default=0.0,
+                        help="Focal loss exponent for WDL value loss (default: 0.0 = standard CE). "
+                             "Downweights confident-correct samples. Recommended: 1.0-2.0.")
+    parser.add_argument("--dynamic-epochs", action="store_true", default=False,
+                        help="Automatically reduce training epochs when draws dominate buffer")
+    parser.add_argument("--draw-target", type=float, default=0.5,
+                        help="Target draw fraction for --dynamic-epochs (default: 0.5)")
+    parser.add_argument("--stratified-sampling", action="store_true", default=False,
+                        help="Sample equally from W/D/L outcome classes (mutually exclusive with PER)")
+    parser.add_argument("--stratified-alpha", type=float, default=1.0,
+                        help="Stratification strength 0=uniform, 1=full (default: 1.0)")
+    parser.add_argument("--adaptive-sims", action="store_true", default=False,
+                        help="Scale simulation count by buffer WDL entropy")
+    parser.add_argument("--entropy-target", type=float, default=0.8,
+                        help="Target WDL entropy in nats for --adaptive-sims (default: 0.8, max=ln(3)≈1.099)")
+    parser.add_argument("--factored-value-head", action="store_true", default=False,
+                        help="Use factored value head (decisiveness + conditional). "
+                             "Incompatible with standard WDL checkpoints (starts fresh).")
+
     # Device and paths
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device: cuda or cpu (default: cuda)")
@@ -2394,6 +2627,11 @@ Examples:
     # Validate --workers minimum
     if args.workers < 2:
         parser.error("--workers must be >= 2 (sequential self-play has been removed)")
+
+    # Validate: stratified sampling and PER are mutually exclusive
+    if args.stratified_sampling and args.priority_exponent > 0:
+        parser.error("--stratified-sampling and --priority-exponent are mutually exclusive "
+                     "(both modify the sampling distribution)")
 
     # Derive search_batch from search algorithm (no longer user-facing)
     if args.search_algorithm == "gumbel":
@@ -2519,6 +2757,15 @@ Examples:
         "workers": args.workers,
         "train_batch": args.train_batch,
         "epochs": args.epochs,
+        "entropy_reg": args.entropy_reg,
+        "focal_gamma": args.focal_gamma,
+        "dynamic_epochs": args.dynamic_epochs,
+        "draw_target": args.draw_target,
+        "stratified_sampling": args.stratified_sampling,
+        "stratified_alpha": args.stratified_alpha,
+        "adaptive_sims": args.adaptive_sims,
+        "entropy_target": args.entropy_target,
+        "factored_value_head": args.factored_value_head,
     }
 
     # Write config record for new runs (resume already has one)
@@ -2542,9 +2789,24 @@ Examples:
           f"eval_batch={args.eval_batch} GPU-effective, input={args.input_batch_size})")
     print(f"Training:            {args.iterations} iters x {args.games_per_iter} games")
     print(f"                     train_batch={args.train_batch}, lr={args.lr}, epochs={args.epochs}")
-    print(f"Value head:          WDL (soft cross-entropy), risk_beta={args.risk_beta}")
+    head_type = "Factored (decisiveness + conditional)" if args.factored_value_head else "WDL (soft cross-entropy)"
+    print(f"Value head:          {head_type}, risk_beta={args.risk_beta}")
     if args.opponent_risk:
         print(f"Opponent risk:       {args.opponent_risk}")
+    # Collapse prevention mechanisms
+    collapse_flags = []
+    if args.entropy_reg > 0:
+        collapse_flags.append(f"entropy_reg={args.entropy_reg}")
+    if args.focal_gamma > 0:
+        collapse_flags.append(f"focal_gamma={args.focal_gamma}")
+    if args.dynamic_epochs:
+        collapse_flags.append(f"dynamic_epochs(target={args.draw_target})")
+    if args.stratified_sampling:
+        collapse_flags.append(f"stratified(alpha={args.stratified_alpha})")
+    if args.adaptive_sims:
+        collapse_flags.append(f"adaptive_sims(target={args.entropy_target})")
+    if collapse_flags:
+        print(f"Collapse prevention: {', '.join(collapse_flags)}")
     print(f"Buffer:              {args.buffer_size} positions")
     if args.priority_exponent > 0:
         print(f"PER:                 alpha={args.priority_exponent:g}, beta={args.per_beta:g}")
@@ -2556,7 +2818,8 @@ Examples:
     # Create network
     network = AlphaZeroNet(num_filters=args.filters, num_blocks=args.blocks,
                            input_channels=INPUT_CHANNELS, wdl=True,
-                           se_reduction=args.se_reduction)
+                           se_reduction=args.se_reduction,
+                           factored_value=args.factored_value_head)
     network = network.to(device)
     if device == "cuda":
         network = network.to(memory_format=torch.channels_last)
@@ -2623,10 +2886,25 @@ Examples:
             state_dict['value_head.fc2.bias'] = new_b
             print("migrated scalar→WDL...", end=" ", flush=True)
 
-        network.load_state_dict(state_dict)
+        # Handle factored value head checkpoint compatibility
+        ckpt_factored = checkpoint.get('config', {}).get('factored_value_head', False)
+        if args.factored_value_head and not ckpt_factored:
+            # Loading standard WDL checkpoint into factored model — skip value head weights
+            print("migrating standard→factored value head (random init)...", end=" ", flush=True)
+            state_dict = {k: v for k, v in state_dict.items()
+                          if not k.startswith('value_head.')}
+            network.load_state_dict(state_dict, strict=False)
+        elif not args.factored_value_head and ckpt_factored:
+            # Loading factored checkpoint into standard model — skip value head weights
+            print("migrating factored→standard value head (random init)...", end=" ", flush=True)
+            state_dict = {k: v for k, v in state_dict.items()
+                          if not k.startswith('value_head.')}
+            network.load_state_dict(state_dict, strict=False)
+        else:
+            network.load_state_dict(state_dict)
         print("done", flush=True)
-        if not ckpt_wdl:
-            print("  Skipping optimizer state (incompatible after scalar→WDL migration)")
+        if not ckpt_wdl or (args.factored_value_head != ckpt_factored):
+            print("  Skipping optimizer state (incompatible after value head migration)")
         else:
             print("  Loading optimizer state...", end=" ", flush=True)
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -2677,6 +2955,7 @@ Examples:
     # Metrics tracker (for console output)
     print("Initializing metrics tracker...", end=" ", flush=True)
     metrics_tracker = MetricsTracker()
+    collapse_monitor = CollapseMonitor()
     print("done", flush=True)
 
     # Live dashboard (optional - real-time web server)
@@ -2882,6 +3161,7 @@ Examples:
                 'simulations': args.simulations,
                 'wdl': True,
                 'se_reduction': args.se_reduction,
+                'factored_value_head': args.factored_value_head,
             },
             'backend': 'cpp',
             'version': '2.0',
@@ -2986,6 +3266,7 @@ Examples:
                 'simulations': args.simulations,
                 'wdl': True,
                 'se_reduction': args.se_reduction,
+                'factored_value_head': args.factored_value_head,
             },
             'backend': 'cpp',
             'version': '2.0'
@@ -3029,48 +3310,9 @@ Examples:
                 'phase': phase_label,
             })
 
-        def check_export_request():
-            if live_dashboard is None:
-                return
-            if not live_dashboard.poll_export_request():
-                return
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"model_export_iter{iteration + 1:03d}_{timestamp}.pt"
-            export_path = os.path.join(run_dir, filename)
-            try:
-                safe_torch_save({
-                    'iteration': iteration + 1,
-                    'model_state_dict': network.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'config': {
-                        'input_channels': INPUT_CHANNELS,
-                        'num_filters': args.filters,
-                        'num_blocks': args.blocks,
-                        'num_actions': POLICY_SIZE,
-                        'policy_filters': 2,
-                        'value_filters': 1,
-                        'value_hidden': 256,
-                        'simulations': args.simulations,
-                        'wdl': True,
-                        'se_reduction': args.se_reduction,
-                    },
-                    'backend': 'cpp',
-                    'version': '2.0'
-                }, export_path)
-                print(f"  [Export] Saved: {export_path}")
-                live_dashboard.socketio.emit('export_complete', {
-                    'status': 'saved', 'filename': filename
-                })
-            except Exception as e:
-                print(f"  [Export] FAILED: {e}")
-                live_dashboard.socketio.emit('export_complete', {
-                    'status': 'error', 'error': str(e)
-                })
-
         log_current_settings()
         poll_control_file('self-play')
         apply_dashboard_updates('self-play')
-        check_export_request()
 
         # Per-iteration risk_beta sampling from Laplace distribution
         if args.risk_beta_random:
@@ -3242,6 +3484,10 @@ Examples:
             print(f"  Sample Game: {result} in {n_moves} moves{reason_str}")
             print(f"    Moves: {move_str}")
 
+        # Defaults for training metrics (may be overwritten in training phase)
+        train_metrics = {}
+        effective_epochs = args.epochs
+
         # Create selfplay_done safety lock (before training begins)
         selfplay_done_path = None
         if claude_iface is not None and args.claude_timeout > 0:
@@ -3266,7 +3512,20 @@ Examples:
                 print("  Skipping training (buffer empty)")
             else:
                 comp = replay_buffer.get_composition()
-                print(f"  Training: {args.epochs} epochs on {total_buf} positions "
+
+                # Dynamic epochs (Step 2): reduce epochs when draws dominate
+                effective_epochs = args.epochs
+                if args.dynamic_epochs:
+                    total_comp = comp['wins'] + comp['draws'] + comp['losses']
+                    if total_comp > 0:
+                        draw_frac = comp['draws'] / total_comp
+                        ratio = (1.0 - draw_frac) / (1.0 - args.draw_target)
+                        effective_epochs = max(1, int(args.epochs * ratio))
+                        if effective_epochs != args.epochs:
+                            print(f"  [Dynamic Epochs] draw_frac={draw_frac:.2%}, "
+                                  f"epochs: {args.epochs} -> {effective_epochs}")
+
+                print(f"  Training: {effective_epochs} epochs on {total_buf} positions "
                       f"(W={comp['wins']} D={comp['draws']} L={comp['losses']})...")
 
                 # Update live dashboard to show training phase
@@ -3285,7 +3544,6 @@ Examples:
 
                 poll_control_file('training')
                 apply_dashboard_updates('training')
-                check_export_request()
 
                 train_start = time.time()
 
@@ -3317,9 +3575,14 @@ Examples:
 
                 train_metrics = train_iteration(
                     network, optimizer, replay_buffer,
-                    args.train_batch, args.epochs, device, scaler,
+                    args.train_batch, effective_epochs, device, scaler,
                     per_beta=current_per_beta,
                     progress_callback=train_progress_cb,
+                    entropy_reg=args.entropy_reg,
+                    focal_gamma=args.focal_gamma,
+                    factored_value_head=args.factored_value_head,
+                    stratified_sampling=args.stratified_sampling,
+                    stratified_alpha=args.stratified_alpha,
                 )
 
                 metrics.train_time = time.time() - train_start
@@ -3345,11 +3608,14 @@ Examples:
 
         metrics.buffer_size = get_total_buffer_size()
         metrics.total_time = time.time() - iter_start
-        check_export_request()
 
         # Track metrics for console output
         metrics_tracker.add_iteration(metrics)
         metrics_tracker.print_iteration_summary(metrics, args)
+
+        # Collapse monitor alerts (Step 3)
+        collapse_alerts = collapse_monitor.update(
+            metrics, train_metrics.get('value_loss', 0.0))
 
         # Append iteration record to JSONL (crash-safe, no in-memory dict)
         record = {
@@ -3390,6 +3656,11 @@ Examples:
             "reanalysis_positions": metrics.reanalysis_positions,
             "reanalysis_time_s": metrics.reanalysis_time_s,
             "reanalysis_mean_kl": metrics.reanalysis_mean_kl,
+            # Collapse prevention metrics
+            "wdl_entropy": train_metrics.get('wdl_entropy', 0.0),
+            "focal_mean_weight": train_metrics.get('focal_mean_weight', 1.0),
+            "effective_epochs": effective_epochs,
+            "collapse_alerts": collapse_alerts,
         }
         # Merge hardware/performance stats (empty dict in sequential mode)
         record.update(hw_stats)
@@ -3426,6 +3697,7 @@ Examples:
                     'simulations': args.simulations,
                     'wdl': True,
                     'se_reduction': args.se_reduction,
+                    'factored_value_head': args.factored_value_head,
                 },
                 'backend': 'cpp',
                 'version': '2.0'

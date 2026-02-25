@@ -184,6 +184,8 @@ void ReplayBuffer::add_sample(
         tree_needs_rebuild_ = true;
     }
 
+    stratified_dirty_ = true;
+
     // Update statistics (simple fetch_add, no CAS contention)
     // NOTE: current_size_ ELIMINATED - size() computes min(total_added, capacity)
     total_added_.value.fetch_add(1, std::memory_order_release);
@@ -236,6 +238,8 @@ void ReplayBuffer::add_batch(
     }
 
     total_games_.value.fetch_add(1, std::memory_order_relaxed);
+
+    stratified_dirty_ = true;
 }
 
 void ReplayBuffer::add_batch_raw(
@@ -286,6 +290,8 @@ void ReplayBuffer::add_batch_raw(
             sum_tree_->set_leaf(pos, max_p);
             tree_needs_rebuild_ = true;
         }
+
+        stratified_dirty_ = true;
 
         // Update statistics (no CAS!)
         total_added_.value.fetch_add(1, std::memory_order_release);
@@ -383,6 +389,9 @@ void ReplayBuffer::clear() {
         sum_tree_->clear();
         tree_needs_rebuild_ = false;
     }
+
+    // Invalidate stratified index cache
+    stratified_dirty_ = true;
 }
 
 ReplayBuffer::Composition ReplayBuffer::get_composition() const {
@@ -611,6 +620,160 @@ void ReplayBuffer::update_priorities(
         float p = std::pow(priorities[i], priority_exponent_);
         sum_tree_->update(indices[i], p);
     }
+}
+
+// ============================================================================
+// Outcome-Stratified Sampling
+// ============================================================================
+
+void ReplayBuffer::rebuild_stratified_indices() {
+    win_indices_.clear();
+    draw_indices_.clear();
+    loss_indices_.clear();
+
+    size_t current = size();
+    for (size_t i = 0; i < current; ++i) {
+        uint8_t r = metadata_[i].game_result;
+        if (r == 0) win_indices_.push_back(i);
+        else if (r == 1) draw_indices_.push_back(i);
+        else if (r == 2) loss_indices_.push_back(i);
+        // r == 0xFF (sentinel) is skipped
+    }
+    stratified_dirty_ = false;
+}
+
+bool ReplayBuffer::sample_stratified(
+    size_t batch_size,
+    float alpha,
+    std::vector<float>& observations,
+    std::vector<float>& policies,
+    std::vector<float>& values,
+    std::vector<float>* wdl_targets,
+    std::vector<float>* soft_values,
+    std::vector<float>& out_is_weights
+) {
+    size_t current = size();
+    if (current < batch_size) return false;
+
+    std::lock_guard<std::mutex> lock(stratified_mutex_);
+
+    // Rebuild index lists if new samples were added
+    if (stratified_dirty_) {
+        rebuild_stratified_indices();
+    }
+
+    // If any class is empty, fall back to uniform sampling
+    if (win_indices_.empty() || draw_indices_.empty() || loss_indices_.empty()) {
+        bool ok = sample(batch_size, observations, policies, values, wdl_targets, soft_values);
+        if (ok) {
+            out_is_weights.assign(batch_size, 1.0f);
+        }
+        return ok;
+    }
+
+    // Resize output buffers
+    observations.resize(batch_size * OBS_SIZE);
+    policies.resize(batch_size * POLICY_SIZE);
+    values.resize(batch_size);
+    if (wdl_targets) wdl_targets->resize(batch_size * 3);
+    if (soft_values) soft_values->resize(batch_size);
+    out_is_weights.resize(batch_size);
+
+    size_t total = win_indices_.size() + draw_indices_.size() + loss_indices_.size();
+
+    // Distribution for selecting outcome class: uniform 1/3
+    std::uniform_int_distribution<int> class_dist(0, 2);
+    std::uniform_int_distribution<size_t> win_dist(0, win_indices_.size() - 1);
+    std::uniform_int_distribution<size_t> draw_dist(0, draw_indices_.size() - 1);
+    std::uniform_int_distribution<size_t> loss_dist(0, loss_indices_.size() - 1);
+    // Uniform fallback distribution (for alpha blending)
+    std::uniform_int_distribution<size_t> uniform_dist(0, current - 1);
+
+    for (size_t i = 0; i < batch_size; ++i) {
+        size_t idx;
+        float is_weight;
+
+        if (alpha >= 1.0f) {
+            // Full stratification: choose class uniformly, then sample within class
+            int cls = class_dist(rng_);
+            if (cls == 0) {
+                idx = win_indices_[win_dist(rng_)];
+                is_weight = 3.0f * static_cast<float>(win_indices_.size()) / static_cast<float>(total);
+            } else if (cls == 1) {
+                idx = draw_indices_[draw_dist(rng_)];
+                is_weight = 3.0f * static_cast<float>(draw_indices_.size()) / static_cast<float>(total);
+            } else {
+                idx = loss_indices_[loss_dist(rng_)];
+                is_weight = 3.0f * static_cast<float>(loss_indices_.size()) / static_cast<float>(total);
+            }
+        } else if (alpha <= 0.0f) {
+            // Pure uniform
+            idx = uniform_dist(rng_);
+            is_weight = 1.0f;
+        } else {
+            // Blend: with probability alpha use stratified, else uniform
+            // IS weight uses full mixture probability for unbiased correction
+            float r = static_cast<float>(rng_()) / static_cast<float>(rng_.max());
+            size_t n_c;
+            if (r < alpha) {
+                int cls = class_dist(rng_);
+                if (cls == 0) {
+                    idx = win_indices_[win_dist(rng_)];
+                    n_c = win_indices_.size();
+                } else if (cls == 1) {
+                    idx = draw_indices_[draw_dist(rng_)];
+                    n_c = draw_indices_.size();
+                } else {
+                    idx = loss_indices_[loss_dist(rng_)];
+                    n_c = loss_indices_.size();
+                }
+            } else {
+                idx = uniform_dist(rng_);
+                // Determine which class this sample belongs to for IS weight
+                uint8_t res = metadata_[idx].game_result;
+                if (res == 0) n_c = win_indices_.size();
+                else if (res == 1) n_c = draw_indices_.size();
+                else n_c = loss_indices_.size();
+            }
+            // Full mixture IS weight: P_uniform / P_actual
+            // P_actual(x) = alpha * (1/3)(1/n_c) + (1-alpha) * (1/total)
+            float p_strat = 1.0f / (3.0f * static_cast<float>(n_c));
+            float p_unif  = 1.0f / static_cast<float>(total);
+            float p_actual = alpha * p_strat + (1.0f - alpha) * p_unif;
+            is_weight = p_unif / p_actual;
+        }
+
+        // Clamp to valid range
+        if (idx >= current) idx = current - 1;
+
+        // Copy sample data
+        std::memcpy(
+            observations.data() + i * OBS_SIZE,
+            observations_.data() + idx * OBS_SIZE,
+            OBS_SIZE * sizeof(float)
+        );
+        std::memcpy(
+            policies.data() + i * POLICY_SIZE,
+            policies_.data() + idx * POLICY_SIZE,
+            POLICY_SIZE * sizeof(float)
+        );
+        values[i] = values_[idx];
+
+        if (wdl_targets) {
+            std::memcpy(
+                wdl_targets->data() + i * 3,
+                wdl_targets_.data() + idx * 3,
+                3 * sizeof(float)
+            );
+        }
+        if (soft_values) {
+            (*soft_values)[i] = soft_values_[idx];
+        }
+
+        out_is_weights[i] = is_weight;
+    }
+
+    return true;
 }
 
 // ============================================================================
@@ -957,6 +1120,9 @@ bool ReplayBuffer::load(const std::string& path) {
     write_pos_.value.store(static_cast<size_t>(num_samples % capacity_), std::memory_order_relaxed);
     total_added_.value.store(num_samples, std::memory_order_release);
     total_games_.value.store(header.total_games, std::memory_order_relaxed);
+
+    // Invalidate stratified index cache (will rebuild on next sample_stratified call)
+    stratified_dirty_ = true;
 
     // Recompute composition counters from loaded metadata
     uint64_t wins = 0, draws = 0, losses = 0;

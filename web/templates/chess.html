@@ -268,6 +268,42 @@
         .move-san { font-weight: 600; color: #2c3e50; }
         .move-prob { color: #7f8c8d; }
 
+        /* Factored Value Head Display */
+        .factored-container {
+            margin-top: 10px;
+            padding: 8px 10px;
+            background: #f0f4f8;
+            border-radius: 6px;
+            border-left: 3px solid #3498db;
+        }
+
+        .factored-label {
+            font-weight: 600;
+            color: #2c3e50;
+            font-size: 0.85em;
+            margin-bottom: 6px;
+        }
+
+        .factored-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 3px 0;
+            font-size: 0.85em;
+        }
+
+        .factored-name { color: #555; }
+        .factored-val { font-weight: 600; color: #2c3e50; }
+
+        /* Section divider for eval panel */
+        .eval-section-label {
+            font-size: 0.85em;
+            color: #7f8c8d;
+            margin-bottom: 5px;
+            margin-top: 10px;
+            font-weight: 500;
+        }
+
         /* Promotion Dialog */
         .promotion-dialog {
             display: none;
@@ -538,6 +574,18 @@
                                 <div class="wdl-segment wdl-loss" id="wdl-loss" style="width:33.3%">--</div>
                             </div>
                         </div>
+                        <!-- Factored Value Head (shown when model uses factored value) -->
+                        <div class="factored-container" id="factored-container" style="display:none;">
+                            <div class="factored-label">Factored Value Head</div>
+                            <div class="factored-row">
+                                <span class="factored-name">P(decisive)</span>
+                                <span class="factored-val" id="factored-dec">--</span>
+                            </div>
+                            <div class="factored-row">
+                                <span class="factored-name">P(win | decisive)</span>
+                                <span class="factored-val" id="factored-cond">--</span>
+                            </div>
+                        </div>
                         <!-- Fallback for legacy scalar models -->
                         <div class="eval-value" id="nn-value-fallback" style="display:none;">
                             <span class="eval-label">NN Value:</span>
@@ -545,6 +593,8 @@
                         </div>
                         <div class="top-moves" id="top-moves">
                             <p style="color: #95a5a6; font-size: 0.9em;">No evaluation yet</p>
+                        </div>
+                        <div class="top-moves" id="nn-top-moves" style="display:none;">
                         </div>
                     </div>
                 </div>
@@ -800,6 +850,9 @@
                 document.getElementById(id).textContent = '--';
             });
             document.getElementById('top-moves').innerHTML = '<p style="color: #95a5a6; font-size: 0.9em;">No evaluation yet</p>';
+            document.getElementById('nn-top-moves').style.display = 'none';
+            document.getElementById('nn-top-moves').innerHTML = '';
+            document.getElementById('factored-container').style.display = 'none';
         }
 
         /** Determine which player is to move now */
@@ -1147,15 +1200,26 @@
                 colorEvalScore(document.getElementById('nn-score'), evaluation.nn_value);
             }
 
-            // Top moves
+            // Factored value head display
+            const factoredEl = document.getElementById('factored-container');
+            if (evaluation.factored) {
+                const dec = evaluation.factored.decisiveness;
+                const cond = evaluation.factored.win_given_decisive;
+                factoredEl.style.display = '';
+                document.getElementById('factored-dec').textContent = (dec * 100).toFixed(1) + '%';
+                document.getElementById('factored-cond').textContent = (cond * 100).toFixed(1) + '%';
+            } else {
+                factoredEl.style.display = 'none';
+            }
+
+            // MCTS Visits (renamed from "Top Moves" for clarity)
             const topEl = document.getElementById('top-moves');
             if (evaluation.top_moves && evaluation.top_moves.length > 0) {
-                const label = isStockfish ? 'Top Moves (cp):' : 'Top Moves:';
-                let html = `<div style="font-size: 0.85em; color: #7f8c8d; margin-bottom: 5px;">${label}</div>`;
+                const label = isStockfish ? 'Top Moves (cp):' : 'MCTS Visits:';
+                let html = `<div class="eval-section-label">${label}</div>`;
                 evaluation.top_moves.forEach((m, idx) => {
                     let metric;
                     if (isStockfish) {
-                        // Show centipawns
                         const cp = m.cp !== undefined ? m.cp : m.probability;
                         metric = (cp > 0 ? '+' : '') + Math.round(cp) + ' cp';
                     } else {
@@ -1169,6 +1233,23 @@
                 topEl.innerHTML = html;
             } else {
                 topEl.innerHTML = '<p style="color: #95a5a6; font-size: 0.9em;">No moves available</p>';
+            }
+
+            // Raw NN Policy (shows neural network output before MCTS amplification)
+            const nnEl = document.getElementById('nn-top-moves');
+            if (!isStockfish && evaluation.nn_top_moves && evaluation.nn_top_moves.length > 0) {
+                nnEl.style.display = '';
+                let html = `<div class="eval-section-label">NN Policy:</div>`;
+                evaluation.nn_top_moves.forEach((m, idx) => {
+                    html += `<div class="top-move">
+                        <span class="move-san">${idx + 1}. ${m.move_san}</span>
+                        <span class="move-prob">${(m.probability * 100).toFixed(1)}%</span>
+                    </div>`;
+                });
+                nnEl.innerHTML = html;
+            } else {
+                nnEl.style.display = 'none';
+                nnEl.innerHTML = '';
             }
         }
 

@@ -432,37 +432,6 @@ DASHBOARD_HTML = """
             font-size: 0.85em;
             color: #95a5a6;
         }
-        .export-section {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            padding: 10px 20px;
-            margin: 0 20px 10px;
-            background: rgba(255,255,255,0.03);
-            border-radius: 8px;
-        }
-        .export-btn {
-            background: linear-gradient(135deg, #00b894 0%, #00cec9 100%);
-            color: white;
-            border: none;
-            padding: 8px 20px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 0.9em;
-            font-weight: bold;
-            transition: opacity 0.2s;
-        }
-        .export-btn:hover {
-            opacity: 0.9;
-        }
-        .export-btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-        .export-feedback {
-            font-size: 0.85em;
-            color: #95a5a6;
-        }
     </style>
 </head>
 <body>
@@ -643,12 +612,6 @@ DASHBOARD_HTML = """
         </div>
     </div>
 
-    <!-- Export Model Section -->
-    <div class="export-section">
-        <button class="export-btn" id="export-btn" onclick="exportModel()">Export Model Weights</button>
-        <span class="export-feedback" id="export-feedback"></span>
-    </div>
-
     <!-- Parameter Controls Section -->
     <div class="param-controls-section">
         <div class="param-controls-header" onclick="toggleParamControls()">
@@ -712,6 +675,31 @@ DASHBOARD_HTML = """
                         <input type="number" data-param="temperature_moves" step="1" min="0" max="200">
                         <span class="param-current" id="cur-temperature_moves"></span>
                     </div>
+                </div>
+
+                <!-- Gumbel Search Group -->
+                <div class="param-group">
+                    <h4>Gumbel SH</h4>
+                    <div class="param-row">
+                        <label>Top-K</label>
+                        <input type="number" data-param="gumbel_top_k" step="1" min="1" max="64">
+                        <span class="param-current" id="cur-gumbel_top_k"></span>
+                    </div>
+                    <div class="param-row">
+                        <label>C_Visit</label>
+                        <input type="number" data-param="gumbel_c_visit" step="1" min="1" max="1000">
+                        <span class="param-current" id="cur-gumbel_c_visit"></span>
+                    </div>
+                    <div class="param-row">
+                        <label>C_Scale</label>
+                        <input type="number" data-param="gumbel_c_scale" step="0.1" min="0.01" max="10">
+                        <span class="param-current" id="cur-gumbel_c_scale"></span>
+                    </div>
+                </div>
+
+                <!-- PUCT-specific Group -->
+                <div class="param-group">
+                    <h4>PUCT (if active)</h4>
                     <div class="param-row">
                         <label>Dir. Alpha</label>
                         <input type="number" data-param="dirichlet_alpha" step="0.01" min="0.01" max="2">
@@ -1148,9 +1136,6 @@ DASHBOARD_HTML = """
                 console.log('Connected to dashboard server');
                 document.getElementById('status').textContent = 'Connected';
                 document.getElementById('status').className = 'status connected';
-                // Reset export button in case a prior request was lost
-                document.getElementById('export-btn').disabled = false;
-                document.getElementById('export-feedback').textContent = '';
             });
 
             socket.on('disconnect', () => {
@@ -1559,24 +1544,6 @@ DASHBOARD_HTML = """
                 feedbackEl.style.color = '#2ecc71';
             });
 
-            socket.on('export_ack', (resp) => {
-                const feedbackEl = document.getElementById('export-feedback');
-                feedbackEl.textContent = 'Queued, waiting for training loop...';
-                feedbackEl.style.color = '#f1c40f';
-            });
-
-            socket.on('export_complete', (resp) => {
-                const btn = document.getElementById('export-btn');
-                const feedbackEl = document.getElementById('export-feedback');
-                btn.disabled = false;
-                if (resp.status === 'saved') {
-                    feedbackEl.textContent = 'Saved: ' + resp.filename;
-                    feedbackEl.style.color = '#2ecc71';
-                } else {
-                    feedbackEl.textContent = 'Error: ' + (resp.error || 'unknown');
-                    feedbackEl.style.color = '#e74c3c';
-                }
-            });
         }
 
         // --- Parameter Controls Functions ---
@@ -1627,13 +1594,6 @@ DASHBOARD_HTML = """
         function resetParams() {
             populateParams(currentParams);
             document.getElementById('param-feedback').textContent = '';
-        }
-
-        function exportModel() {
-            const btn = document.getElementById('export-btn');
-            btn.disabled = true;
-            document.getElementById('export-feedback').textContent = 'Requesting...';
-            socket.emit('export_model');
         }
 
         // Input change listeners for modified highlighting
@@ -1696,9 +1656,6 @@ class LiveDashboardServer:
         self._pending_lock = threading.Lock()
         self._current_params: Dict[str, any] = {}
 
-        # Export model: browser → training loop
-        self._export_requested: bool = False
-
     def set_current_params(self, params: dict):
         """Push authoritative parameter values. Broadcasts to all connected clients."""
         self._current_params = params.copy()
@@ -1713,13 +1670,6 @@ class LiveDashboardServer:
             meta = self._pending_meta.copy()
             self._pending_meta.clear()
         return updates, meta
-
-    def poll_export_request(self) -> bool:
-        """Atomically read and clear export request flag."""
-        with self._pending_lock:
-            requested = self._export_requested
-            self._export_requested = False
-        return requested
 
     def _create_app(self):
         """Create Flask app with SocketIO."""
@@ -1771,6 +1721,9 @@ class LiveDashboardServer:
             'games_per_iter': (int, 1, 10000),
             'max_fillup_factor': (int, 0, 100),
             'save_interval': (int, 1, 1000),
+            'gumbel_top_k': (int, 1, 64),
+            'gumbel_c_visit': (float, 1.0, 1000.0),
+            'gumbel_c_scale': (float, 0.01, 10.0),
         }
 
         @socketio.on('apply_params')
@@ -1794,12 +1747,6 @@ class LiveDashboardServer:
             socketio.emit('params_pending_ack', {
                 'accepted': validated, 'errors': errors
             })
-
-        @socketio.on('export_model')
-        def handle_export_model():
-            with self._pending_lock:
-                self._export_requested = True
-            emit('export_ack', {'status': 'queued'})
 
         self.app = app
         self.socketio = socketio
@@ -1842,11 +1789,12 @@ class LiveDashboardServer:
         print(f"  Live dashboard started: {url}")
 
         if open_browser:
+            browser_url = f"http://127.0.0.1:{self.port}"
             try:
-                webbrowser.open(url)
+                webbrowser.open(browser_url)
                 print(f"  Browser opened automatically")
             except Exception:
-                print(f"  Open in browser: {url}")
+                print(f"  Open in browser: {browser_url}")
 
         return True
 

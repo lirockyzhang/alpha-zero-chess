@@ -37,6 +37,8 @@ uv run python alphazero-cpp/scripts/train.py \
   --lr 0.001 \
   --train-batch 1024 \
   --epochs 3 \
+  --entropy-reg 0.1 \
+  --dynamic-epochs --draw-target 0.5 \
   --live
 ```
 
@@ -44,7 +46,7 @@ uv run python alphazero-cpp/scripts/train.py \
 - `games_per_iter` must be an integer multiple of `workers`. If you want 32 games, use 32 workers (not 64).
 - Start with `--epochs 3` (not 5). Higher epochs cause value head overfitting when W/L data is scarce (see Section 10).
 - Start with `--simulations 200`. Higher values (e.g., 800) cause the weak value head to produce overconfident draw evaluations, triggering a self-reinforcing repetition spiral (see Section 10g). Increase simulations only after the model shows decisive play (>20% wins+losses) and the value head is calibrated (value_loss > 0.5).
-- Use `--search-algorithm gumbel` (default). Gumbel Top-k Sequential Halving replaces Dirichlet noise with principled Gumbel exploration and produces improved policy training targets. `search_batch` is auto-derived from `gumbel_top_k` (both default to 16). Use `--search-algorithm puct` to fall back to classic AlphaZero PUCT+Dirichlet (auto-sets `search_batch=1`).
+- Use `--search-algorithm gumbel` (default). Gumbel Top-k Sequential Halving replaces Dirichlet noise with principled Gumbel exploration and produces improved policy training targets. `search_batch` is auto-derived from `gumbel_top_k` (both default to 16). Interior nodes use deterministic policy-following selection (not PUCT), eliminating c_puct/FPU dependency below root (see Section 10u). Use `--search-algorithm puct` to fall back to classic AlphaZero PUCT+Dirichlet (auto-sets `search_batch=1`).
 - `--save-interval` defaults to 1 (checkpoint every iteration). No need to specify unless you want less frequent saves.
 - CUDA graph calibration auto-retries on bad GPU states. If calibration fails twice, safe defaults are used automatically.
 
@@ -100,7 +102,12 @@ tail -n 10 <run_dir>/claude_log.jsonl
   "buffer_size":15000, "wins":4500, "draws":7000, "losses":3500,
   "lr":0.001, "risk_beta":0.0,
   "sample_game":{"moves":"e2e4 e7e5 g1f3 ...","result":"1-0","reason":"checkmate","length":78},
-  "alerts":["high_draw_rate","loss_plateau"]
+  "alerts":["high_draw_rate","loss_plateau"],
+  "wdl_entropy":0.85,
+  "focal_mean_weight":0.62,
+  "effective_epochs":2,
+  "effective_sims":180,
+  "collapse_alerts":["WARNING: Draw rate >60% for 3 consecutive iterations"]
 }
 ```
 
@@ -130,6 +137,8 @@ Written on shutdown when `--claude` is enabled. Contains:
 | `avg_game_length` | Average moves per game — very low (<40) = model playing badly |
 | `wins`/`draws`/`losses` | Buffer composition — if draws > 90%, value head is training on draw-saturated data |
 | `alerts` | Automated alert strings (see Alert Reference below) |
+| `wdl_entropy` | WDL entropy from training batch (nats). < 0.3 = collapsed. Only present with `--entropy-reg` |
+| `collapse_alerts` | Collapse monitor warnings (see Section 5). Only present with collapse prevention flags |
 
 ---
 
@@ -257,6 +266,15 @@ To change them, stop training and restart with `--resume`:
 | `--reanalyze-fraction` | float | Fraction of buffer to reanalyze each iteration (default 0.0=disabled, 0.25=recommended). Enables FEN storage on startup. See Section 10r. |
 | `--reanalyze-simulations-ratio` | float | Reanalysis sims as fraction of self-play sims (default 0.25). |
 | `--reanalyze-workers` | int | Number of reanalysis workers (default 0=auto: half of self-play workers). |
+| `--entropy-reg` | float | WDL entropy regularization coefficient λ_H (default 0.0=disabled). Adds `-λ_H · H(WDL)` to value loss, preventing WDL distribution from collapsing to (0,1,0). Recommended: 0.05-0.15. See Section 10t. |
+| `--focal-gamma` | float | Focal loss exponent γ (default 0.0=standard CE). Downweights confident-correct predictions: `(1-p_correct)^γ · CE`. At γ=2, decisive samples misclassified as draws contribute ~41× more gradient. Recommended: 1.0-2.0. See Section 10t. |
+| `--dynamic-epochs` | flag | Enable automatic epoch reduction based on buffer draw fraction. Formula: `E_eff = max(1, floor(E_base · (1-draw_frac) / (1-draw_target)))`. See Section 10t. |
+| `--draw-target` | float | Target draw fraction for dynamic epochs (default 0.5). Only used with `--dynamic-epochs`. |
+| `--stratified-sampling` | flag | Enable outcome-stratified sampling: sample equally from W/D/L classes with importance sampling weights. Mutually exclusive with PER (`--priority-exponent > 0`). See Section 10t. |
+| `--stratified-alpha` | float | Stratification strength (default 1.0). 0=uniform, 1=full stratification. Blending (0<α<1) interpolates between uniform and stratified. Only used with `--stratified-sampling`. |
+| `--adaptive-sims` | flag | Enable entropy-driven simulation budget. Scales sims by buffer WDL entropy: `N = N_base · max(0.25, H/H_target)`. Reduces sims when value head collapses. See Section 10t. |
+| `--entropy-target` | float | Target WDL entropy in nats (default 0.8, max=ln(3)≈1.099). Only used with `--adaptive-sims`. |
+| `--factored-value-head` | flag | Use factored value head: two binary classifiers (decisiveness + conditional W|dec) instead of 3-class WDL. Structural firewall — conditional head gradient is independent of draw fraction. **Incompatible with existing checkpoints** (value head weights randomly initialized on architecture mismatch). See Section 10t. |
 
 **CRITICAL: `--resume` does NOT preserve CLI arguments.** When using `--resume`, you MUST re-specify ALL parameters (`--filters`, `--blocks`, `--se-reduction`, `--workers`, `--simulations`, `--search-algorithm`, `--train-batch`, `--epochs`, `--games-per-iter`, etc.). Only the model weights, optimizer state, and replay buffer are loaded from the checkpoint. Omitting parameters causes them to revert to defaults (e.g., workers=1, simulations=800, train_batch=256), which can silently produce terrible results.
 
@@ -275,6 +293,18 @@ Alerts are computed automatically and included in each iteration line.
 | `high_repetition_rate` | Repetition draws > 30% of games (last 3 iter) | Increase `c_explore`, consider `risk_beta` > 0. Gumbel's Sequential Halving should reduce repetitions vs PUCT — if still high, the value head may be draw-collapsed (see Section 10g) |
 | `short_games` | Avg game length < 40 over last 3 iterations | Increase simulations; model quality too low |
 | `nan_detected` | Any NaN/Inf in loss values | Stop immediately, resume from last checkpoint |
+
+### Collapse Monitor Alerts (requires `--entropy-reg`, `--focal-gamma`, `--dynamic-epochs`, `--stratified-sampling`, `--adaptive-sims`, or `--factored-value-head`)
+
+The `CollapseMonitor` tracks metrics over a sliding window and emits prominent log warnings. These appear in the `collapse_alerts` JSONL field. Purely observational — no behavioral side effects.
+
+| Alert | Condition | Severity | Recommended Response |
+|-------|-----------|----------|---------------------|
+| `WARNING` | Draw rate > 60% for 3 consecutive iterations | Medium | Enable `--dynamic-epochs` and `--entropy-reg 0.1` if not already active. See Section 10t. |
+| `CRITICAL` | Repetition draw rate > 30% for 3 consecutive iterations | High | Repetition spiral in progress. Enable `--stratified-sampling`. Consider rollback if value_loss < 0.3. |
+| `PLATEAU` | Value loss change < 2% over 5 iterations | Low | Value head may be stuck. Enable `--focal-gamma 2.0` to upweight hard samples. |
+| `COLLAPSE` | Avg game length < 40 for 3 consecutive iterations | High | Model playing degenerate short games. Increase simulations, enable `--entropy-reg`. |
+| `DANGER` | value_loss < 0.5 AND draw_rate > 60% simultaneously | Critical | Compound collapse signal. Enable multiple mechanisms (see Section 10t combination guide). Consider rollback. |
 
 ---
 
@@ -315,6 +345,31 @@ Alerts are computed automatically and included in each iteration line.
 - **Model producing >20% decisive games with value_loss > 0.5**: Safe to increase simulations (200 → 400 → 800) to sharpen tactical play.
 - **Iteration time too long** (> 60 min): Reduce `simulations` or reduce `games_per_iter`
 - **100% draws with high simulations**: Do NOT increase further. High simulations + weak value head = draw death (see Section 10g). **Roll back and reduce simulations.**
+
+### When to enable collapse prevention mechanisms
+
+These are startup-only flags (require `--resume` restart). Enable proactively before collapse, not reactively after.
+
+**Preventive (enable from the start of a new run):**
+| Mechanism | Flag | Risk | Benefit | Recommended |
+|-----------|------|------|---------|-------------|
+| Entropy Reg | `--entropy-reg 0.1` | Slightly slower value convergence | Lyapunov stability guarantee against WDL collapse | **Yes — low cost, high safety** |
+| Dynamic Epochs | `--dynamic-epochs` | None when disabled (draw_frac < target) | Auto-reduces epochs during draw-heavy phases | **Yes — zero cost when healthy** |
+| Collapse Monitor | (always active when any flag above is set) | None (observational only) | Early warning of collapse patterns | **Yes — free** |
+
+**Reactive (enable when collapse signals appear):**
+| Mechanism | Flag | When to Enable | When NOT to Enable |
+|-----------|------|----------------|-------------------|
+| Focal Loss | `--focal-gamma 2.0` | `PLATEAU` alert, value_loss stagnating | Early training (iters 1-10) when all losses are high |
+| Stratified Sampling | `--stratified-sampling` | Buffer >80% draws, `CRITICAL` alert | Buffer is balanced (<70% draws) — adds overhead |
+| Adaptive Sims | `--adaptive-sims` | `DANGER` alert, value_loss < 0.5 + high draws | Healthy training — reduces simulation count unnecessarily |
+| Factored Value Head | `--factored-value-head` | Fresh run where collapse is expected | Mid-run (incompatible checkpoints, requires restart from scratch) |
+
+**Combination guide (escalation ladder):**
+1. **Mild concern** (draw rate 60-70%): `--entropy-reg 0.1 --dynamic-epochs`
+2. **Moderate concern** (draw rate 70-85%, value_loss 0.4-0.6): Add `--focal-gamma 2.0 --stratified-sampling`
+3. **Severe concern** (draw rate >85%, value_loss < 0.4): Add `--adaptive-sims --entropy-target 0.8`. Consider rollback.
+4. **Fresh run with maximum protection**: `--factored-value-head --entropy-reg 0.1 --dynamic-epochs --focal-gamma 2.0 --stratified-sampling`
 
 ### General rules
 1. **Change at most 1-2 parameters at a time** — isolate the effect
@@ -433,8 +488,9 @@ uv run python alphazero-cpp/scripts/monitor_iteration.py --latest --timeout 3600
 **Fix (mild case, draw rate 60-80%):**
 - **Gumbel (default)**: Increase `gumbel_c_visit` (+10-20), increase `gumbel_top_k` (16→24), consider `risk_beta` = 0.5. Gumbel's Sequential Halving allocates sims more efficiently than PUCT+Dirichlet and may resist draw spirals better.
 - **PUCT**: Increase `c_explore` to 2.0-2.5, increase `dirichlet_epsilon` to 0.30, consider `risk_beta` = 0.5.
+- **Collapse prevention (if enabled)**: `--entropy-reg` and `--dynamic-epochs` should already be slowing the spiral. Add `--stratified-sampling` and `--focal-gamma 2.0` on restart to amplify W/L gradient signal. See Section 10t.
 
-**Fix (severe case, draw rate 90-100%)**: These exploration changes alone will NOT work if the value head is deeply draw-biased. Parameter tuning cannot break an established spiral — the model's value head has already learned "everything is a draw" and all new self-play data reinforces this. **You must roll back** to a checkpoint from before the spiral began, delete all post-rollback checkpoints and log entries, and restart with corrected parameters.
+**Fix (severe case, draw rate 90-100%)**: These exploration changes alone will NOT work if the value head is deeply draw-biased. Parameter tuning cannot break an established spiral — the model's value head has already learned "everything is a draw" and all new self-play data reinforces this. **You must roll back** to a checkpoint from before the spiral began, delete all post-rollback checkpoints and log entries, and restart with corrected parameters. On the fresh start, enable `--entropy-reg 0.1 --dynamic-epochs --stratified-sampling --focal-gamma 2.0` to prevent recurrence (see Section 10t).
 
 **CRITICAL — Do NOT increase simulations to fix early-training draw death.** Higher simulations (e.g., 200 → 800) amplify a weak value head's draw bias into high-confidence repetition-forcing play, making the spiral WORSE (see Section 10g).
 
@@ -515,6 +571,7 @@ These are hard-won lessons from actual training runs. Read carefully before maki
 - Use `--search-algorithm gumbel` (default). Gumbel's Sequential Halving allocates simulation budget more efficiently than PUCT+Dirichlet and produces improved policy targets with theoretical guarantees.
 - Start with `simulations=200` for appropriate search depth during cold start.
 - Use `epochs=3` to prevent value overfitting.
+- Enable `--entropy-reg 0.1 --dynamic-epochs` from iteration 1 as low-cost collapse prevention (see Section 10t). These have zero cost when training is healthy.
 - Watch for loss declining steadily — that's the key health indicator.
 - Monitor buffer composition via `get_composition()` — watch for W/L data emerging.
 - Plan to increase simulations later (after iter 15-20) once the model shows >20% decisive games.
@@ -542,7 +599,7 @@ These are hard-won lessons from actual training runs. Read carefully before maki
 
 **With Gumbel (default) — `search_batch` = `gumbel_top_k` (auto-derived):**
 
-Virtual loss is automatically disabled. Gumbel uses round-robin root selection — each simulation in a batch is deterministically assigned to a different active action, eliminating root collisions without needing virtual loss. This removes the "virtual loss + draw bias" problem entirely and makes higher batch sizes safe.
+Heavy virtual loss is replaced with **lightweight virtual losses** (visit-count-only, no Q corruption). Gumbel uses round-robin root selection — each simulation in a batch is deterministically assigned to a different active action, eliminating root collisions without needing virtual loss at the root. At interior nodes, lightweight VL (+1 visit count only) is sufficient because the deterministic deficit formula is monotonically decreasing in visit count (see Section 10u). This removes the "virtual loss + draw bias" problem entirely and makes higher batch sizes safe.
 
 | search_batch | GPU Utilization | Root Fan-out (top_k=16) | Recommendation |
 |-------------|-----------------|------------------------|----------------|
@@ -727,8 +784,9 @@ Setting `risk_beta=0.5` (ERM risk-seeking) produced only 2 decisive games per it
 1. **Detection**: Draw rate > 90% for 2+ iterations AND zero repetition draws AND fifty-move draws > 60% of draws AND value_loss < 0.4
 2. **Immediate action**: Set `epochs=1` and `temperature_moves=50`
 3. **Optional**: Set `risk_beta=0.3-0.5` (helps once variance returns, but insufficient alone)
-4. **Monitor**: Draw rate should drop within 1-2 iterations. Value loss should increase (healthy recalibration).
-5. **Restore**: Once draw rate < 70% sustained for 3+ iterations and value_loss > 0.4, gradually restore `epochs` to 2, then 3. Keep `temperature_moves=50` until the model shows strong opening play.
+4. **Collapse prevention**: On restart, enable `--entropy-reg 0.1 --dynamic-epochs --stratified-sampling` to prevent recurrence. `--dynamic-epochs` would have auto-reduced epochs before manual intervention was needed. `--stratified-sampling` ensures W/L positions get equal training weight despite buffer saturation. See Section 10t.
+5. **Monitor**: Draw rate should drop within 1-2 iterations. Value loss should increase (healthy recalibration).
+6. **Restore**: Once draw rate < 70% sustained for 3+ iterations and value_loss > 0.4, gradually restore `epochs` to 2, then 3. Keep `temperature_moves=50` until the model shows strong opening play.
 
 **Prevention:**
 - Use `epochs=3` (not 5) from the start
@@ -774,6 +832,7 @@ The previous run used `search_batch=1` with Gumbel (the PUCT recommendation). Th
 2. No root collisions (round-robin assignment)
 3. Maximum GPU utilization (large batches = better amortization)
 4. Faster self-play (16× fewer GPU round-trips per move vs search_batch=1)
+5. Interior nodes use deterministic policy-following selection with lightweight VL (see Section 10u)
 
 ### 10k. CUDA Graph Recalibration Bug
 
@@ -1186,3 +1245,256 @@ Reanalysis workers → SECONDARY queue─┘
 **Reanalysis requires restart:** Like PER, FEN storage is allocated at startup. To enable reanalysis on an existing run, stop training and restart with `--resume <run_dir> --reanalyze-fraction 0.25`. Positions generated before FEN storage was enabled will have empty FENs and will be skipped during reanalysis (counted as `positions_skipped` in stats).
 
 **Monitoring:** The training log reports per-iteration: positions updated, positions skipped, reanalysis NN evals, and tail time (seconds spent on reanalysis after self-play finished). A healthy run shows most positions completing (low skip rate) and short tail times (< 30% of self-play time).
+
+### 10t. Value Head Collapse Prevention Mechanisms
+
+**Background:** Value head collapse is the single most destructive failure mode in AlphaZero self-play training (see Sections 10g, 10i, 10m, 10r). The self-reinforcing cycle — weak value head → conservative play → draws → more draw training data → weaker value head — can be irreversible once established. Seven independently toggleable mechanisms are available to prevent and mitigate collapse. All are disabled by default (backward compatible).
+
+**New JSONL fields (when any mechanism is enabled):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `wdl_entropy` | float | Average WDL entropy across training batch (nats). Healthy: 0.7-1.1. Collapsed: < 0.3. Only logged when `--entropy-reg > 0`. |
+| `focal_mean_weight` | float | Average focal loss weight across batch. Near 1.0 = model mostly wrong (early training). Near 0.0 = model mostly right. Only logged when `--focal-gamma > 0`. |
+| `effective_epochs` | int | Actual epochs used after dynamic adjustment. Equal to `--epochs` when disabled. |
+| `effective_sims` | int | Actual simulations used after adaptive adjustment. Equal to `--simulations` when disabled. |
+| `collapse_alerts` | list[str] | Collapse monitor alerts this iteration. Empty list when healthy. |
+
+#### Mechanism 1: Entropy Regularization (`--entropy-reg`)
+
+Adds `-λ_H · H(softmax(WDL_logits))` to the value loss. By maximizing WDL entropy, the distribution is prevented from collapsing to (0,1,0) — the "everything is a draw" attractor.
+
+**How it works:** The entropy term `H(w) = -Σ w_i log(w_i)` is maximized when the WDL distribution is uniform (H=ln(3)≈1.099 nats) and minimized when collapsed to a single class (H=0). Subtracting `λ_H · H` from the loss encourages higher entropy, keeping the value head "honestly uncertain" rather than overconfident about draws.
+
+**Recommended values:**
+| λ_H | Effect | When to use |
+|-----|--------|-------------|
+| 0.0 | Disabled (default) | Backward compatibility |
+| 0.05 | Light regularization | Preventive use from iteration 1 |
+| 0.10 | **Moderate (recommended)** | Good balance: prevents collapse without significantly slowing convergence |
+| 0.15-0.20 | Strong regularization | Active collapse recovery, or very draw-heavy training |
+| > 0.25 | Too strong | Value head cannot converge — entropy penalty dominates the loss |
+
+**Interaction with factored value head:** When `--factored-value-head` is active, entropy is computed from the reconstructed WDL probabilities `(w_W, w_D, w_L)` using `log(p + ε)` instead of `log_softmax`.
+
+#### Mechanism 2: Dynamic Epochs (`--dynamic-epochs`)
+
+Automatically reduces training epochs when the buffer is draw-dominated.
+
+**Formula:** `E_eff = max(1, floor(E_base · (1 - draw_frac) / (1 - draw_target)))`
+
+**Example:** With `E_base=3`, `draw_target=0.5`:
+| Buffer draw % | Effective epochs | Reduction |
+|---------------|-----------------|-----------|
+| 40% | 3 | None |
+| 50% | 3 | None (at target) |
+| 70% | 1 | 67% reduction |
+| 80% | 1 | 67% reduction |
+| 90% | 1 | 67% reduction (floor cap) |
+
+This automates the manual "set epochs=1 when draws > 80%" intervention described in Sections 10i and 10r. The `--draw-target` parameter (default 0.5) sets the draw fraction below which no reduction occurs.
+
+**Zero cost when healthy:** When draw_frac ≤ draw_target, effective_epochs equals the base epochs — no behavioral change. This makes it safe to enable from iteration 1.
+
+#### Mechanism 3: Collapse Alert Monitor
+
+A `CollapseMonitor` that tracks metrics over a sliding window and emits prominent log warnings. Purely observational — no behavioral side effects. See the "Collapse Monitor Alerts" table in Section 5 for the full alert reference.
+
+The monitor is automatically active when any collapse prevention flag is enabled. Alerts appear in the `collapse_alerts` JSONL field and in the training log output.
+
+#### Mechanism 4: Outcome-Stratified Sampling (`--stratified-sampling`)
+
+Samples equally from W/D/L outcome classes regardless of buffer composition. Includes importance sampling (IS) weights for unbiased loss estimation.
+
+**How it works:** Instead of uniform random sampling (which over-represents draws in a draw-heavy buffer), stratified sampling divides the buffer into three pools by game outcome. Each batch draws equally from all three pools. IS weights correct the gradient to be unbiased: `w_i = 3 × (count_of_class / total_count)`.
+
+**Example IS weights at 90% draws:**
+| Outcome class | Buffer fraction | IS weight | Effect |
+|--------------|----------------|-----------|--------|
+| Win | 5% | 0.15 | Downweighted (oversampled relative to buffer) |
+| Draw | 90% | 2.70 | Upweighted (undersampled relative to buffer) |
+| Loss | 5% | 0.15 | Downweighted (oversampled relative to buffer) |
+
+The IS weights ensure that the gradient is unbiased despite non-uniform sampling. Without IS weights, the model would overfit to the rare W/L positions.
+
+**`--stratified-alpha`:** Controls stratification strength. α=1.0 (default) is full stratification. α=0.0 is uniform sampling. Values between 0 and 1 blend: `P_sample = α · P_stratified + (1-α) · P_uniform`, with IS weights computed from the mixture probability.
+
+**Mutually exclusive with PER:** Both modify the sampling distribution. The system validates this at startup and exits with an error if both are enabled. Choose one or the other:
+- **PER** focuses on high-loss samples regardless of outcome
+- **Stratified sampling** ensures outcome balance regardless of loss
+
+**Fallback:** If any outcome class is empty in the buffer (e.g., zero wins yet), stratified sampling automatically falls back to uniform sampling with IS weights all 1.0.
+
+#### Mechanism 5: Adaptive Simulation Budget (`--adaptive-sims`)
+
+Scales simulation count by buffer WDL entropy. When the value head collapses (low entropy), sims are reduced to weaken search amplification — the key driver of the collapse spiral (Section 10g).
+
+**Formula:** `N_sims = N_base · max(0.25, H(WDL_buffer) / H_target)`
+
+**Example with N_base=200, H_target=0.8:**
+| Buffer entropy H | Scale factor | Effective sims | Situation |
+|-----------------|-------------|----------------|-----------|
+| 1.0 | 1.25 | 250 | Healthy — slightly more sims |
+| 0.8 | 1.00 | 200 | At target — no change |
+| 0.4 | 0.50 | 100 | Concerning — reduce search depth |
+| 0.2 | 0.25 | 50 | Collapsed — minimum sims |
+
+The floor of 0.25× ensures sims never drop below `gumbel_top_k` (minimum for Gumbel Sequential Halving to complete one round).
+
+**Why reduce sims during collapse?** Deep search amplifies value head bias (Section 10g). If the value head says "everything is a draw," 800 sims produces a very confident "draw" evaluation. 50 sims produces a noisy evaluation that still allows exploration. Reducing sims breaks the amplification feedback loop.
+
+#### Mechanism 6: Focal Loss (`--focal-gamma`)
+
+Modulates the WDL cross-entropy to downweight confident-correct predictions, upweighting hard/misclassified samples: `(1 - p_correct)^γ · CE`.
+
+**Example at γ=2.0:**
+| p_correct | Focal weight | Effect |
+|-----------|-------------|--------|
+| 0.95 (easy, correct) | 0.0025 | Nearly zero gradient — model already knows this |
+| 0.50 (uncertain) | 0.25 | Moderate gradient |
+| 0.10 (wrong) | 0.81 | Strong gradient — model needs to learn this |
+
+**Why it helps against collapse:** When the value head predicts "draw" for everything, decisive positions (W/L) where the model is wrong get amplified ~41× relative to draw positions where the model is confident. This automatically focuses learning on the positions that contain the most information about winning and losing.
+
+**Recommended values:**
+| γ | Effect | When to use |
+|---|--------|-------------|
+| 0.0 | Standard CE (default) | Backward compatibility |
+| 1.0 | Moderate focusing | Light anti-collapse; good for early training |
+| **2.0** | **Strong focusing (recommended)** | Active collapse concern; strong upweighting of hard samples |
+| > 3.0 | Very aggressive | May cause training instability — too much focus on outliers |
+
+**Interaction with factored value head:** For the factored head, focal weights are computed separately for each binary head (decisiveness and conditional), using each head's own prediction accuracy. This is more principled than using reconstructed WDL focal weights.
+
+#### Mechanism 7: Factored Value Head (`--factored-value-head`)
+
+Replaces the standard 3-class WDL head with two binary classifiers:
+1. **Decisiveness head:** `p_dec(s) = σ(z_dec)` — probability the outcome is decisive (W or L, not draw)
+2. **Conditional outcome head:** `p_{W|dec}(s) = σ(z_{W|dec})` — probability of win given the outcome is decisive
+
+**WDL reconstruction:** `w_W = p_dec · p_{W|dec}`, `w_D = 1 - p_dec`, `w_L = p_dec · (1 - p_{W|dec})`
+
+**Why it's a structural firewall:** The conditional head's gradient is mathematically independent of the buffer's draw fraction. Even if `p_dec` collapses to 0 (everything predicted as draw), `p_{W|dec}` continues learning from decisive samples. When the system encounters a decisive position, it can correctly identify W vs L — information that is completely lost in the standard WDL head during collapse.
+
+**Loss computation:** Two separate binary cross-entropy losses:
+- `L_dec = BCE(z_dec, y_dec)` where `y_dec = 1` for W/L, `0` for D
+- `L_cond = BCE(z_cond, y_cond)` only for decisive samples, where `y_cond = 1` for W, `0` for L
+
+**Checkpoint incompatibility:** The factored head has different weight shapes than the standard WDL head. When loading a standard checkpoint into a factored model (or vice versa), value head weights are randomly initialized with a warning. This means `--factored-value-head` should only be used for fresh runs, not added to existing runs via `--resume`.
+
+**C++ interface:** No changes needed. The factored head reconstructs standard WDL probabilities before passing to C++. The self-play engine only sees `wdl_probs` — it never knows the head is factored.
+
+#### Recommended Configurations
+
+**New run with preventive measures (recommended default):**
+```bash
+uv run python alphazero-cpp/scripts/train.py \
+  --claude \
+  --entropy-reg 0.1 \
+  --dynamic-epochs --draw-target 0.5 \
+  --search-algorithm gumbel \
+  --simulations 200 --epochs 3 \
+  ... (other args)
+```
+
+**New run with maximum collapse protection:**
+```bash
+uv run python alphazero-cpp/scripts/train.py \
+  --claude \
+  --factored-value-head \
+  --entropy-reg 0.1 \
+  --focal-gamma 2.0 \
+  --dynamic-epochs --draw-target 0.5 \
+  --stratified-sampling \
+  --search-algorithm gumbel \
+  --simulations 200 --epochs 3 \
+  ... (other args)
+```
+
+**Existing run showing collapse signals (restart with `--resume`):**
+```bash
+uv run python alphazero-cpp/scripts/train.py \
+  --claude --resume <run_dir> \
+  --entropy-reg 0.1 \
+  --focal-gamma 2.0 \
+  --dynamic-epochs --draw-target 0.5 \
+  --stratified-sampling \
+  --adaptive-sims --entropy-target 0.8 \
+  ... (other args from original launch)
+```
+
+Note: Do NOT add `--factored-value-head` to `--resume` — it's incompatible with existing checkpoints. For factored value head, start a new run.
+
+#### Mechanism Interaction Summary
+
+All seven mechanisms are independently toggleable and compose correctly:
+
+| Mechanisms | Interaction | Notes |
+|-----------|-------------|-------|
+| Entropy Reg + Focal Loss | Focal applied first (multiplicative on CE), entropy added second (additive) | Focal doesn't modulate the entropy term |
+| Entropy Reg + Factored Head | Entropy computed from reconstructed WDL probs | Uses `log(p + ε)` instead of `log_softmax` |
+| Focal Loss + Factored Head | Per-head focal weights | Each binary head has its own focal weight |
+| Stratified + PER | **Mutually exclusive** | Both modify sampling; validated at startup |
+| Stratified + Focal/Entropy | IS weights multiply final `per_sample_total` | Sampling correction is independent of loss modification |
+| Dynamic Epochs + any | Independent | Epochs from buffer composition, loss modifications from training |
+| Adaptive Sims + any | Independent | Sims from buffer entropy, orthogonal to training changes |
+| Alert Monitor + any | Independent | Purely observational, no side effects |
+
+### 10u. Gumbel Interior Deterministic Selection
+
+**Background:** The Gumbel MuZero paper (Danihelka et al. 2022) specifies two distinct selection regimes: (1) Gumbel Top-k Sequential Halving at the **root** (depth=0), and (2) a **deterministic policy-following rule** at all interior nodes (depth>0). Prior to this change, interior nodes fell back to PUCT even in Gumbel mode, inheriting all of PUCT's interacting heuristics (c_puct, FPU, heavy virtual losses). The deterministic interior selection eliminates these dependencies.
+
+**What changed:**
+
+| Component | Old (Gumbel mode) | New (Gumbel mode) |
+|---|---|---|
+| Root selection (depth=0) | Gumbel SH round-robin | Unchanged |
+| Interior selection (depth>0) | PUCT: `Q + c*P*sqrt(N)/(1+n)` | Deterministic: `argmax(π_improved - N/(1+ΣN))` |
+| Unvisited Q (interior) | FPU: `parent_Q - fpu_base*sqrt(1-prior)` | `mixed_value` (prior-weighted avg of sibling Q) |
+| Virtual losses | Heavy: `value_sum += -10000, visit_count += 1` | Lightweight: `visit_count += 1` only |
+| Parameters at interior | c_puct (c_explore), fpu_base | gumbel_c_visit, gumbel_c_scale (reused from root) |
+
+**No new parameters needed.** The existing `--gumbel-c-visit` (default 50.0) and `--gumbel-c-scale` (default 1.0) are reused for the interior Q-transform. PUCT mode (`--search-algorithm puct`) is completely untouched.
+
+**How deterministic interior selection works:**
+
+1. **Q-transform:** For each child of an interior node, compute a scaled Q-value:
+   - Visited children use their actual `Q = value_sum / (visit_count × 10000)`
+   - Unvisited children use `mixed_value` — a blend of the parent's own value and the prior-weighted average Q of visited siblings
+   - Q-values are normalized to `[0, 1]` and scaled by `(c_visit + max_child_visits) × c_scale`
+
+2. **Improved policy:** `π_improved(a) = softmax(log(prior(a)) + q_transform(a))`
+   This shifts the prior toward high-value actions — actions with good Q get boosted.
+
+3. **Action selection:** `argmax(π_improved(a) - N(a) / (1 + ΣN))`
+   Select the child with the largest *deficit* between its improved policy share and its visit share. This deterministically allocates visits in proportion to the improved policy.
+
+**Why mixed_value replaces FPU:**
+
+FPU (First Play Urgency) is a PUCT-specific heuristic that assigns a pessimistic Q-value to unvisited children: `Q_fpu = parent_Q - 0.3 * sqrt(1 - prior)`. This worked with PUCT's exploration term but creates problems:
+- In draw-biased positions, FPU produces values around -0.29, which can be *better* than virtual-loss-degraded siblings, defeating the purpose of virtual losses
+- FPU interacts with c_puct in hard-to-predict ways
+
+`mixed_value` is the paper's replacement: `(V_node + ΣN × weighted_Q) / (1 + ΣN)`, where `weighted_Q` is the prior-weighted average Q of visited children. This gives unvisited children a "reasonable guess" rather than a pessimistic penalty, and naturally improves as the node accumulates more visits.
+
+**Why lightweight virtual losses work:**
+
+PUCT mode uses heavy virtual losses (`visit_count += 1` AND `value_sum += -10000`) because FPU can make unvisited nodes look better than virtual-loss-degraded nodes unless Q is pushed strongly negative.
+
+The deterministic deficit formula `π_improved(a) - N(a)/(1+ΣN)` is monotonically decreasing in `N(a)`. Adding +1 to a child's visit count strictly reduces its selection score, guaranteeing a different child is selected next — without needing to corrupt Q-values. This means:
+- Q-values stay accurate during parallel leaf collection (no artificial pessimism)
+- No need to "undo" value corruption during backpropagation
+- Simpler, faster, and more numerically stable
+
+**Interaction with Gumbel root selection:** At the root, Sequential Halving uses its own round-robin mechanism — the active action set determines which root child is selected, not PUCT or deterministic selection. Interior deterministic selection only activates at depth ≥ 1, below the root child chosen by round-robin.
+
+**When this activates:** Automatically when `--search-algorithm gumbel` is used (the default). No flags to set. Falls back to PUCT interior selection when `--search-algorithm puct` is used.
+
+**Debugging/verification:** Run the test suite:
+```bash
+# Build and run all virtual visit tests (includes 5 Gumbel interior tests)
+cmake --build build --config Release --target virtual_visits_test
+./build/Release/virtual_visits_test
+```
+
+Tests 11-15 specifically cover: lightweight VL correctness, lightweight VL cancel/restore cycles, Gumbel interior selection with known priors/Q-values, VL diversification via deficit formula, and a full 200-simulation pipelined search with tree invariant checks.

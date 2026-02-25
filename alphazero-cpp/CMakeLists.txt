@@ -148,6 +148,14 @@ target_include_directories(history_encoding_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/chess-library/include
 )
 
+# NodePool test (block reuse, shrink, split metrics)
+add_executable(node_pool_test tests/node_pool_test.cpp)
+target_link_libraries(node_pool_test PRIVATE mcts_core encoding)
+target_include_directories(node_pool_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/chess-library/include
+)
+
 # Replay buffer v5 test (FEN storage, sparse policy, obs reconstruction)
 add_executable(replay_buffer_v5_test tests/replay_buffer_v5_test.cpp)
 target_link_libraries(replay_buffer_v5_test PRIVATE training encoding OpenMP::OpenMP_CXX)

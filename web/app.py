@@ -71,6 +71,7 @@ class LoadedModel:
     num_filters: int = 0
     num_blocks: int = 0
     checkpoint_path: str = ""
+    factored_value: bool = False
 
 # Use standalone module for game state and config
 try:
@@ -232,6 +233,7 @@ class ChessWebInterface:
                     num_filters=existing.num_filters,
                     num_blocks=existing.num_blocks,
                     checkpoint_path=path,
+                    factored_value=existing.factored_value,
                 )
 
         print(f"Loading model from {path}...")
@@ -252,9 +254,10 @@ class ChessWebInterface:
             backend = checkpoint.get('backend', 'cpp')
 
             wdl = config.get('wdl', True)  # Default True — all new models use WDL
+            factored = config.get('factored_value_head', False)
 
             print(f"Detected C++ checkpoint (backend={backend}, version={checkpoint.get('version', '?')})")
-            print(f"  input_channels={input_channels}, policy_filters={policy_filters}, value_hidden={value_hidden}, wdl={wdl}, se_r={se_reduction}")
+            print(f"  input_channels={input_channels}, policy_filters={policy_filters}, value_hidden={value_hidden}, wdl={wdl}, se_r={se_reduction}, factored={factored}")
 
             # Create network with C++ architecture
             network = AlphaZeroNet(
@@ -264,7 +267,8 @@ class ChessWebInterface:
                 policy_filters=policy_filters,
                 value_hidden=value_hidden,
                 wdl=wdl,
-                se_reduction=se_reduction
+                se_reduction=se_reduction,
+                factored_value=factored
             )
             network.load_state_dict(checkpoint['model_state_dict'])
         else:
@@ -274,6 +278,7 @@ class ChessWebInterface:
             input_channels = 119
 
             wdl = checkpoint.get('wdl', True)  # Default True for newer checkpoints
+            factored = False  # Python checkpoints don't support factored value head
 
             print(f"Detected Python checkpoint (wdl={wdl})")
 
@@ -302,6 +307,7 @@ class ChessWebInterface:
             num_filters=num_filters,
             num_blocks=num_blocks,
             checkpoint_path=path,
+            factored_value=factored,
         )
 
     def _model_slot_info(self, slot: str) -> dict:
@@ -314,8 +320,9 @@ class ChessWebInterface:
                 'num_filters': model.num_filters,
                 'num_blocks': model.num_blocks,
                 'checkpoint_path': model.checkpoint_path,
+                'factored_value': model.factored_value,
             }
-        return {'loaded': False, 'name': '', 'num_filters': 0, 'num_blocks': 0, 'checkpoint_path': ''}
+        return {'loaded': False, 'name': '', 'num_filters': 0, 'num_blocks': 0, 'checkpoint_path': '', 'factored_value': False}
 
     def _setup_routes(self):
         """Setup Flask routes."""
@@ -701,7 +708,7 @@ class ChessWebInterface:
         model = self.models[slot]
 
         # Run C++ MCTS with batched leaf evaluation
-        policy, mcts_value, nn_value, wdl = self._run_cpp_mcts(game, model)
+        policy, mcts_value, nn_value, wdl, root_policy, factored_info = self._run_cpp_mcts(game, model)
 
         # Select best action
         action = int(np.argmax(policy))
@@ -714,7 +721,9 @@ class ChessWebInterface:
             'mcts_value': float(mcts_value),
             'nn_value': float(nn_value),
             'wdl': wdl,  # [win, draw, loss] or None
-            'top_moves': self._get_top_moves_from_policy(game, policy, top_k=5)
+            'top_moves': self._get_top_moves_from_policy(game, policy, top_k=5),
+            'nn_top_moves': self._get_top_moves_from_policy(game, root_policy, top_k=5),
+            'factored': factored_info,
         }
 
         # Apply move (immutable update)
@@ -730,7 +739,7 @@ class ChessWebInterface:
             model: LoadedModel to use for evaluation
 
         Returns:
-            Tuple of (policy, mcts_value, nn_value, wdl_list)
+            Tuple of (policy, mcts_value, nn_value, wdl_list, root_policy, factored_info)
         """
         fen = game.fen()
         board = game.board
@@ -813,7 +822,20 @@ class ChessWebInterface:
         # instead of raw NN value which doesn't reflect search results
         mcts_value = mcts.get_root_value()
 
-        return policy, float(mcts_value), root_value_float, wdl_list
+        # Extract factored value head components if available
+        factored_info = None
+        if model.factored_value:
+            z_dec = network._last_z_dec
+            z_cond = network._last_z_cond
+            if z_dec is not None and z_cond is not None:
+                p_dec = torch.sigmoid(z_dec).item()
+                p_cond = torch.sigmoid(z_cond).item()
+                factored_info = {
+                    'decisiveness': float(p_dec),
+                    'win_given_decisive': float(p_cond),
+                }
+
+        return policy, float(mcts_value), root_value_float, wdl_list, root_policy, factored_info
 
     def _get_top_moves_from_policy(self, game: GameState, policy: np.ndarray, top_k: int = 5) -> list:
         """Get top K moves from policy probabilities.

@@ -252,8 +252,11 @@ Node* MCTSSearch::select(Node* node, chess::Board& board) {
         // Gumbel mode: round-robin root child selection (depth 0 only)
         if (depth == 0 && config_.use_gumbel && !gumbel_.all_phases_done) {
             best_child = get_gumbel_target_child();
+        } else if (depth > 0 && config_.use_gumbel) {
+            // Gumbel interior: deterministic improved-policy-following selection
+            best_child = gumbel_interior_select(node);
         } else {
-            // Standard PUCT — used for non-root nodes and PUCT mode
+            // Standard PUCT — used for non-root nodes (PUCT mode) and post-SH root fallback
             float best_score = -std::numeric_limits<float>::infinity();
 
             for (Node* child = node->first_child; child != nullptr; child = child->next_sibling) {
@@ -495,6 +498,179 @@ void MCTSSearch::remove_virtual_visits(Node* leaf) {
 }
 
 // ============================================================================
+// Lightweight Virtual Losses (Gumbel interior mode)
+// ============================================================================
+// Only increment/decrement visit_count along the leaf→root path.
+// No value_sum corruption — Q-values stay accurate.
+// Works because the Gumbel deficit formula π(a) - N(a)/(1+ΣN) is
+// monotonically decreasing in N(a), so +1 visit guarantees a different
+// child is selected on the next traversal.
+
+void MCTSSearch::add_virtual_visit_lightweight(Node* leaf) {
+    for (Node* n = leaf; n != nullptr; n = n->parent) {
+        n->visit_count.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void MCTSSearch::remove_virtual_visit_lightweight(Node* leaf) {
+    for (Node* n = leaf; n != nullptr; n = n->parent) {
+        n->visit_count.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
+// ============================================================================
+// Gumbel Interior Selection (deterministic policy-following)
+// ============================================================================
+
+float MCTSSearch::mixed_value(const Node* node) const {
+    // Prior-weighted average of visited children's Q-values
+    float weighted_q_sum = 0.0f;
+    float prior_sum_visited = 0.0f;
+    int total_child_visits = 0;
+
+    for (Node* child = node->first_child; child != nullptr; child = child->next_sibling) {
+        uint32_t n = child->visit_count.load(std::memory_order_relaxed);
+        total_child_visits += static_cast<int>(n);
+        if (n > 0) {
+            int64_t sum = child->value_sum_fixed.load(std::memory_order_relaxed);
+            float q = sum / (10000.0f * n);
+            float p = child->prior();
+            weighted_q_sum += p * q;
+            prior_sum_visited += p;
+        }
+    }
+
+    // V_node: the node's own value estimate
+    float v_node;
+    uint32_t node_n = node->visit_count.load(std::memory_order_relaxed);
+    if (node_n == 0) {
+        v_node = 0.0f;
+    } else {
+        int64_t sum = node->value_sum_fixed.load(std::memory_order_relaxed);
+        v_node = sum / (10000.0f * node_n);
+    }
+
+    // Fallback to node's own Q when no children visited
+    if (prior_sum_visited < 1e-8f || total_child_visits == 0) {
+        return v_node;
+    }
+
+    float weighted_q = weighted_q_sum / prior_sum_visited;
+    float fn = static_cast<float>(total_child_visits);
+    return (v_node + fn * weighted_q) / (1.0f + fn);
+}
+
+void MCTSSearch::qtransform_interior(const Node* node, float* out, int num_children) const {
+    // Step 1: Fill Q-values — visited children use actual Q, unvisited use mixed_value
+    float mv = mixed_value(node);
+    float min_q = std::numeric_limits<float>::infinity();
+    float max_q = -std::numeric_limits<float>::infinity();
+    int max_visits = 0;
+
+    int idx = 0;
+    for (Node* child = node->first_child; child != nullptr; child = child->next_sibling) {
+        uint32_t n = child->visit_count.load(std::memory_order_relaxed);
+        if (n > 0) {
+            int64_t sum = child->value_sum_fixed.load(std::memory_order_relaxed);
+            out[idx] = sum / (10000.0f * n);
+            max_visits = std::max(max_visits, static_cast<int>(n));
+        } else {
+            out[idx] = mv;
+        }
+        min_q = std::min(min_q, out[idx]);
+        max_q = std::max(max_q, out[idx]);
+        idx++;
+    }
+
+    // Step 2: Rescale to [0, 1] (paper uses [0,1] for interior, unlike root's [-1,1])
+    float range = max_q - min_q;
+    for (int i = 0; i < num_children; i++) {
+        float q_normalized = (range < 1e-8f) ? 0.5f : (out[i] - min_q) / range;
+        // Step 3: Scale by sigma function
+        out[i] = (config_.gumbel_c_visit + static_cast<float>(max_visits))
+                 * config_.gumbel_c_scale * q_normalized;
+    }
+}
+
+Node* MCTSSearch::gumbel_interior_select(Node* node) const {
+    // Count children (typically ≤ 64 for chess)
+    int num_children = 0;
+    for (Node* child = node->first_child; child != nullptr; child = child->next_sibling) {
+        num_children++;
+    }
+    if (num_children == 0) return nullptr;
+    if (num_children == 1) return node->first_child;
+
+    // Stack allocation for typical chess positions (max ~218 legal moves, but
+    // typically 30-40). Heap fallback for extreme cases.
+    static constexpr int STACK_LIMIT = 64;
+    float stack_completed_q[STACK_LIMIT];
+    float stack_log_prior[STACK_LIMIT];
+    float stack_visits_f[STACK_LIMIT];
+
+    float* completed_q_buf = (num_children <= STACK_LIMIT) ? stack_completed_q : new float[num_children];
+    float* log_prior_buf = (num_children <= STACK_LIMIT) ? stack_log_prior : new float[num_children];
+    float* visits_f_buf = (num_children <= STACK_LIMIT) ? stack_visits_f : new float[num_children];
+
+    // Step 1: Compute qtransform for all children
+    qtransform_interior(node, completed_q_buf, num_children);
+
+    // Step 2: Collect log(prior) and visit counts
+    int total_child_visits = 0;
+    int idx = 0;
+    for (Node* child = node->first_child; child != nullptr; child = child->next_sibling) {
+        float p = std::max(child->prior(), 1e-6f);
+        log_prior_buf[idx] = std::log(p);
+        uint32_t n = child->visit_count.load(std::memory_order_relaxed);
+        visits_f_buf[idx] = static_cast<float>(n);
+        total_child_visits += static_cast<int>(n);
+        idx++;
+    }
+
+    // Step 3: Compute improved_policy = softmax(log(prior) + completed_q)
+    // Using log-sum-exp for numerical stability
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < num_children; i++) {
+        float logit = log_prior_buf[i] + completed_q_buf[i];
+        completed_q_buf[i] = logit;  // Reuse buffer for logits
+        if (logit > max_logit) max_logit = logit;
+    }
+
+    float sum_exp = 0.0f;
+    for (int i = 0; i < num_children; i++) {
+        completed_q_buf[i] = std::exp(completed_q_buf[i] - max_logit);
+        sum_exp += completed_q_buf[i];
+    }
+
+    // Step 4: Select argmax(improved_policy[a] - N[a] / (1 + ΣN))
+    float inv_sum_exp = 1.0f / sum_exp;
+    float inv_total_plus_one = 1.0f / (1.0f + static_cast<float>(total_child_visits));
+
+    float best_score = -std::numeric_limits<float>::infinity();
+    Node* best_child = nullptr;
+    idx = 0;
+    for (Node* child = node->first_child; child != nullptr; child = child->next_sibling) {
+        float improved_pi = completed_q_buf[idx] * inv_sum_exp;
+        float visit_frac = visits_f_buf[idx] * inv_total_plus_one;
+        float score = improved_pi - visit_frac;
+        if (score > best_score) {
+            best_score = score;
+            best_child = child;
+        }
+        idx++;
+    }
+
+    // Cleanup heap allocation if used
+    if (num_children > STACK_LIMIT) {
+        delete[] completed_q_buf;
+        delete[] log_prior_buf;
+        delete[] visits_f_buf;
+    }
+
+    return best_child;
+}
+
+// ============================================================================
 // Async Double-Buffer Pipeline Implementation
 // ============================================================================
 
@@ -534,7 +710,11 @@ int MCTSSearch::collect_leaves_async(float* obs_buffer, float* mask_buffer, int 
             simulations_completed_++;
             if (config_.use_gumbel) advance_gumbel_sim();
         } else if (!leaf->is_expanded()) {
-            add_virtual_visits(leaf);
+            if (config_.use_gumbel) {
+                add_virtual_visit_lightweight(leaf);
+            } else {
+                add_virtual_visits(leaf);
+            }
             collection.emplace_back(leaf, board, sim);
         } else {
             float value = leaf->q_value(0.0f, config_.fpu_base);
@@ -600,7 +780,11 @@ void MCTSSearch::update_prev_leaves(const std::vector<std::vector<float>>& polic
         Node* leaf = eval.node;
 
         // Remove virtual visits before real backpropagation replaces them
-        remove_virtual_visits(leaf);
+        if (config_.use_gumbel) {
+            remove_virtual_visit_lightweight(leaf);
+        } else {
+            remove_virtual_visits(leaf);
+        }
 
         expand(leaf, eval.board, policies[i], values[i]);
         if (wdl != nullptr) {
@@ -618,7 +802,11 @@ void MCTSSearch::update_prev_leaves(const std::vector<std::vector<float>>& polic
 void MCTSSearch::cancel_prev_pending() {
     const auto& eval_buffer = get_evaluation_buffer();
     for (const auto& eval : eval_buffer) {
-        remove_virtual_visits(eval.node);
+        if (config_.use_gumbel) {
+            remove_virtual_visit_lightweight(eval.node);
+        } else {
+            remove_virtual_visits(eval.node);
+        }
     }
     simulations_in_flight_ -= static_cast<int>(eval_buffer.size());
 }
@@ -626,7 +814,11 @@ void MCTSSearch::cancel_prev_pending() {
 void MCTSSearch::cancel_collection_pending() {
     auto& coll_buffer = get_collection_buffer();
     for (const auto& eval : coll_buffer) {
-        remove_virtual_visits(eval.node);
+        if (config_.use_gumbel) {
+            remove_virtual_visit_lightweight(eval.node);
+        } else {
+            remove_virtual_visits(eval.node);
+        }
     }
     simulations_in_flight_ -= static_cast<int>(coll_buffer.size());
     coll_buffer.clear();

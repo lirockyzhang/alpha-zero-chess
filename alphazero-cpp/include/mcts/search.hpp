@@ -222,6 +222,25 @@ private:
     void add_virtual_visits(Node* leaf);
     void remove_virtual_visits(Node* leaf);
 
+    // Lightweight virtual losses (visit-count only, no value_sum corruption).
+    // Used in Gumbel mode where the deterministic deficit formula
+    // π(a) - N(a)/(1+ΣN) is monotonically decreasing in N(a),
+    // guaranteeing different child selection without needing Q corruption.
+    void add_virtual_visit_lightweight(Node* leaf);
+    void remove_virtual_visit_lightweight(Node* leaf);
+
+    // Gumbel interior: deterministic improved-policy-following selection
+    // Replaces PUCT at depth>0 when use_gumbel=true
+    Node* gumbel_interior_select(Node* node) const;
+
+    // Compute mixed_value for a node (prior-weighted avg of visited children Q)
+    // Used as the default Q for unvisited children in Gumbel interior selection
+    float mixed_value(const Node* node) const;
+
+    // Compute completed Q-values for interior node children with qtransform
+    // Fills out[] with scaled, normalized Q-values for all num_children children
+    void qtransform_interior(const Node* node, float* out, int num_children) const;
+
     NodePool& pool_;
     BatchSearchConfig config_;
     std::mt19937 rng_;
